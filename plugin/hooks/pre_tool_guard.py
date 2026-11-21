@@ -206,8 +206,15 @@ def maybe_squeeze_command(cmd_line):
         if not toks:
             return None
 
-    # Reject inline env assignments (FOO=bar cmd)
-    if "=" in toks[0]:
+    # Allow safe read-only env var prefixes (e.g., PYTHONPATH=. pytest) while rejecting arbitrary env mutations
+    safe_env_keys = {"PYTHONPATH", "RUST_BACKTRACE", "RUST_LOG", "NO_COLOR", "CARGO_TERM_COLOR"}
+    env_args = []
+    while toks and "=" in toks[0]:
+        k, _, _ = toks[0].partition("=")
+        if k not in safe_env_keys:
+            return None
+        env_args.append(toks.pop(0))
+    if not toks:
         return None
 
     cmd_base = os.path.basename(toks[0])
@@ -221,6 +228,8 @@ def maybe_squeeze_command(cmd_line):
     out = [sq_bin, "--safe"]
     if cwd_arg:
         out.extend(["--cwd", cwd_arg])
+    for ev in env_args:
+        out.extend(["--env", ev])
     out.append("--")
     out.extend(toks)
     return " ".join(shlex.quote(x) for x in out)

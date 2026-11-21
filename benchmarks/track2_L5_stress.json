@@ -1,0 +1,162 @@
+{
+  "ts": "2026-11-21T22:25:44.342494+00:00",
+  "benchmark": "L5_stress_5phase_monorepo",
+  "arms": [
+    {
+      "arm": "vanilla_neon",
+      "model": "Gemini 4 Neon (High)",
+      "conv_id": "2b6ebec1-0",
+      "passed": false,
+      "gt_detail": {
+        "py": false,
+        "rs": true,
+        "spec": true
+      },
+      "wall_s": 244.18,
+      "phase_walls": [
+        [
+          "P1_py_diag_fix",
+          65.86,
+          0
+        ],
+        [
+          "P2_rust_fix",
+          75.51,
+          0
+        ],
+        [
+          "P3_cross_file_feature",
+          45.24,
+          0
+        ],
+        [
+          "P4_lockfile_audit_edgecase",
+          33.51,
+          0
+        ],
+        [
+          "P5_final_gate",
+          24.06,
+          0
+        ]
+      ],
+      "handoff_crystal_tokens": 843,
+      "turns": 20,
+      "tool_calls": 37,
+      "peak_ctx": 52666,
+      "uncached_in": 78876,
+      "cached_in": 636492,
+      "out_tokens": 11616,
+      "cache_hit_pct": 88.97,
+      "steady_state_hit_pct": 90.55,
+      "spills": 0,
+      "tool_bytes": 41076,
+      "credit_index": 200605.2,
+      "credit_delta_pct": 0.0
+    },
+    {
+      "arm": "wave4_neon",
+      "model": "Gemini 4 Neon (High)",
+      "conv_id": "71245e98-f",
+      "passed": false,
+      "gt_detail": {
+        "py": false,
+        "rs": true,
+        "spec": true
+      },
+      "wall_s": 205.0,
+      "phase_walls": [
+        [
+          "P1_py_diag_fix",
+          53.28,
+          0
+        ],
+        [
+          "P2_rust_fix",
+          44.69,
+          0
+        ],
+        [
+          "P3_cross_file_feature",
+          44.17,
+          0
+        ],
+        [
+          "P4_lockfile_audit_edgecase",
+          39.11,
+          0
+        ],
+        [
+          "P5_final_gate",
+          23.75,
+          0
+        ]
+      ],
+      "handoff_crystal_tokens": 678,
+      "turns": 18,
+      "tool_calls": 23,
+      "peak_ctx": 50906,
+      "uncached_in": 69934,
+      "cached_in": 596214,
+      "out_tokens": 12608,
+      "cache_hit_pct": 89.5,
+      "steady_state_hit_pct": 91.39,
+      "spills": 1,
+      "tool_bytes": 31794,
+      "credit_index": 192595.4,
+      "credit_delta_pct": -4.0
+    },
+    {
+      "arm": "wave4_hydrogen",
+      "model": "Gemini 4 Hydrogen (High)",
+      "conv_id": "b4c20266-6",
+      "passed": false,
+      "gt_detail": {
+        "py": false,
+        "rs": true,
+        "spec": true
+      },
+      "wall_s": 121.65,
+      "phase_walls": [
+        [
+          "P1_py_diag_fix",
+          32.19,
+          0
+        ],
+        [
+          "P2_rust_fix",
+          26.77,
+          0
+        ],
+        [
+          "P3_cross_file_feature",
+          22.96,
+          0
+        ],
+        [
+          "P4_lockfile_audit_edgecase",
+          21.85,
+          0
+        ],
+        [
+          "P5_final_gate",
+          17.88,
+          0
+        ]
+      ],
+      "handoff_crystal_tokens": 678,
+      "turns": 17,
+      "tool_calls": 21,
+      "peak_ctx": 48487,
+      "uncached_in": 65139,
+      "cached_in": 538034,
+      "out_tokens": 11453,
+      "cache_hit_pct": 89.2,
+      "steady_state_hit_pct": 91.6,
+      "spills": 1,
+      "tool_bytes": 31137,
+      "credit_index": 176207.4,
+      "credit_delta_pct": -12.2
+    }
+  ]
+}

@@ -73,6 +73,10 @@ def test_wm_squeeze():
             check(f"refuse {' '.join(args)}", False, f"expected rc=2 got {p.returncode}")
     check(f"all {len(unsafe_cases)} unsafe commands refused (rc=2)", refused_ok)
 
+    # Disallowed env var via --env must be refused (rc=2)
+    p_bad_env = subprocess.run([str(WM_SQUEEZE), "--safe", "--env", "LD_PRELOAD=/tmp/x.so", "--", "ls"], capture_output=True, text=True, env=env)
+    check("disallowed --env LD_PRELOAD refused (rc=2)", p_bad_env.returncode == 2)
+
     # Safe command execution & latency
     t0 = time.perf_counter()
     p = subprocess.run([str(WM_SQUEEZE), "--safe", "--cwd", str(KIT), "--", "git", "status", "--short"], capture_output=True, text=True, env=env)
@@ -164,6 +168,12 @@ def test_pre_tool_hook():
     d = json.loads(out)
     ow = (d.get("overwrite") or {}).get("CommandLine", "")
     check("cd /tmp && cargo test -> --cwd /tmp", d.get("decision") == "allow" and "--cwd /tmp" in ow)
+
+    # Safe env var prefix PYTHONPATH=. pytest -v -> wrapped with --env PYTHONPATH=.
+    rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": "PYTHONPATH=. pytest -v tests/test_a.py"}}})
+    d = json.loads(out)
+    ow = (d.get("overwrite") or {}).get("CommandLine", "")
+    check("PYTHONPATH=. pytest -v -> --env PYTHONPATH=.", d.get("decision") == "allow" and "--env PYTHONPATH=." in ow)
 
     # Piped/globbed/redirected commands left untouched
     for cmd in ("git diff | head -n 20", "ls *.py", "echo hi > /tmp/x", "python3 script.py"):

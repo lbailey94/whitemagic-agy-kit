@@ -677,10 +677,26 @@ fn main() {
     }
 
     let mut cwd: Option<String> = None;
+    let mut safe_envs: Vec<(String, String)> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--cwd" if i + 1 < args.len() => { cwd = Some(args[i + 1].clone()); i += 2; }
+            "--env" if i + 1 < args.len() => {
+                let kv = &args[i + 1];
+                if let Some((k, v)) = kv.split_once('=') {
+                    if matches!(k, "PYTHONPATH" | "RUST_BACKTRACE" | "RUST_LOG" | "NO_COLOR" | "CARGO_TERM_COLOR") {
+                        safe_envs.push((k.to_string(), v.to_string()));
+                    } else {
+                        eprintln!("wm-squeeze --safe refused disallowed env var: {}", k);
+                        std::process::exit(2);
+                    }
+                } else {
+                    eprintln!("wm-squeeze --safe invalid --env format: {}", kv);
+                    std::process::exit(2);
+                }
+                i += 2;
+            }
             "--max-bytes" if i + 1 < args.len() => { max_bytes = args[i + 1].parse().unwrap_or(DEFAULT_MAX_BYTES).clamp(512, 9200); i += 2; }
             "--" => { i += 1; break; }
             _ => break,
@@ -723,6 +739,9 @@ fn main() {
     let mut command = Command::new(cmd);
     command.args(cmd_args).current_dir(&work_dir).stdout(Stdio::piped()).stderr(Stdio::piped());
     command.env("GIT_PAGER", "cat").env("PAGER", "cat").env("NO_COLOR", "1");
+    for (k, v) in &safe_envs {
+        command.env(k, v);
+    }
 
     let output = match command.output() {
         Ok(o) => o,

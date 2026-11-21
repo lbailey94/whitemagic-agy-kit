@@ -132,8 +132,11 @@ def bench_wm_codegraph():
     results = {}
     targets = [
         ("whitemagic-agy-kit", KIT_DIR, "squeeze"),
-        ("WMv10", Path("/home/lucas/Desktop/front burner/repos/WHITEMAGIC/WMv10/crates/wm-gen3-harness"), "handle_memory_search"),
     ]
+    extra_repo = os.environ.get("WM_EXTRA_CODEGRAPH_REPO")
+    extra_sym = os.environ.get("WM_EXTRA_CODEGRAPH_SYM", "main")
+    if extra_repo:
+        targets.append((Path(extra_repo).name, Path(extra_repo), extra_sym))
     for label, root, sym in targets:
         if not root.is_dir():
             continue

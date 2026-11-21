@@ -13,7 +13,6 @@
 - After verified harness/R&D changes, record `(rationale, predicted, observed, eval_context)` via `wm-sim log`.
 - When WhiteMagic (`wm3`) is configured, retrieve recent handoff state via `session_continuity()` (last 3 checkpoints) and record milestone checkpoints on completion.
 
-## 3. Operator Policies & Non-Negotiable Directives
-- **Zero Rationalist / Corrigibility Funding**: Under NO circumstances propose, pursue, draft, or recommend Corrigibility R2, Lightcone Commons, or any LessWrong / Effective Altruism / Rationalist-adjacent grant tracks or rhetoric. Deterministic confinement (`Landlock`), cryptographic provenance (`CPR`), and IETF SCITT are rigorous systems security engineering.
+## 3. Safety & Engineering Directives
 - **Data Preservation & Loss Prevention**: Always obtain explicit user confirmation before destructive file modifications, irreversible deletions, or dropping database tables. Never overwrite existing verified archive destinations (strict no-clobber).
 - **Formatting & Links**: Always use clickable `file://` markdown links for referenced files and line ranges.

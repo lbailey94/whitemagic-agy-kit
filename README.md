@@ -14,6 +14,7 @@ Built from empirical offline forensics across `50` real sessions (`12,740` turns
   - **L2 Medium (2-hop cross-file refactor):** **`-18.2%`** credit, **`-51%`** wall-time (`49.4s → 24.4s`) with `Hydrogen`
   - **L3 Complex (65 KB noisy CI log + 3 bugs):** **`-15.7%`** credit (`Neon`), **`-43%`** wall-time (`Hydrogen`)
   - **L4 Hard Rust Crate (`220` noisy `cargo test` + 3 bugs):** **`-28.1%`** cold (`Hydrogen`, `-40%` wall-time, `-50%` tool bytes), **`-26.9%` cold-adjusted / `-46.6%` with verified 85.2% Turn-0 cross-session prefix cache hit** (`Neon`)
+  - **L5 Long-Horizon 5-Phase Monorepo Stress (`17–20` continuous turns, Python+Rust + 80 KB log + 50 KB `Cargo.lock` diff):** **`-50.2%` wall-time (`244s → 122s`, `2.01×` faster)**, **`-43%` tool calls (`37 → 21`)**, **`-25%` tool bytes**, **`-16.7%` uncached tokens**, **`-12.2%` credit** (`Hydrogen`, incremental on top of Wave 1/2 rules), and **`678`-token `wm-handoff` crystal (`-98.6%` vs `48k` cold resume)**
 - **Component Micro-Benchmarks & Full 2.27B-Token Corpus Forensics:**
   - `wm-squeeze v3`: **`-98.8%`** noisy `cargo test`, **`-99.5%`** lockfile `git diff`, **`-80.1%`** 420-diagnostic linter output, **`31.1×`** faster repeat checks via content-addressed cache (`9.2 ms`)
   - `wm-codegraph`: **`-99.65%` (`289×`)** token reduction tracing all 14 2-hop callers across a 13.4k-line Rust harness in `6.0 ms` (`133,468 → 462` tokens)
