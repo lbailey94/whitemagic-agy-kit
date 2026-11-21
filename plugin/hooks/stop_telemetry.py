@@ -83,6 +83,10 @@ def summarize_tail(transcript_path):
 
 
 def main():
+    if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
+        sys.stdout.write(json.dumps({"decision": "allow"}))
+        sys.stdout.flush()
+        return
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         tp = payload.get("transcriptPath") or ""

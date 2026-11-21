@@ -32,18 +32,21 @@ done
 
 mkdir -p "$PLUGINS_DIR" "$LOCAL_BIN" "$AGY_CLI_DIR" "${HOME}/.gemini/config/hooks"
 
-echo "=== 1. Building zero-dependency Rust CLI compressor: wm-squeeze ==="
+echo "=== 1. Building zero-dependency Rust binaries: wm-squeeze & wm-codegraph ==="
 if command -v cargo >/dev/null 2>&1; then
     cargo build --release --manifest-path "${KIT_DIR}/tools/wm-squeeze/Cargo.toml"
     cp "${KIT_DIR}/tools/wm-squeeze/target/release/wm-squeeze" "${LOCAL_BIN}/wm-squeeze"
-    chmod +x "${LOCAL_BIN}/wm-squeeze"
-    echo "Installed ${LOCAL_BIN}/wm-squeeze"
+    cargo build --release --manifest-path "${KIT_DIR}/tools/wm-codegraph/Cargo.toml"
+    cp "${KIT_DIR}/tools/wm-codegraph/target/release/wm-codegraph" "${LOCAL_BIN}/wm-codegraph"
+    chmod +x "${LOCAL_BIN}/wm-squeeze" "${LOCAL_BIN}/wm-codegraph"
+    echo "Installed ${LOCAL_BIN}/wm-squeeze & ${LOCAL_BIN}/wm-codegraph"
 elif command -v rustc >/dev/null 2>&1; then
     rustc -O "${KIT_DIR}/tools/wm-squeeze/src/main.rs" -o "${LOCAL_BIN}/wm-squeeze"
-    chmod +x "${LOCAL_BIN}/wm-squeeze"
-    echo "Compiled ${LOCAL_BIN}/wm-squeeze via rustc"
+    rustc -O "${KIT_DIR}/tools/wm-codegraph/src/main.rs" -o "${LOCAL_BIN}/wm-codegraph"
+    chmod +x "${LOCAL_BIN}/wm-squeeze" "${LOCAL_BIN}/wm-codegraph"
+    echo "Compiled ${LOCAL_BIN}/wm-squeeze & ${LOCAL_BIN}/wm-codegraph via rustc"
 else
-    echo "[warn] Rust toolchain not found; skipping wm-squeeze (hooks fail-open cleanly without it)."
+    echo "[warn] Rust toolchain not found; skipping native binaries (hooks fail-open cleanly without them)."
 fi
 
 if [ "$SYNC_GLOBAL" -eq 1 ]; then
@@ -140,7 +143,7 @@ if [ "$KEEP_HEAVY_PLUGINS" -eq 0 ] && command -v agy >/dev/null 2>&1; then
 fi
 
 echo "=== 5. Installing portable CLI tools & cache-warmth statusline ==="
-for tool in wm-sim agy-bench agy-mode wm-local-digest wm-dream; do
+for tool in wm-sim agy-bench agy-mode wm-local-digest wm-dream wm-handoff; do
     cp "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
     chmod +x "${LOCAL_BIN}/${tool}"
 done
@@ -212,6 +215,8 @@ base_allow = [
     "command(wm3)",
     "command(wm-sim)",
     "command(wm-squeeze --safe)",
+    "command(wm-codegraph)",
+    "command(wm-handoff)",
     "command(wm-local-digest)",
     "command(wm-dream)",
     "command(wm-preflight-brief)",

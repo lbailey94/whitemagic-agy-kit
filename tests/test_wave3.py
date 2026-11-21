@@ -115,6 +115,34 @@ def test_wm_squeeze():
         f"{len(noisy_diff)}B -> {len(p.stdout)}B",
     )
 
+    # Pytest -v multi-space right-aligned [  0%] collapsing
+    noisy_pytest = "\n".join(
+        [f"test_mod.py::test_case[{i}] PASSED                                        [{min(99, i):3d}%]" for i in range(300)]
+        + ["test_mod.py::test_real_bug FAILED                                       [100%]", "AssertionError: expected 80 got 120"]
+    )
+    p = subprocess.run([str(WM_SQUEEZE), "--pipe", "--kind", "pytest"], input=noisy_pytest, capture_output=True, text=True, env=env)
+    check(
+        "pytest -v right-aligned PASSED lines collapsed & FAILED kept",
+        p.returncode == 0 and "300 passed lines collapsed" in p.stdout and "AssertionError: expected 80 got 120" in p.stdout,
+        f"{len(noisy_pytest)}B -> {len(p.stdout)}B",
+    )
+
+    # CoACT linter diagnostic grouping
+    noisy_lint = "\n".join(f"src/file_{f}.ts({l},5): error TS2322: Type mismatch" for f in range(8) for l in range(1, 35))
+    p = subprocess.run([str(WM_SQUEEZE), "--pipe", "--kind", "linter"], input=noisy_lint, capture_output=True, text=True, env=env)
+    check(
+        "CoACT linter grouping caps <=8.2KB & keeps file anchors",
+        p.returncode == 0 and "linter-grouped" in p.stdout and len(p.stdout.encode()) <= 8200,
+        f"{len(noisy_lint)}B -> {len(p.stdout)}B",
+    )
+
+    # Content-addressed cache hit on repeated safe git status
+    env_cache = {**os.environ, "WM_SQUEEZE_NO_STATS": "1"}
+    env_cache.pop("WM_SQUEEZE_NO_CACHE", None)
+    subprocess.run([str(WM_SQUEEZE), "--safe", "--cwd", str(KIT), "--", "git", "log", "-n", "2", "--oneline"], capture_output=True, text=True, env=env_cache)
+    p2 = subprocess.run([str(WM_SQUEEZE), "--safe", "--cwd", str(KIT), "--", "git", "log", "-n", "2", "--oneline"], capture_output=True, text=True, env=env_cache)
+    check("wm-squeeze content-addressed cache hit on repeat cmd", p2.returncode == 0 and "cache-hit" in p2.stdout)
+
 
 def test_pre_tool_hook():
     print("\n2. PreToolUse Guard & Deterministic Optimizer:")
@@ -236,6 +264,25 @@ def test_statusline_and_lifecycle():
     # wm-dream dry-run
     p = subprocess.run([str(LOCAL_BIN / "wm-dream"), "--dry-run"], capture_output=True, text=True)
     check("wm-dream --dry-run", p.returncode == 0 and "Dream Digest" in p.stdout)
+
+    # Wave 4: wm-codegraph CLI + MCP + wm-handoff + wm-sim prefix-hash + VANILLA bypass
+    cg = LOCAL_BIN / "wm-codegraph"
+    p = subprocess.run([str(cg), "callers", "squeeze", "--root", str(KIT)], capture_output=True, text=True)
+    check("wm-codegraph callers finds squeeze -> main", p.returncode == 0 and "main" in p.stdout)
+
+    mcp_in = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
+    p = subprocess.run([str(cg), "--mcp"], input=mcp_in, capture_output=True, text=True)
+    check("wm-codegraph --mcp responds to tools/list", p.returncode == 0 and "code_graph" in p.stdout)
+
+    p = subprocess.run([str(LOCAL_BIN / "wm-handoff"), "--cwd", str(KIT)], capture_output=True, text=True)
+    check("wm-handoff emits verbatim crystal with sha256", p.returncode == 0 and "crystal_sha256=" in p.stdout)
+
+    p = subprocess.run([str(LOCAL_BIN / "wm-sim"), "prefix-hash"], capture_output=True, text=True)
+    check("wm-sim prefix-hash computes ContextCacheToken", p.returncode == 0 and "ContextCacheToken SHA-256" in p.stdout)
+
+    rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": "git diff"}}}, env_extra={"WM_AGY_BENCH_VANILLA": "1"})
+    d = json.loads(out)
+    check("WM_AGY_BENCH_VANILLA=1 passes through untouched", rc == 0 and d == {"decision": "allow"})
 
 
 def main():

@@ -26,11 +26,12 @@ DREAM_DIGEST = DATA_DIR / "dream_digest.md"
 def build_brief():
     parts = []
     if PREFLIGHT_PATH.exists():
-        age_min = int((time.time() - PREFLIGHT_PATH.stat().st_mtime) / 60)
         lines = PREFLIGHT_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
         header = [l.strip() for l in lines[:4] if l.strip()]
         claims = [l.strip() for l in lines if "Claim:" in l or "Release:" in l][:3]
-        parts.append(f"[SessionStart Cached Brief | age={age_min}m | source={PREFLIGHT_PATH}]")
+        # Stable header (no volatile per-minute age=Xm) so sibling subagents & back-to-back sessions
+        # share a byte-identical >4,096-token Turn-0 implicit prefix cache on Gemini 4.
+        parts.append(f"[SessionStart Cached Brief | source={PREFLIGHT_PATH}]")
         parts.extend(header[:3])
         if claims:
             parts.append("Recent Sangha Claims/Releases:")
@@ -77,6 +78,10 @@ def build_brief():
 
 
 def main():
+    if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
+        sys.stdout.write("{}")
+        sys.stdout.flush()
+        return
     try:
         _ = sys.stdin.read()
     except Exception:

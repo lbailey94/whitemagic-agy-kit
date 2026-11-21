@@ -1,0 +1,10 @@
+[package]
+name = "wm-codegraph"
+version = "3.0.0"
+edition = "2021"
+description = "Zero-dependency incremental structural symbol & call-graph indexer (CLI + 1-tool MCP) for Antigravity CLI"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -278,6 +278,40 @@ def cmd_sync_wm3(args):
     print(f"Synced {len(unsynced)} SIM entries into WhiteMagic Gen3.")
 
 
+def cmd_prefix_hash(args):
+    """Compute a ContextCacheToken-style canonical SHA-256 of Turn-0 rules, skills, and eager MCP schemas."""
+    h = hashlib.sha256()
+    total_bytes = 0
+    print("=== Turn-0 ContextCacheToken Prefix Audit ===")
+    for rf in RULE_FILES:
+        if rf.exists():
+            data = rf.read_bytes()
+            total_bytes += len(data)
+            h.update(f"rule:{rf.name}\n".encode() + data + b"\n")
+            print(f"  RULE  {rf.name:28s}: {len(data):6,} B (~{len(data)//4:4,} tok)")
+    mcp_dir = HOME / ".gemini" / "antigravity-cli" / "mcp"
+    if mcp_dir.is_dir():
+        for jf in sorted(mcp_dir.glob("*/*.json")):
+            data = jf.read_bytes()
+            h.update(f"mcp:{jf.parent.name}/{jf.name}\n".encode() + data + b"\n")
+    skills_dir = HOME / ".gemini" / "config" / "skills"
+    if skills_dir.is_dir():
+        sk_bytes = 0
+        for sf in sorted(skills_dir.glob("*/SKILL.md")):
+            txt = sf.read_text(encoding="utf-8", errors="replace")
+            if txt.startswith("---"):
+                parts = txt.split("---", 2)
+                if len(parts) >= 2:
+                    b = parts[1].encode("utf-8")
+                    sk_bytes += len(b)
+                    h.update(f"skill:{sf.parent.name}\n".encode() + b + b"\n")
+        total_bytes += sk_bytes
+        print(f"  SKILL custom frontmatter          : {sk_bytes:6,} B (~{sk_bytes//4:4,} tok)")
+    token = h.hexdigest()
+    print(f"  ContextCacheToken SHA-256         : {token[:24]}... (full: {token})")
+    print(f"  Rule+CustomSkill Prefix Footprint : {total_bytes:,} B (~{total_bytes//4:,} tok)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="wm-sim: Self-Improvement Memory CLI & Hygiene Auditor")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -303,6 +337,7 @@ def main():
     p_f.add_argument("--limit", type=int, default=15)
 
     sub.add_parser("audit", help="Run AGY rules, skills, hooks, MCP, and SIM ledger hygiene audit")
+    sub.add_parser("prefix-hash", help="Compute deterministic ContextCacheToken SHA-256 of Turn-0 static prefix")
     sub.add_parser("sync-wm3", help="Commit unsynced SIM experiment records to WhiteMagic Gen3")
 
     args = parser.parse_args()
@@ -314,6 +349,8 @@ def main():
         cmd_failures(args)
     elif args.cmd == "audit":
         cmd_audit(args)
+    elif args.cmd == "prefix-hash":
+        cmd_prefix_hash(args)
     elif args.cmd == "sync-wm3":
         cmd_sync_wm3(args)
 

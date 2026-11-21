@@ -1,0 +1,74 @@
+{
+  "ts": "2026-11-21T21:49:19.330477+00:00",
+  "track1": {
+    "wm_squeeze_v3": {
+      "cargo_test_noisy": {
+        "raw_bytes": 28449,
+        "out_bytes": 337,
+        "reduction_pct": 98.8,
+        "error_preserved": true,
+        "ms": 1.57
+      },
+      "linter_420_diags": {
+        "raw_bytes": 40701,
+        "out_bytes": 8119,
+        "reduction_pct": 80.1,
+        "error_preserved": true,
+        "ms": 2.77
+      },
+      "git_diff_lockfile": {
+        "raw_bytes": 47109,
+        "out_bytes": 217,
+        "reduction_pct": 99.5,
+        "error_preserved": true,
+        "ms": 2.35
+      },
+      "content_addressed_cache": {
+        "cold_ms": 5.6,
+        "cache_hit_ms": 5.2,
+        "cache_hit_marker": true,
+        "speedup_x": 1.1
+      }
+    },
+    "wm_codegraph": {
+      "whitemagic-agy-kit": {
+        "symbol": "squeeze",
+        "naive_matching_files": 4,
+        "naive_read_bytes": 88205,
+        "naive_est_tokens": 22051,
+        "codegraph_bytes": 256,
+        "codegraph_est_tokens": 64,
+        "reduction_pct": 99.71,
+        "compression_x": 344.6,
+        "index_ms": 4.8,
+        "query_ms": 2.0
+      },
+      "WMv10": {
+        "symbol": "handle_memory_search",
+        "naive_matching_files": 1,
+        "naive_read_bytes": 533875,
+        "naive_est_tokens": 133468,
+        "codegraph_bytes": 1850,
+        "codegraph_est_tokens": 462,
+        "reduction_pct": 99.65,
+        "compression_x": 288.6,
+        "index_ms": 5.5,
+        "query_ms": 6.0
+      }
+    },
+    "historical_replay": {
+      "sessions": 52,
+      "turns": 12740,
+      "total_input_tokens": 2268833672,
+      "total_uncached_tokens": 147804927,
+      "overall_cache_hit_pct": 93.49,
+      "total_spills": 1010,
+      "user_idle_evictions": 190,
+      "user_idle_evict_uncached": 45478296,
+      "wm_handoff_recoverable_uncached": 45098296,
+      "wm_handoff_pct_of_all_uncached": 30.5,
+      "gap30_evict_uncached": 36215638,
+      "normal_incremental_uncached": 53122065
+    }
+  }
+}

@@ -362,6 +362,9 @@ def handle_whitemagic_mcp(tool_name, args):
 
 
 def main():
+    if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
+        emit({"decision": "allow"})
+        return
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception:

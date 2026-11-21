@@ -1,8 +1,8 @@
 {
   "name": "whitemagic-agy-kit",
   "displayName": "WhiteMagic AGY Turbo Kit",
-  "version": "2.0.0",
-  "description": "Cross-platform (macOS + Linux) Antigravity CLI performance, deterministic PreToolUse token compression (wm-squeeze), cache-warmth telemetry, SIM memory, data-loss guard, and local $0 offload bundle.",
+  "version": "3.0.0",
+  "description": "Cross-platform (macOS + Linux) Antigravity CLI performance, CoACT PreToolUse compression (wm-squeeze v3), incremental AST symbol/call-graph (wm-codegraph), CliffCompaction handoffs (wm-handoff), cache-warmth telemetry, SIM memory, and $0 local offload.",
   "author": {
     "name": "Lucas Bailey",
     "url": "https://github.com/lbailey94"

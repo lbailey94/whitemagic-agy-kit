@@ -115,6 +115,30 @@ def main():
         print("[wm-local-digest] Empty input.")
         return
 
+    # Fast lossless diagnostic line-extractor for noisy logs when querying errors/failures
+    is_log = (args.file or "").lower().endswith((".log", ".out", ".err")) or "\x1b[" in text[:4096]
+    wants_diag = bool(re.search(r"\b(fail|error|exception|traceback|panic|bug|warn|assert|broken)\b", args.query, re.I))
+    if not args.llm and is_log and wants_diag:
+        clean_text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
+        lines = clean_text.splitlines()
+        diag_re = re.compile(r"\b(FAIL|FAILED|ERROR|Exception|Traceback|AssertionError|panicked|CRITICAL|error\[E)\b")
+        hits = []
+        seen = set()
+        for idx, ln in enumerate(lines):
+            if diag_re.search(ln):
+                lo = max(0, idx - 1)
+                hi = min(len(lines), idx + 3)
+                block = "\n".join(f"L{k+1}: {lines[k][:220]}" for k in range(lo, hi))
+                if block not in seen:
+                    seen.add(block)
+                    hits.append(block)
+        if hits:
+            out = "\n---\n".join(hits)[:2400]
+            red = 100.0 * (1.0 - len(out) / max(len(text), 1))
+            print(f"[wm-local-digest | $0 diag-extract | {src_label} -> {len(out)/1024:.1f} KB (-{red:.0f}%) | {len(hits)} failure blocks]")
+            print(out)
+            return
+
     chunks = chunk_text(text)
     selected = rank_chunks(chunks, args.query, top_k=args.top_k)
     context = "\n\n".join(f"--- Chunk {idx+1}/{len(chunks)} ---\n{c}" for idx, c in selected)

@@ -1,8 +1,8 @@
 [package]
 name = "wm-squeeze"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
-description = "Zero-dependency deterministic CLI output compressor and safe read-only proxy for Antigravity CLI"
+description = "Zero-dependency deterministic CoACT CLI compressor, content-addressed cache, and safe proxy for Antigravity CLI"
 
 [profile.release]
 opt-level = 3
