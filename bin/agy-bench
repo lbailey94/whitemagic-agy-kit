@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-agy-bench — Portable (macOS + Linux) Antigravity CLI Offline Benchmark & A/B Comparator.
-Combines agy-fast's millisecond transcript analyzer with custom truncation, plugin bloat,
-and pre-edit context metrics, saving reproducible snapshots to ~/.local/share/whitemagic/agy_benchmarks/.
+agy-bench — Portable (macOS + Linux) Antigravity CLI Offline Benchmark & Credit/Cache A/B Comparator (Wave 3).
+Combines agy-fast's millisecond transcript analyzer with:
+  - Truncation, unbounded-read, duplicate-read & pre-edit context hygiene metrics
+  - Per-model uncached burn & inter-turn cache decay telemetry (--credits)
+  - wm-squeeze cumulative compression savings
+  - Reproducible A/B snapshots under ~/.local/share/whitemagic/agy_benchmarks/
 """
 import argparse
 import glob
@@ -11,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +22,7 @@ HOME = Path.home()
 BENCH_JS = HOME / ".gemini" / "config" / "plugins" / "agy-fast" / "dist" / "benchmark.mjs"
 BRAIN_DIR = HOME / ".gemini" / "antigravity-cli" / "brain"
 OUT_DIR = HOME / ".local" / "share" / "whitemagic" / "agy_benchmarks"
+SQUEEZE_STATS = HOME / ".local" / "share" / "whitemagic" / "wm_squeeze_stats.jsonl"
 CFG_JSON = HOME / ".gemini" / "config" / "config.json"
 PLUGINS_DIR = HOME / ".gemini" / "config" / "plugins"
 
@@ -31,7 +36,16 @@ def parse_agy_fast_md(md_text):
     return metrics
 
 
-def measure_truncations_and_pre_edit(recent=30, since=None):
+def parse_ts(v):
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def measure_extended_and_credits(recent=30, since=None):
     logs = sorted(
         glob.glob(str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")),
         key=os.path.getmtime,
@@ -43,17 +57,59 @@ def measure_truncations_and_pre_edit(recent=30, since=None):
     else:
         logs = logs[:recent]
 
-    total_cmds = trunc_cmds = total_reads = unbounded_reads = bursts_4plus = 0
+    total_cmds = trunc_cmds = total_reads = unbounded_reads = dup_reads = bursts_4plus = 0
     pre_edit_kbs = []
+    model_stats = defaultdict(lambda: {"turns": 0, "uncached": 0, "cached": 0, "out": 0})
+    gap_buckets = defaultdict(lambda: [0, 0.0, 0])  # [n, sum_hit, low50]
+    tot_unc = tot_cac = tot_out = tot_turns = 0
+
     for lp in logs:
         first_edit = False
         cum_bytes = 0
+        seen_reads = set()
+        prev_ts = None
+        prev_ctx = 0
         with open(lp, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     obj = json.loads(line)
                 except Exception:
                     continue
+                t = obj.get("type", "")
+                if t == "USER_INPUT":
+                    prev_ts = None
+                    continue
+                if t == "PLANNER_RESPONSE":
+                    unc = int(obj.get("input_tokens") or 0)
+                    cac = int(obj.get("cache_read_tokens") or 0)
+                    out = int(obj.get("output_tokens") or 0)
+                    ctx = unc + cac
+                    ts = parse_ts(obj.get("created_at"))
+                    if ctx > 0:
+                        tot_turns += 1
+                        tot_unc += unc
+                        tot_cac += cac
+                        tot_out += out
+                        mdl = obj.get("model") or "unknown"
+                        ms = model_stats[mdl]
+                        ms["turns"] += 1
+                        ms["uncached"] += unc
+                        ms["cached"] += cac
+                        ms["out"] += out
+                        if prev_ts and ts and prev_ctx >= 25000:
+                            gap = max(0.0, ts - prev_ts)
+                            if gap <= 1800:
+                                b = "<15s" if gap < 15 else ("15-30s" if gap < 30 else ("30-60s" if gap < 60 else ("60-180s" if gap < 180 else ">=180s")))
+                                hit = 100.0 * cac / ctx
+                                gb = gap_buckets[b]
+                                gb[0] += 1
+                                gb[1] += hit
+                                if hit < 50:
+                                    gb[2] += 1
+                    if ts:
+                        prev_ts = ts
+                    prev_ctx = ctx
+
                 tcalls = obj.get("tool_calls") or []
                 rf_turn = 0
                 for tc in tcalls:
@@ -67,8 +123,13 @@ def measure_truncations_and_pre_edit(recent=30, since=None):
                     if name == "read_file":
                         rf_turn += 1
                         total_reads += 1
-                        if not args.get("StartLine") and not args.get("EndLine"):
+                        sl, el = args.get("StartLine"), args.get("EndLine")
+                        if not sl and not el:
                             unbounded_reads += 1
+                        rkey = (str(args.get("Path", "")), sl, el)
+                        if rkey in seen_reads:
+                            dup_reads += 1
+                        seen_reads.add(rkey)
                     elif name == "run_command":
                         total_cmds += 1
                     elif name in ("edit_file", "write_file", "mcp_agy-fast_fast_apply_edits") and not first_edit:
@@ -76,11 +137,14 @@ def measure_truncations_and_pre_edit(recent=30, since=None):
                         pre_edit_kbs.append(cum_bytes / 1024.0)
                 if rf_turn >= 4:
                     bursts_4plus += 1
-                if obj.get("type") not in ("USER_INPUT", "PLANNER_RESPONSE"):
+                if t not in ("USER_INPUT", "PLANNER_RESPONSE", "SYSTEM_MESSAGE"):
                     content = str(obj.get("content") or "")
                     cum_bytes += len(content)
-                    if "truncated" in content.lower() and ("Command output:" in content or "Command exited" in content):
+                    if "truncated" in content.lower() and ("Command output:" in content or "Command exited" in content or "output.txt" in content):
                         trunc_cmds += 1
+
+    overall_hit = round(100.0 * tot_cac / max(tot_unc + tot_cac, 1), 2)
+    unc_per_turn = round(tot_unc / max(tot_turns, 1), 1)
 
     return {
         "sessions_scanned": len(logs),
@@ -90,8 +154,45 @@ def measure_truncations_and_pre_edit(recent=30, since=None):
         "read_file_total": total_reads,
         "read_file_unbounded": unbounded_reads,
         "read_file_unbounded_pct": round(100.0 * unbounded_reads / max(total_reads, 1), 1),
+        "read_file_exact_dups": dup_reads,
         "read_file_bursts_4plus": bursts_4plus,
         "avg_pre_edit_tool_kb": round(sum(pre_edit_kbs) / max(len(pre_edit_kbs), 1), 1) if pre_edit_kbs else 0.0,
+        "overall_cache_hit_pct": overall_hit,
+        "avg_uncached_per_turn": unc_per_turn,
+        "total_uncached_tokens": tot_unc,
+        "total_cached_tokens": tot_cac,
+        "total_output_tokens": tot_out,
+        "per_model": {k: dict(v) for k, v in model_stats.items()},
+        "gap_buckets": {
+            b: {
+                "n": gap_buckets[b][0],
+                "avg_hit_pct": round(gap_buckets[b][1] / max(gap_buckets[b][0], 1), 1),
+                "low50": gap_buckets[b][2],
+            }
+            for b in ["<15s", "15-30s", "30-60s", "60-180s", ">=180s"]
+        },
+    }
+
+
+def measure_squeeze_savings():
+    if not SQUEEZE_STATS.exists():
+        return {"cmds": 0, "raw_kb": 0.0, "out_kb": 0.0, "saved_kb": 0.0, "est_tokens_saved": 0}
+    cmds = raw_b = out_b = 0
+    for line in SQUEEZE_STATS.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            o = json.loads(line)
+            cmds += 1
+            raw_b += int(o.get("raw", 0))
+            out_b += int(o.get("out", 0))
+        except Exception:
+            continue
+    saved = max(0, raw_b - out_b)
+    return {
+        "cmds": cmds,
+        "raw_kb": round(raw_b / 1024.0, 1),
+        "out_kb": round(out_b / 1024.0, 1),
+        "saved_kb": round(saved / 1024.0, 1),
+        "est_tokens_saved": saved // 4,
     }
 
 
@@ -126,7 +227,7 @@ def measure_plugin_overhead():
 def run_capture(args):
     agy_fast_md = ""
     af_metrics = {}
-    if BENCH_JS.exists():
+    if BENCH_JS.exists() and not args.credits:
         cmd = ["node", str(BENCH_JS), "analyze", "--local"]
         if args.since:
             cmd.extend(["--since", args.since])
@@ -138,8 +239,9 @@ def run_capture(args):
         agy_fast_md = proc.stdout.strip()
         af_metrics = parse_agy_fast_md(agy_fast_md)
 
-    custom = measure_truncations_and_pre_edit(recent=args.recent, since=args.since)
+    custom = measure_extended_and_credits(recent=args.recent, since=args.since)
     plugins = measure_plugin_overhead()
+    squeeze = measure_squeeze_savings()
 
     snapshot = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -149,6 +251,7 @@ def run_capture(args):
         "agy_fast_metrics": af_metrics,
         "custom_metrics": custom,
         "plugin_overhead": plugins,
+        "wm_squeeze": squeeze,
     }
 
     if args.save:
@@ -160,11 +263,28 @@ def run_capture(args):
 
     if agy_fast_md:
         print(agy_fast_md)
-    print("\n=== Extended Hygiene & Truncation Telemetry ===")
+
+    print("\n=== Extended Hygiene, Cache & Credit Longevity Telemetry ===")
+    print(f"  Overall cache hit rate  : {custom['overall_cache_hit_pct']}% | avg uncached/turn: {custom['avg_uncached_per_turn']:,.0f} tok")
+    print(f"  Total uncached / cached : {custom['total_uncached_tokens']/1e6:.2f}M unc / {custom['total_cached_tokens']/1e6:.1f}M cac | out: {custom['total_output_tokens']/1e6:.2f}M")
     print(f"  run_command truncations : {custom['run_command_truncated']}/{custom['run_command_total']} ({custom['run_command_trunc_pct']}%)")
-    print(f"  read_file unbounded     : {custom['read_file_unbounded']}/{custom['read_file_total']} ({custom['read_file_unbounded_pct']}%) | bursts>=4: {custom['read_file_bursts_4plus']}")
+    print(f"  read_file unbounded/dup : {custom['read_file_unbounded']}/{custom['read_file_total']} ({custom['read_file_unbounded_pct']}%) | exact dups: {custom['read_file_exact_dups']} | bursts>=4: {custom['read_file_bursts_4plus']}")
     print(f"  avg pre-edit tool bytes : {custom['avg_pre_edit_tool_kb']} KB")
+    print(f"  wm-squeeze savings      : {squeeze['cmds']} cmds | saved {squeeze['saved_kb']} KB (~{squeeze['est_tokens_saved']:,} tok)")
     print(f"  enabled plugins         : {plugins['enabled_plugins']} ({plugins['enabled_skills']} skills, {plugins['frontmatter_bytes']:,} B / ~{plugins['est_tokens']:,} tok)")
+
+    if args.credits:
+        print("\n--- Per-Model Credit & Cache Efficiency ---")
+        print(f"  {'Model':26s} | {'Turns':>5s} | {'Hit%':>5s} | {'Unc/Turn':>9s} | {'Total Unc':>9s} | {'Out':>7s}")
+        for m, s in sorted(custom["per_model"].items(), key=lambda x: -x[1]["uncached"]):
+            tot = s["uncached"] + s["cached"]
+            hit = 100.0 * s["cached"] / max(tot, 1)
+            upt = s["uncached"] / max(s["turns"], 1)
+            print(f"  {m:26s} | {s['turns']:5d} | {hit:4.1f}% | {upt/1000:7.1f}k | {s['uncached']/1e6:7.2f}M | {s['out']/1e6:5.2f}M")
+        print("\n--- Cache Hit Rate by Inter-Turn Gap (prior ctx >= 25k) ---")
+        for b, gs in custom["gap_buckets"].items():
+            if gs["n"] > 0:
+                print(f"  {b:8s}: n={gs['n']:5d} | avg_hit={gs['avg_hit_pct']:5.1f}% | misses(<50%)={gs['low50']}")
 
 
 def run_compare(args):
@@ -195,30 +315,34 @@ def run_compare(args):
         av = a.get("agy_fast_metrics", {}).get(k, "—")
         print(f"{k:42s} | {str(bv):22s} | {str(av):22s}")
     for ck, label in [
+        ("overall_cache_hit_pct", "Overall cache hit %"),
+        ("avg_uncached_per_turn", "Avg uncached tokens / turn"),
         ("run_command_trunc_pct", "run_command truncation %"),
         ("read_file_unbounded_pct", "read_file unbounded %"),
+        ("read_file_exact_dups", "read_file exact dups"),
         ("avg_pre_edit_tool_kb", "avg pre-edit tool KB"),
     ]:
         bv = b.get("custom_metrics", {}).get(ck, "—")
         av = a.get("custom_metrics", {}).get(ck, "—")
         print(f"{label:42s} | {str(bv):22s} | {str(av):22s}")
-    bp = b.get("plugin_overhead", {}).get("est_tokens", "—")
-    ap = a.get("plugin_overhead", {}).get("est_tokens", "—")
-    print(f"{'Plugin frontmatter tokens':42s} | {str(bp):22s} | {str(ap):22s}")
+    bsq = b.get("wm_squeeze", {}).get("saved_kb", "—")
+    asq = a.get("wm_squeeze", {}).get("saved_kb", "—")
+    print(f"{'wm-squeeze saved KB':42s} | {str(bsq):22s} | {str(asq):22s}")
 
 
 def main():
-    p = argparse.ArgumentParser(description="agy-bench: AGY CLI offline performance benchmark & A/B comparator")
-    p.add_argument("--recent", type=int, default=30)
-    p.add_argument("--since")
-    p.add_argument("--split-usage", action="store_true")
-    p.add_argument("--save", action="store_true")
-    p.add_argument("--label", default="snapshot")
-    p.add_argument("--compare", action="store_true")
-    p.add_argument("--before")
-    p.add_argument("--after")
+    p = argparse.ArgumentParser(description="AGY CLI offline benchmark & credit/cache A/B comparator")
+    p.add_argument("--recent", type=int, default=30, help="Number of recent sessions to analyze (default: 30)")
+    p.add_argument("--since", help="ISO timestamp filter (e.g. 2026-11-21T12:00:00-05:00)")
+    p.add_argument("--split-usage", action="store_true", help="Split metrics by sessions with vs without agy-fast")
+    p.add_argument("--credits", action="store_true", help="Print per-model credit longevity & inter-turn cache decay tables")
+    p.add_argument("--save", action="store_true", help="Save JSON snapshot to ~/.local/share/whitemagic/agy_benchmarks/")
+    p.add_argument("--label", default="", help="Label for saved snapshot")
+    p.add_argument("--compare", action="store_true", help="Compare oldest vs newest saved snapshots")
+    p.add_argument("--before", help="Explicit before snapshot JSON path")
+    p.add_argument("--after", help="Explicit after snapshot JSON path")
     args = p.parse_args()
-    if args.compare:
+    if args.compare or (args.before and args.after):
         run_compare(args)
     else:
         run_capture(args)

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""
+agy-mode — Per-session Antigravity CLI (agy 1.5.14+) model/cache profile launcher.
+Never mutates ~/.gemini/antigravity-cli/settings.json; uses `--settings` / `--model`
+so you can switch between credit-longevity, orchestrator, and turbo-burst sessions cleanly.
+
+Profiles (grounded in local 40-session telemetry):
+  longevity    -> Gemini 4 Hydrogen (XHigh)  [94.7% cache hit, ~11k uncached/turn, 3.15x longevity]
+  orchestrator -> agy 1.5.14 Orchestrator    [Frontier Planner + high-cache Executor via /model]
+  deep         -> Gemini 4 Argon (High)      [97.7% cache hit even at 30-60s gaps]
+  turbo        -> Gemini 4 Neon (XHigh)      [Fast <15s coding bursts]
+  status       -> Print live per-model cache & uncached-burn telemetry from recent sessions
+"""
+import argparse
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+PROFILES = {
+    "longevity": {
+        "model": "Gemini 4 Hydrogen (XHigh)",
+        "desc": "Maximum cache stability (94.7% hit, ~11k uncached/turn) for long R&D / tool loops",
+    },
+    "orchestrator": {
+        "model": "Orchestrator",
+        "desc": "agy 1.5.14 Planner + Executor split (configure Planner/Executor/Effort via /model)",
+    },
+    "deep": {
+        "model": "Gemini 4 Argon (High)",
+        "desc": "Deep reasoning with 97.7% cache retention across 30-60s tool gaps",
+    },
+    "turbo": {
+        "model": "Gemini 4 Neon (XHigh)",
+        "desc": "Fast coding bursts when inter-turn cadence stays <15s",
+    },
+}
+
+
+def print_status(recent=30):
+    brain = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+    logs = sorted(
+        glob.glob(str(brain / "*" / ".system_generated" / "logs" / "transcript.jsonl")),
+        key=os.path.getmtime,
+        reverse=True,
+    )[:recent]
+    stats = defaultdict(lambda: [0, 0, 0, 0])  # turns, unc, cac, out
+    for lp in logs:
+        for line in Path(lp).read_text(errors="replace").splitlines():
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "PLANNER_RESPONSE":
+                continue
+            unc = int(o.get("input_tokens") or 0)
+            cac = int(o.get("cache_read_tokens") or 0)
+            out = int(o.get("output_tokens") or 0)
+            if unc + cac <= 0:
+                continue
+            m = o.get("model") or "unknown"
+            s = stats[m]
+            s[0] += 1
+            s[1] += unc
+            s[2] += cac
+            s[3] += out
+
+    print(f"=== AGY Model Cache & Credit Longevity ({len(logs)} recent sessions) ===")
+    print(f"{'Model':26s} | {'Turns':>5s} | {'Hit%':>5s} | {'Unc/Turn':>9s} | {'Total Unc':>9s} | {'Out':>7s}")
+    print("-" * 76)
+    for m, (t, u, c, o) in sorted(stats.items(), key=lambda x: -x[1][1]):
+        hit = 100.0 * c / max(u + c, 1)
+        upt = u / max(t, 1)
+        print(f"{m:26s} | {t:5d} | {hit:4.1f}% | {upt/1000:7.1f}k | {u/1e6:7.2f}M | {o/1e6:5.2f}M")
+
+    print("\nAvailable `agy-mode` profiles (non-destructive, per-session):")
+    for k, v in PROFILES.items():
+        print(f"  agy-mode {k:13s} -> {v['model']:26s} ({v['desc']})")
+
+
+def main():
+    argv = sys.argv[1:]
+    dry_run = False
+    cleaned = []
+    for a in argv:
+        if a == "--dry-run" and not cleaned:
+            dry_run = True
+        elif a == "--dry-run" and len(cleaned) == 1:
+            dry_run = True
+        else:
+            cleaned.append(a)
+
+    if not cleaned or cleaned[0] in ("-h", "--help"):
+        print("Usage: agy-mode <longevity|orchestrator|deep|turbo|status> [--dry-run] [agy args...]")
+        return
+
+    profile = cleaned[0]
+    if profile == "status":
+        print_status()
+        return
+    if profile not in PROFILES:
+        sys.stderr.write(f"agy-mode: unknown profile '{profile}'. Choose: {', '.join(PROFILES)} or status\n")
+        sys.exit(2)
+
+    agy_bin = shutil.which("agy") or str(Path.home() / ".local" / "bin" / "agy")
+    p = PROFILES[profile]
+    extra = [a for a in cleaned[1:] if a != "--"]
+    cmd = [agy_bin, "--model", p["model"]] + extra
+    if dry_run:
+        print(" ".join(cmd))
+        return
+    os.execvp(agy_bin, cmd)
+
+
+if __name__ == "__main__":
+    main()

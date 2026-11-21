@@ -1,0 +1,10 @@
+[package]
+name = "wm-squeeze"
+version = "2.0.0"
+edition = "2021"
+description = "Zero-dependency deterministic CLI output compressor and safe read-only proxy for Antigravity CLI"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Portable (macOS + Linux) fast (<25ms, stdlib-only) custom AGY CLI statusLine renderer.
-Shows: Model/Effort | Mode | Context Gauge (color-coded for 120k/180k TTFT cliff) |
-Active Subagents | Git branch | Root Disk Free (warns <15 GiB).
+Portable (macOS + Linux) fast (<20ms, stdlib-only) custom AGY CLI statusLine renderer (Wave 3).
+Shows:
+  Model/Effort | Mode | Context Gauge (120k/180k cliff) |
+  Live Cache Hit % + Warmth Countdown (<25s warm / 25-55s COOL / >=55s COLD) |
+  Session Uncached Burn | Active Subagents | Git branch | Root Disk Free.
 """
 import json
 import os
 import shutil
 import sys
+import time
+from datetime import datetime
+from pathlib import Path
 
 RST = "\033[0m"
 DIM = "\033[2m"
@@ -38,9 +43,69 @@ def short_git_branch(cwd):
 def fmt_k(n):
     if not n:
         return "0"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
     if n >= 1000:
         return f"{n/1000:.0f}k"
     return str(n)
+
+
+def fmt_age(sec):
+    s = max(0, int(sec))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    return f"{s // 3600}h"
+
+
+def resolve_transcript(data):
+    tp = data.get("transcript_path") or data.get("transcriptPath")
+    if tp and os.path.isfile(tp):
+        return Path(tp)
+    cid = data.get("conversation_id") or data.get("conversationId") or data.get("session_id")
+    if cid:
+        cand = Path.home() / ".gemini" / "antigravity-cli" / "brain" / str(cid) / ".system_generated" / "logs" / "transcript.jsonl"
+        if cand.is_file():
+            return cand
+    return None
+
+
+def read_cache_telemetry(tp):
+    """O(1) tail read (last 48 KB) of active transcript.jsonl (<3ms)."""
+    try:
+        sz = tp.stat().st_size
+        with open(tp, "rb") as f:
+            if sz > 49152:
+                f.seek(sz - 49152)
+            tail = f.read().decode("utf-8", errors="replace")
+        last_hit = None
+        last_ts = None
+        recent_unc = 0
+        for line in tail.splitlines():
+            if '"PLANNER_RESPONSE"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "PLANNER_RESPONSE":
+                continue
+            unc = int(o.get("input_tokens") or 0)
+            cac = int(o.get("cache_read_tokens") or 0)
+            ctx = unc + cac
+            if ctx > 0:
+                recent_unc += unc
+                last_hit = 100.0 * cac / ctx
+            ts_raw = o.get("created_at")
+            if ts_raw:
+                try:
+                    last_ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    pass
+        return last_hit, last_ts, recent_unc
+    except Exception:
+        return None, None, 0
 
 
 def main():
@@ -78,6 +143,25 @@ def main():
             tip = ""
         pct_s = f" {used_pct:.0f}%" if isinstance(used_pct, (int, float)) else ""
         parts.append(f"{c_col}ctx:{fmt_k(in_tok)}{pct_s}{tip}{RST}")
+
+    # Live cache hit % + warmth countdown + uncached burn
+    tp = resolve_transcript(data)
+    if tp:
+        hit, last_ts, rec_unc = read_cache_telemetry(tp)
+        if hit is not None:
+            h_col = GREEN if hit >= 85.0 else (YELLOW if hit >= 65.0 else RED)
+            cache_seg = f"{h_col}hit:{hit:.0f}%{RST}"
+            if last_ts is not None:
+                age = max(0.0, time.time() - last_ts)
+                if age < 25:
+                    cache_seg += f" {GREEN}warm:{fmt_age(age)}{RST}"
+                elif age < 55:
+                    cache_seg += f" {YELLOW}COOL:{fmt_age(age)}!{RST}"
+                else:
+                    cache_seg += f" {RED}COLD:{fmt_age(age)}{RST}"
+            if rec_unc > 0:
+                cache_seg += f" {DIM}unc:{fmt_k(rec_unc)}{RST}"
+            parts.append(cache_seg)
 
     subs = data.get("subagents") or []
     running_subs = sum(1 for s in subs if isinstance(s, dict) and s.get("status") == "running")

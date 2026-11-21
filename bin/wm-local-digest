@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+wm-local-digest — Zero-cloud-credit RLM/LID external corpus & log digester.
+Queries your local llama-server (default http://127.0.0.1:18898, Qwen3-4B / Valkyrie)
+with optional semantic chunk ranking via local bge-small embeddings (:18899) so huge
+logs, transcripts, and documents stay OUTSIDE Gemini 4's prompt window ($0 cloud tokens).
+"""
+import argparse
+import json
+import math
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+LLM_URL = os.environ.get("WM_LOCAL_LLM_URL", "http://127.0.0.1:18898/v1/chat/completions")
+LLM_MODEL = os.environ.get("WM_LOCAL_LLM_MODEL", "valkyrie")
+EMBED_URL = os.environ.get("WM_LOCAL_EMBED_URL", "http://127.0.0.1:18899/v1/embeddings")
+EMBED_MODEL = os.environ.get("WM_LOCAL_EMBED_MODEL", "bge-small")
+
+
+def post_json(url, payload, timeout=30):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def chunk_text(text, chunk_chars=900, overlap=120):
+    if len(text) <= chunk_chars:
+        return [text]
+    chunks = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(n, start + chunk_chars)
+        if end < n:
+            nl = text.rfind("\n", start + chunk_chars // 2, end)
+            if nl > start:
+                end = nl + 1
+        chunks.append(text[start:end])
+        if end >= n:
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
+
+def cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(y * y for y in b)) or 1.0
+    return dot / (na * nb)
+
+
+def rank_chunks(chunks, query, top_k=3):
+    if len(chunks) <= top_k:
+        return list(enumerate(chunks))
+    q_terms = [t for t in re.findall(r"[a-z0-9_@.-]{3,}", query.lower()) if t not in ("what", "does", "that", "this", "with", "from", "have", "were", "the", "and", "for")]
+    lex_scores = []
+    for idx, c in enumerate(chunks):
+        low = c.lower()
+        # Exact rare-term & identifier hits carry strong signal
+        hits = sum(2.5 if ("@" in t or "_" in t or any(ch.isdigit() for ch in t)) else 1.0 for t in q_terms if t in low)
+        freq = sum(min(low.count(t), 4) * 0.25 for t in q_terms)
+        lex_scores.append(hits + freq)
+
+    # Blend with local bge-small semantic cosine similarity (<=900 chars fits 512-tok ctx safely)
+    sem_scores = [0.0] * len(chunks)
+    cand_indices = sorted(range(len(chunks)), key=lambda i: (-lex_scores[i], i))[:32]
+    try:
+        q_emb = post_json(EMBED_URL, {"model": EMBED_MODEL, "input": query[:450]}, timeout=3)["data"][0]["embedding"]
+        for i in range(0, len(cand_indices), 16):
+            sub_idx = cand_indices[i : i + 16]
+            batch = [chunks[k][:850] for k in sub_idx]
+            res = post_json(EMBED_URL, {"model": EMBED_MODEL, "input": batch}, timeout=6)["data"]
+            for k, item in zip(sub_idx, res):
+                sem_scores[k] = cosine(q_emb, item["embedding"])
+    except Exception:
+        pass
+
+    scored = [((lex_scores[i] * 0.65) + (sem_scores[i] * 4.0), i, chunks[i]) for i in range(len(chunks))]
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    chosen = sorted(scored[:top_k], key=lambda x: x[1])
+    return [(idx, txt) for _, idx, txt in chosen]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Digest huge files/logs locally via Qwen3-4B (:18898) at $0 cloud cost.")
+    ap.add_argument("--file", "-f", help="Path to file to inspect (reads stdin if omitted)")
+    ap.add_argument("--query", "-q", required=True, help="Targeted question or extraction instruction")
+    ap.add_argument("--top-k", type=int, default=3, help="Max chunks returned / passed to local LLM (default: 3)")
+    ap.add_argument("--max-tokens", type=int, default=220, help="Max LLM output tokens when --llm is set (default: 220)")
+    ap.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds for --llm (default: 30)")
+    ap.add_argument("--llm", action="store_true", help="Synthesize selected chunks via local llama-server (:18898); default is <1.5s hybrid bge-small+BM25 extract to keep Gemini 4 prefix cache warm")
+    args = ap.parse_args()
+
+    if args.file:
+        p = Path(args.file).expanduser()
+        if not p.is_file():
+            sys.stderr.write(f"wm-local-digest: file not found: {p}\n")
+            sys.exit(1)
+        text = p.read_text(encoding="utf-8", errors="replace")
+        src_label = f"{p.name} ({len(text)/1024:.1f} KB)"
+    else:
+        text = sys.stdin.read()
+        src_label = f"stdin ({len(text)/1024:.1f} KB)"
+
+    if not text.strip():
+        print("[wm-local-digest] Empty input.")
+        return
+
+    chunks = chunk_text(text)
+    selected = rank_chunks(chunks, args.query, top_k=args.top_k)
+    context = "\n\n".join(f"--- Chunk {idx+1}/{len(chunks)} ---\n{c}" for idx, c in selected)
+
+    if not args.llm:
+        out = context[:3600]
+        red = 100.0 * (1.0 - len(out) / max(len(text), 1))
+        print(f"[wm-local-digest | $0 hybrid-extract | {src_label} -> {len(out)/1024:.1f} KB (-{red:.0f}%) | {len(selected)}/{len(chunks)} chunks]")
+        print(out)
+        return
+
+    prompt = (
+        "/no_think\n"
+        "You are a concise, lossless engineering extractor. "
+        "Answer ONLY from the excerpts with exact numbers, paths, and facts (<=6 bullets, no fluff).\n\n"
+        f"SOURCE: {src_label}\nQUERY: {args.query}\n\nEXCERPTS:\n{context[:3000]}"
+    )
+
+    try:
+        res = post_json(
+            LLM_URL,
+            {
+                "model": LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": args.max_tokens,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=args.timeout,
+        )
+        msg = res["choices"][0]["message"]["content"].strip()
+        # Strip Qwen3 <think>...</think> wrapper if emitted
+        msg = re.sub(r"<think>.*?</think>\s*", "", msg, flags=re.S).strip()
+        print(f"[wm-local-digest | $0 local {LLM_MODEL} | {src_label} | {len(selected)}/{len(chunks)} chunks]")
+        print(msg[:4000])
+    except Exception as e:
+        sys.stderr.write(f"[wm-local-digest] local LLM unavailable ({e}); falling back to ranked excerpts:\n")
+        print(context[:4000])
+
+
+if __name__ == "__main__":
+    main()

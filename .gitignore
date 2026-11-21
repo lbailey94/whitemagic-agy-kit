@@ -1,4 +1,4 @@
+tools/wm-squeeze/target/
 __pycache__/
 *.pyc
 .DS_Store
-*.bak-*

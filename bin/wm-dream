@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""
+wm-dream — Offline AGY & WhiteMagic consolidation daemon (Anthropic /dream + Google SIM + Lakshmi homeostasis).
+Distills:
+  1. Recurring SIM tool_failure anti-patterns (sim_ledger.jsonl)
+  2. Rolling 7-day AGY cache-hit & uncached-token telemetry (agy_telemetry.jsonl)
+  3. Cumulative wm-squeeze token savings (wm_squeeze_stats.jsonl)
+  4. Rule-file byte caps & plugin bloat check
+Writes a tiny (<480 B) immutable digest to ~/.local/share/whitemagic/dream_digest.md
+for zero-latency Turn-0 SessionStart injection.
+"""
+import argparse
+import json
+import os
+import time
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+DATA_DIR = HOME / ".local" / "share" / "whitemagic"
+SIM_LEDGER = DATA_DIR / "sim_ledger.jsonl"
+TELEM_LOG = DATA_DIR / "agy_telemetry.jsonl"
+SQUEEZE_LOG = DATA_DIR / "wm_squeeze_stats.jsonl"
+OUT_DIGEST = DATA_DIR / "dream_digest.md"
+
+
+def load_jsonl(path, tail_lines=500):
+    if not path.exists():
+        return []
+    out = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines()[-tail_lines:]:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw))
+        except Exception:
+            continue
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Consolidate SIM failures, AGY cache telemetry, and wm-squeeze savings.")
+    ap.add_argument("--dry-run", action="store_true", help="Print digest without writing dream_digest.md")
+    ap.add_argument("--window-days", type=int, default=7, help="Telemetry lookback window in days (default: 7)")
+    args = ap.parse_args()
+
+    now = time.time()
+    cutoff = now - args.window_days * 86400
+
+    # 1. Recurring SIM failures
+    sim_rows = load_jsonl(SIM_LEDGER, 400)
+    fail_counts = Counter()
+    for r in sim_rows:
+        if r.get("event") == "tool_failure":
+            tool = r.get("tool", "?")
+            err = str(r.get("error", "")).splitlines()[0][:55]
+            fail_counts[f"{tool}: {err}"] += 1
+
+    # 2. Rolling AGY telemetry
+    telem_rows = [r for r in load_jsonl(TELEM_LOG, 300) if float(r.get("ts_epoch", now)) >= cutoff]
+    tot_unc = sum(int(r.get("session_uncached", 0)) for r in telem_rows)
+    tot_cac = sum(int(r.get("session_cached", 0)) for r in telem_rows)
+    hits = [float(r["last_hit_pct"]) for r in telem_rows if r.get("last_hit_pct") is not None]
+    avg_hit = (sum(hits) / len(hits)) if hits else None
+
+    # 3. wm-squeeze savings
+    sq_rows = [r for r in load_jsonl(SQUEEZE_LOG, 2000) if float(r.get("ts", now)) >= cutoff]
+    sq_saved = sum(int(r.get("saved", 0)) for r in sq_rows)
+    sq_raw = sum(int(r.get("raw", 0)) for r in sq_rows)
+
+    # 4. Rule cap check
+    rule_warns = []
+    for rf in (HOME / ".gemini" / "GEMINI.md", HOME / "GEMINI.md"):
+        if rf.exists():
+            sz = rf.stat().st_size
+            if sz > 18000:
+                rule_warns.append(f"{rf.name}={sz//1024}KB(>75%)")
+
+    lines = [
+        f"Dream Digest ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC, {args.window_days}d window):"
+    ]
+    if telem_rows:
+        hit_s = f"{avg_hit:.1f}%" if avg_hit is not None else "n/a"
+        lines.append(
+            f"  - AGY Telemetry: {len(telem_rows)} stops | avg cache hit {hit_s} | unc {tot_unc/1e6:.2f}M / cac {tot_cac/1e6:.1f}M"
+        )
+    if sq_rows:
+        pct = 100.0 * sq_saved / max(sq_raw, 1)
+        lines.append(
+            f"  - wm-squeeze: {len(sq_rows)} cmds | saved {sq_saved/1024:.1f} KB ({pct:.0f}%, ~{sq_saved//4:,} tok)"
+        )
+    if fail_counts:
+        top_f = "; ".join(f"({n}x) {k}" for k, n in fail_counts.most_common(2))
+        lines.append(f"  - Top recurring tool failures: {top_f[:160]}")
+    if rule_warns:
+        lines.append(f"  - WARN rule budget: {', '.join(rule_warns)}")
+
+    digest = "\n".join(lines)
+    if len(digest) > 480:
+        digest = digest[:477] + "..."
+
+    if args.dry_run:
+        print(digest)
+        return
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_DIGEST.write_text(digest + "\n", encoding="utf-8")
+    print(f"Wrote {OUT_DIGEST} ({len(digest)} B):\n{digest}")
+
+
+if __name__ == "__main__":
+    main()
