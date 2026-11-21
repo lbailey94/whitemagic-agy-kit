@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""
+agy-bench — Portable (macOS + Linux) Antigravity CLI Offline Benchmark & A/B Comparator.
+Combines agy-fast's millisecond transcript analyzer with custom truncation, plugin bloat,
+and pre-edit context metrics, saving reproducible snapshots to ~/.local/share/whitemagic/agy_benchmarks/.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+BENCH_JS = HOME / ".gemini" / "config" / "plugins" / "agy-fast" / "dist" / "benchmark.mjs"
+BRAIN_DIR = HOME / ".gemini" / "antigravity-cli" / "brain"
+OUT_DIR = HOME / ".local" / "share" / "whitemagic" / "agy_benchmarks"
+CFG_JSON = HOME / ".gemini" / "config" / "config.json"
+PLUGINS_DIR = HOME / ".gemini" / "config" / "plugins"
+
+
+def parse_agy_fast_md(md_text):
+    metrics = {}
+    for line in md_text.splitlines():
+        m = re.match(r"^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$", line)
+        if m and m.group(1) not in ("Metric", ":---"):
+            metrics[m.group(1).strip()] = m.group(2).strip()
+    return metrics
+
+
+def measure_truncations_and_pre_edit(recent=30, since=None):
+    logs = sorted(
+        glob.glob(str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    if since:
+        since_ts = datetime.fromisoformat(since.replace("Z", "+00:00")).timestamp()
+        logs = [lp for lp in logs if os.path.getmtime(lp) >= since_ts]
+    else:
+        logs = logs[:recent]
+
+    total_cmds = trunc_cmds = total_reads = unbounded_reads = bursts_4plus = 0
+    pre_edit_kbs = []
+    for lp in logs:
+        first_edit = False
+        cum_bytes = 0
+        with open(lp, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                tcalls = obj.get("tool_calls") or []
+                rf_turn = 0
+                for tc in tcalls:
+                    name = tc.get("name") or ""
+                    args = tc.get("args") or tc.get("arguments") or {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    if name == "read_file":
+                        rf_turn += 1
+                        total_reads += 1
+                        if not args.get("StartLine") and not args.get("EndLine"):
+                            unbounded_reads += 1
+                    elif name == "run_command":
+                        total_cmds += 1
+                    elif name in ("edit_file", "write_file", "mcp_agy-fast_fast_apply_edits") and not first_edit:
+                        first_edit = True
+                        pre_edit_kbs.append(cum_bytes / 1024.0)
+                if rf_turn >= 4:
+                    bursts_4plus += 1
+                if obj.get("type") not in ("USER_INPUT", "PLANNER_RESPONSE"):
+                    content = str(obj.get("content") or "")
+                    cum_bytes += len(content)
+                    if "truncated" in content.lower() and ("Command output:" in content or "Command exited" in content):
+                        trunc_cmds += 1
+
+    return {
+        "sessions_scanned": len(logs),
+        "run_command_total": total_cmds,
+        "run_command_truncated": trunc_cmds,
+        "run_command_trunc_pct": round(100.0 * trunc_cmds / max(total_cmds, 1), 1),
+        "read_file_total": total_reads,
+        "read_file_unbounded": unbounded_reads,
+        "read_file_unbounded_pct": round(100.0 * unbounded_reads / max(total_reads, 1), 1),
+        "read_file_bursts_4plus": bursts_4plus,
+        "avg_pre_edit_tool_kb": round(sum(pre_edit_kbs) / max(len(pre_edit_kbs), 1), 1) if pre_edit_kbs else 0.0,
+    }
+
+
+def measure_plugin_overhead():
+    if not CFG_JSON.exists():
+        return {"enabled_plugins": 0, "enabled_skills": 0, "frontmatter_bytes": 0, "est_tokens": 0}
+    cd = json.loads(CFG_JSON.read_text(encoding="utf-8"))
+    plugs = cd.get("plugins") or {}
+    enabled = sorted(k for k, v in plugs.items() if isinstance(v, dict) and v.get("enabled"))
+    fm_bytes = 0
+    skill_cnt = 0
+    for pn in enabled:
+        pdir = PLUGINS_DIR / pn
+        if not pdir.is_dir():
+            continue
+        for sf in glob.glob(str(pdir / "**" / "SKILL.md"), recursive=True):
+            skill_cnt += 1
+            txt = Path(sf).read_text(encoding="utf-8", errors="replace")
+            if txt.startswith("---"):
+                parts = txt.split("---", 2)
+                if len(parts) >= 2:
+                    fm_bytes += len(parts[1].encode("utf-8"))
+    return {
+        "enabled_plugins": len(enabled),
+        "enabled_names": enabled,
+        "enabled_skills": skill_cnt,
+        "frontmatter_bytes": fm_bytes,
+        "est_tokens": fm_bytes // 4,
+    }
+
+
+def run_capture(args):
+    agy_fast_md = ""
+    af_metrics = {}
+    if BENCH_JS.exists():
+        cmd = ["node", str(BENCH_JS), "analyze", "--local"]
+        if args.since:
+            cmd.extend(["--since", args.since])
+            if args.split_usage:
+                cmd.append("--split-usage")
+        else:
+            cmd.extend(["--recent", str(args.recent)])
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        agy_fast_md = proc.stdout.strip()
+        af_metrics = parse_agy_fast_md(agy_fast_md)
+
+    custom = measure_truncations_and_pre_edit(recent=args.recent, since=args.since)
+    plugins = measure_plugin_overhead()
+
+    snapshot = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "label": args.label or "snapshot",
+        "since": args.since,
+        "recent": args.recent,
+        "agy_fast_metrics": af_metrics,
+        "custom_metrics": custom,
+        "plugin_overhead": plugins,
+    }
+
+    if args.save:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{snapshot['label']}.json"
+        out_path = OUT_DIR / fname
+        out_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        print(f"Saved snapshot -> {out_path}\n")
+
+    if agy_fast_md:
+        print(agy_fast_md)
+    print("\n=== Extended Hygiene & Truncation Telemetry ===")
+    print(f"  run_command truncations : {custom['run_command_truncated']}/{custom['run_command_total']} ({custom['run_command_trunc_pct']}%)")
+    print(f"  read_file unbounded     : {custom['read_file_unbounded']}/{custom['read_file_total']} ({custom['read_file_unbounded_pct']}%) | bursts>=4: {custom['read_file_bursts_4plus']}")
+    print(f"  avg pre-edit tool bytes : {custom['avg_pre_edit_tool_kb']} KB")
+    print(f"  enabled plugins         : {plugins['enabled_plugins']} ({plugins['enabled_skills']} skills, {plugins['frontmatter_bytes']:,} B / ~{plugins['est_tokens']:,} tok)")
+
+
+def run_compare(args):
+    snaps = sorted(OUT_DIR.glob("*.json"))
+    if len(snaps) < 2 and not (args.before and args.after):
+        print(f"Need at least 2 saved snapshots in {OUT_DIR} (found {len(snaps)}). Run `agy-bench --save --label after` first.")
+        sys.exit(1)
+    p_before = Path(args.before) if args.before else snaps[0]
+    p_after = Path(args.after) if args.after else snaps[-1]
+    b = json.loads(p_before.read_text(encoding="utf-8"))
+    a = json.loads(p_after.read_text(encoding="utf-8"))
+    print(f"=== AGY CLI A/B Comparison ===\nBefore: {p_before.name} ({b.get('ts','')[:19]})\nAfter : {p_after.name} ({a.get('ts','')[:19]})\n")
+    keys = [
+        "Average context size (tokens)",
+        "Turns >= 150k context",
+        "Average Prompt Cache hit rate",
+        "Effective throughput (tok/s)",
+        "Redundant same-turn edit_file ratio",
+        "Read-only search shell ratio",
+        "Multi-tool stream buffer wait (s)",
+        "Multimodal >=180k turns (media loaded)",
+        "agy-fast tool calls",
+    ]
+    print(f"{'Metric':42s} | {'Before':22s} | {'After':22s}")
+    print("-" * 92)
+    for k in keys:
+        bv = b.get("agy_fast_metrics", {}).get(k, "—")
+        av = a.get("agy_fast_metrics", {}).get(k, "—")
+        print(f"{k:42s} | {str(bv):22s} | {str(av):22s}")
+    for ck, label in [
+        ("run_command_trunc_pct", "run_command truncation %"),
+        ("read_file_unbounded_pct", "read_file unbounded %"),
+        ("avg_pre_edit_tool_kb", "avg pre-edit tool KB"),
+    ]:
+        bv = b.get("custom_metrics", {}).get(ck, "—")
+        av = a.get("custom_metrics", {}).get(ck, "—")
+        print(f"{label:42s} | {str(bv):22s} | {str(av):22s}")
+    bp = b.get("plugin_overhead", {}).get("est_tokens", "—")
+    ap = a.get("plugin_overhead", {}).get("est_tokens", "—")
+    print(f"{'Plugin frontmatter tokens':42s} | {str(bp):22s} | {str(ap):22s}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="agy-bench: AGY CLI offline performance benchmark & A/B comparator")
+    p.add_argument("--recent", type=int, default=30)
+    p.add_argument("--since")
+    p.add_argument("--split-usage", action="store_true")
+    p.add_argument("--save", action="store_true")
+    p.add_argument("--label", default="snapshot")
+    p.add_argument("--compare", action="store_true")
+    p.add_argument("--before")
+    p.add_argument("--after")
+    args = p.parse_args()
+    if args.compare:
+        run_compare(args)
+    else:
+        run_capture(args)
+
+
+if __name__ == "__main__":
+    main()

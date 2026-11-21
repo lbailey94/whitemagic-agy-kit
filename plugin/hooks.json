@@ -1,0 +1,42 @@
+{
+  "whitemagic-session-preflight": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 -S -B ./hooks/session_start_brief.py",
+        "timeout": 5
+      }
+    ]
+  },
+  "data-loss-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -B ./hooks/pre_tool_guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "sim-failure-capture": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": "run_command|call_mcp_tool|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -B ./hooks/post_tool_sim.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

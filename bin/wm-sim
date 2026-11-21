@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""
+wm-sim — Portable (macOS + Linux) Self-Improvement Memory (SIM) CLI & AGY Hygiene Auditor.
+Implements structured continual self-improvement memory (arXiv:2611.18856 / Harness2 / Model 801).
+"""
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+LEDGER_PATH = Path(
+    os.environ.get("WM_SIM_LEDGER", str(HOME / ".local" / "share" / "whitemagic" / "sim_ledger.jsonl"))
+)
+WM3_BIN = Path(os.environ.get("WM3_BIN", shutil.which("wm3") or str(HOME / ".local" / "bin" / "wm3")))
+WM3_STORE = Path(os.environ.get("WM3_STORE", str(HOME / ".local" / "share" / "whitemagic" / "gen3")))
+RULE_FILES = [
+    HOME / ".gemini" / "GEMINI.md",
+    HOME / "GEMINI.md",
+    HOME / ".gemini" / "config" / "plugins" / "whitemagic-agy-kit" / "rules" / "AGENTS.md",
+]
+AGY_RULE_BYTE_CAP = 24000
+
+
+def ensure_ledger():
+    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not LEDGER_PATH.exists():
+        LEDGER_PATH.touch()
+
+
+def read_entries():
+    ensure_ledger()
+    entries = []
+    with open(LEDGER_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return entries
+
+
+def append_entry(entry):
+    ensure_ledger()
+    with open(LEDGER_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def cmd_log(args):
+    now = datetime.now(timezone.utc).isoformat()
+    digest = hashlib.sha256(
+        f"{now}:{args.domain}:{args.group}:{args.target}:{args.rationale}".encode("utf-8")
+    ).hexdigest()[:10]
+    entry = {
+        "id": f"sim-{digest}",
+        "event": "experiment",
+        "ts": now,
+        "domain": args.domain,
+        "problem_group": args.group,
+        "target": args.target,
+        "rationale": args.rationale,
+        "predicted_outcome": args.predicted,
+        "observed_outcome": args.observed,
+        "eval_context": args.eval_context,
+        "status": args.status,
+        "model": args.model,
+        "synced_wm3": False,
+    }
+    append_entry(entry)
+    print(f"Logged {entry['id']} [{entry['domain']}/{entry['problem_group']}] status={entry['status']}")
+
+
+def cmd_query(args):
+    entries = [e for e in read_entries() if e.get("event") == "experiment" or args.include_failures]
+    q = (args.query or "").lower().strip()
+    if args.domain:
+        entries = [e for e in entries if e.get("domain", "").lower() == args.domain.lower()]
+    if q:
+        entries = [e for e in entries if q in json.dumps(e, ensure_ascii=False).lower()]
+
+    if not entries:
+        print("No matching SIM entries found.")
+        return
+
+    grouped = defaultdict(list)
+    for e in entries[-args.limit :]:
+        grp = e.get("problem_group") or e.get("tool") or "general"
+        grouped[grp].append(e)
+
+    print(f"SIM Query Results ({len(entries)} total matched, showing up to {args.limit}):\n")
+    for grp, items in grouped.items():
+        print(f"## Problem Group: {grp} ({len(items)})")
+        for it in items:
+            if it.get("event") == "tool_failure":
+                print(
+                    f"  - [{it.get('ts','')[:19]}] FAIL `{it.get('tool')}`: {it.get('cmd_preview','')} -> {it.get('error','')[:140]}"
+                )
+            else:
+                print(
+                    f"  - [{it.get('id')}] ({it.get('status')}, {it.get('model','')}, {it.get('ts','')[:10]}) target=`{it.get('target')}`"
+                )
+                print(f"      Rationale: {it.get('rationale')}")
+                print(f"      Predicted: {it.get('predicted_outcome')}")
+                print(f"      Observed:  {it.get('observed_outcome')}")
+                if it.get("eval_context"):
+                    print(f"      EvalCtx:   {it.get('eval_context')}")
+        print()
+
+
+def cmd_failures(args):
+    entries = [e for e in read_entries() if e.get("event") == "tool_failure"]
+    if not entries:
+        print("No auto-captured tool failures in SIM ledger.")
+        return
+    print(f"Recent Tool Failures ({min(len(entries), args.limit)} of {len(entries)}):")
+    for it in entries[-args.limit :]:
+        print(
+            f"  - [{it.get('ts','')[:19]}] {it.get('tool')} ({it.get('cwd','')}) | {it.get('cmd_preview','')} => {it.get('error','')[:160]}"
+        )
+
+
+def cmd_audit(args):
+    print("=== AGY CLI & WhiteMagic SIM Hygiene Audit ===\n")
+    print("1. Rule Files (AGY per-file cap: 24,000 bytes):")
+    seen_hashes = {}
+    rule_word_sets = []
+    for rf in RULE_FILES:
+        if rf.exists():
+            data = rf.read_bytes()
+            text = data.decode("utf-8", errors="replace")
+            h = hashlib.sha256(data).hexdigest()[:12]
+            pct = (len(data) / AGY_RULE_BYTE_CAP) * 100
+            dup = f" [DUP content of {seen_hashes[h]}]" if h in seen_hashes else ""
+            seen_hashes[h] = str(rf)
+            words = set(w.lower() for w in text.split() if len(w) > 3)
+            for prev_rf, prev_words in rule_word_sets:
+                if words and prev_words:
+                    jacc = len(words & prev_words) / len(words | prev_words)
+                    if jacc >= 0.65 and not dup:
+                        dup = f" [WARN near-dup of {prev_rf}: {jacc*100:.0f}% overlap]"
+            rule_word_sets.append((str(rf), words))
+            flag = " [WARN >75%]" if pct > 75 else " [OK]"
+            print(f"   - {rf}: {len(data):,} B ({pct:.1f}% of cap){flag}{dup}")
+        else:
+            print(f"   - {rf}: not present")
+
+    cfg = HOME / ".gemini" / "config"
+    hooks_file = cfg / "hooks.json"
+    mcp_file = cfg / "mcp_config.json"
+    skills_dir = cfg / "skills"
+    cfg_json = cfg / "config.json"
+    plugins_dir = cfg / "plugins"
+    print("\n2. Global AGY Customizations (~/.gemini/config):")
+    if hooks_file.exists():
+        try:
+            hd = json.loads(hooks_file.read_text(encoding="utf-8"))
+            print(f"   - hooks.json: VALID ({len(hd)} named hook groups: {', '.join(hd.keys())})")
+        except Exception as e:
+            print(f"   - hooks.json: INVALID JSON ({e})")
+    else:
+        print("   - hooks.json: plugin-managed or not configured")
+
+    if mcp_file.exists():
+        try:
+            md = json.loads(mcp_file.read_text(encoding="utf-8"))
+            servers = list((md.get("mcpServers") or {}).keys())
+            print(f"   - mcp_config.json: VALID ({len(servers)} servers: {', '.join(servers)})")
+        except Exception as e:
+            print(f"   - mcp_config.json: INVALID JSON ({e})")
+    else:
+        print("   - mcp_config.json: not configured")
+
+    if skills_dir.exists():
+        skills = sorted(p.name for p in skills_dir.iterdir() if p.is_dir() and (p / "SKILL.md").exists())
+        print(f"   - custom skills ({len(skills)}): {', '.join(skills)}")
+
+    if cfg_json.exists() and plugins_dir.exists():
+        try:
+            cd = json.loads(cfg_json.read_text(encoding="utf-8"))
+            plugs = cd.get("plugins") or {}
+            enabled_plugs = sorted(k for k, v in plugs.items() if isinstance(v, dict) and v.get("enabled"))
+            disabled_plugs = sorted(k for k, v in plugs.items() if isinstance(v, dict) and not v.get("enabled"))
+            fm_bytes = 0
+            skill_cnt = 0
+            for pn in enabled_plugs:
+                pdir = plugins_dir / pn
+                if not pdir.is_dir():
+                    continue
+                for sf in glob.glob(str(pdir / "**" / "SKILL.md"), recursive=True):
+                    skill_cnt += 1
+                    txt = Path(sf).read_text(encoding="utf-8", errors="replace")
+                    if txt.startswith("---"):
+                        parts = txt.split("---", 2)
+                        if len(parts) >= 2:
+                            fm_bytes += len(parts[1].encode("utf-8"))
+            tok_est = fm_bytes // 4
+            pflag = " [WARN >3k tok prompt bloat]" if tok_est > 3000 else " [OK]"
+            print(
+                f"   - plugins: {len(enabled_plugs)} enabled ({', '.join(enabled_plugs)}), "
+                f"{len(disabled_plugs)} disabled | enabled plugin skills={skill_cnt}, "
+                f"frontmatter={fm_bytes:,} B (~{tok_est:,} tok){pflag}"
+            )
+        except Exception as e:
+            print(f"   - plugins: error reading config.json ({e})")
+
+    print("\n3. Runtime & Disk Hygiene:")
+    brief = HOME / "SharedWorkspace" / "PREFLIGHT_BRIEF.md"
+    if brief.exists():
+        age_m = int((time.time() - brief.stat().st_mtime) / 60)
+        bflag = " [WARN stale >60m]" if age_m > 60 else " [OK]"
+        print(f"   - PREFLIGHT_BRIEF.md age: {age_m}m{bflag}")
+    du = shutil.disk_usage("/")
+    free_gb = du.free / (1024 ** 3)
+    used_pct = (du.used / du.total) * 100
+    dflag = " [WARN >90% full]" if used_pct > 90 else " [OK]"
+    print(f"   - Root disk '/': {free_gb:.2f} GiB free ({used_pct:.1f}% used){dflag}")
+
+    entries = read_entries()
+    exps = [e for e in entries if e.get("event") == "experiment"]
+    fails = [e for e in entries if e.get("event") == "tool_failure"]
+    unsynced = [e for e in exps if not e.get("synced_wm3")]
+    groups = sorted(set(e.get("problem_group", "general") for e in exps))
+    print("\n4. SIM Ledger:")
+    print(f"   - Path: {LEDGER_PATH}")
+    print(f"   - Total records: {len(entries)} ({len(exps)} experiments, {len(fails)} auto-captured tool failures)")
+    print(f"   - Problem groups ({len(groups)}): {', '.join(groups) if groups else 'none'}")
+    print(f"   - Unsynced to wm3: {len(unsynced)}")
+
+
+def cmd_sync_wm3(args):
+    entries = read_entries()
+    unsynced = [e for e in entries if e.get("event") == "experiment" and not e.get("synced_wm3")]
+    if not unsynced:
+        print("All SIM experiment entries are already synced to WhiteMagic Gen3.")
+        return
+
+    if not WM3_BIN.exists():
+        print(f"wm3 binary not found at {WM3_BIN} (local JSONL ledger still preserved).", file=sys.stderr)
+        sys.exit(1)
+
+    lines = ["[SIM Ledger Distillation]"]
+    for e in unsynced:
+        lines.append(
+            f"- {e['id']} [{e['domain']}/{e['problem_group']}] ({e['status']}, {e.get('model','')}): "
+            f"target={e['target']} | rationale={e['rationale']} | predicted={e['predicted_outcome']} | observed={e['observed_outcome']}"
+        )
+    summary_text = "\n".join(lines)
+
+    proc = subprocess.run(
+        [str(WM3_BIN), "--store", str(WM3_STORE), "remember", "--source", "tool:wm-sim", summary_text],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        print(f"wm3 remember failed: {proc.stderr or proc.stdout}", file=sys.stderr)
+        sys.exit(proc.returncode)
+
+    for e in unsynced:
+        e["synced_wm3"] = True
+    tmp = LEDGER_PATH.with_suffix(".jsonl.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    tmp.replace(LEDGER_PATH)
+    print(f"Synced {len(unsynced)} SIM entries into WhiteMagic Gen3.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="wm-sim: Self-Improvement Memory CLI & Hygiene Auditor")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_log = sub.add_parser("log", help="Record a structured SIM harness/R&D edit entry")
+    p_log.add_argument("--domain", required=True)
+    p_log.add_argument("--group", required=True)
+    p_log.add_argument("--target", required=True)
+    p_log.add_argument("--rationale", required=True)
+    p_log.add_argument("--predicted", required=True)
+    p_log.add_argument("--observed", required=True)
+    p_log.add_argument("--eval", dest="eval_context", default="")
+    p_log.add_argument("--status", choices=["kept", "reverted", "failed", "pending"], default="kept")
+    p_log.add_argument("--model", default="gemini-4")
+
+    p_q = sub.add_parser("query", help="Query past SIM entries grouped by problem_group")
+    p_q.add_argument("query", nargs="?", default="")
+    p_q.add_argument("--domain")
+    p_q.add_argument("--include-failures", action="store_true")
+    p_q.add_argument("--limit", type=int, default=20)
+
+    p_f = sub.add_parser("failures", help="List recent auto-captured PostToolUse tool failures")
+    p_f.add_argument("--limit", type=int, default=15)
+
+    sub.add_parser("audit", help="Run AGY rules, skills, hooks, MCP, and SIM ledger hygiene audit")
+    sub.add_parser("sync-wm3", help="Commit unsynced SIM experiment records to WhiteMagic Gen3")
+
+    args = parser.parse_args()
+    if args.cmd == "log":
+        cmd_log(args)
+    elif args.cmd == "query":
+        cmd_query(args)
+    elif args.cmd == "failures":
+        cmd_failures(args)
+    elif args.cmd == "audit":
+        cmd_audit(args)
+    elif args.cmd == "sync-wm3":
+        cmd_sync_wm3(args)
+
+
+if __name__ == "__main__":
+    main()

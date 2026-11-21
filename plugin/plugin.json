@@ -1,0 +1,22 @@
+{
+  "name": "whitemagic-agy-kit",
+  "displayName": "WhiteMagic AGY Turbo Kit",
+  "version": "1.0.0",
+  "description": "Cross-platform (macOS + Linux) Antigravity CLI performance, context hygiene, SIM memory, data-loss guard, and orchestration plugin bundle.",
+  "author": {
+    "name": "Lucas Bailey",
+    "url": "https://github.com/lbailey94"
+  },
+  "repository": "https://github.com/lbailey94/whitemagic-agy-kit",
+  "license": "MIT",
+  "keywords": [
+    "antigravity",
+    "performance",
+    "context-hygiene",
+    "sim",
+    "orchestration",
+    "mlx",
+    "macos",
+    "linux"
+  ]
+}
