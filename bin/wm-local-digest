@@ -157,6 +157,28 @@ def main():
         f"SOURCE: {src_label}\nQUERY: {args.query}\n\nEXCERPTS:\n{context[:3000]}"
     )
 
+    def call_ollama_fallback():
+        ollama_base = os.environ.get("WM_OLLAMA_URL", "http://127.0.0.1:11434")
+        model = os.environ.get("WM_OLLAMA_MODEL", "")
+        if not model:
+            with urllib.request.urlopen(f"{ollama_base}/api/tags", timeout=3) as r:
+                tags = json.loads(r.read().decode("utf-8", errors="replace"))
+            models = [m.get("name") for m in (tags.get("models") or []) if m.get("name")]
+            if not models:
+                raise RuntimeError("no Ollama models installed")
+            model = models[0]
+        res = post_json(
+            f"{ollama_base}/v1/chat/completions",
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": args.max_tokens,
+            },
+            timeout=args.timeout,
+        )
+        return model, res["choices"][0]["message"]["content"].strip()
+
     try:
         res = post_json(
             LLM_URL,
@@ -169,14 +191,22 @@ def main():
             },
             timeout=args.timeout,
         )
+        used_model = LLM_MODEL
         msg = res["choices"][0]["message"]["content"].strip()
-        # Strip Qwen3 <think>...</think> wrapper if emitted
-        msg = re.sub(r"<think>.*?</think>\s*", "", msg, flags=re.S).strip()
-        print(f"[wm-local-digest | $0 local {LLM_MODEL} | {src_label} | {len(selected)}/{len(chunks)} chunks]")
-        print(msg[:4000])
-    except Exception as e:
-        sys.stderr.write(f"[wm-local-digest] local LLM unavailable ({e}); falling back to ranked excerpts:\n")
-        print(context[:4000])
+    except Exception as primary_err:
+        try:
+            used_model, msg = call_ollama_fallback()
+        except Exception as ollama_err:
+            sys.stderr.write(
+                f"[wm-local-digest] local LLM unavailable ({primary_err}; ollama: {ollama_err}); falling back to ranked excerpts:\n"
+            )
+            print(context[:4000])
+            return
+
+    # Strip <think>...</think> wrapper if emitted
+    msg = re.sub(r"<think>.*?</think>\s*", "", msg, flags=re.S).strip()
+    print(f"[wm-local-digest | $0 local {used_model} | {src_label} | {len(selected)}/{len(chunks)} chunks]")
+    print(msg[:4000])
 
 
 if __name__ == "__main__":
