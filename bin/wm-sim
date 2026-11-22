@@ -21,11 +21,28 @@ HOME = Path.home()
 LEDGER_PATH = Path(
     os.environ.get("WM_SIM_LEDGER", str(HOME / ".local" / "share" / "whitemagic" / "sim_ledger.jsonl"))
 )
-WM3_BIN = Path(os.environ.get("WM3_BIN", shutil.which("wm3") or str(HOME / ".local" / "bin" / "wm3")))
-WM3_STORE = Path(os.environ.get("WM3_STORE", str(HOME / ".local" / "share" / "whitemagic" / "gen3")))
+WM3_BIN = Path(
+    os.environ.get(
+        "WM3_BIN",
+        shutil.which("wm3")
+        or shutil.which("wm-gen3")
+        or str(HOME / ".local" / "bin" / "wm-gen3"),
+    )
+)
+_XDG_GEN3_STORE = HOME / ".local" / "share" / "whitemagic" / "gen3"
+_SHARED_GEN3_STORE = Path("/Users/Shared/ai/wm-store-gen3")
+_DEFAULT_GEN3_STORE = str(
+    _XDG_GEN3_STORE
+    if _XDG_GEN3_STORE.is_dir()
+    else (_SHARED_GEN3_STORE if _SHARED_GEN3_STORE.is_dir() else _XDG_GEN3_STORE)
+)
+WM3_STORE = Path(os.environ.get("WM3_STORE", _DEFAULT_GEN3_STORE))
+_EXTRA_RULES = sorted((HOME / ".gemini" / "config" / "rules").glob("*.md")) if (HOME / ".gemini" / "config" / "rules").is_dir() else []
 RULE_FILES = [
     HOME / ".gemini" / "GEMINI.md",
     HOME / "GEMINI.md",
+    *_EXTRA_RULES,
+    HOME / ".gemini" / "config" / "plugins" / "agy-fast" / "rules" / "AGENTS.md",
     HOME / ".gemini" / "config" / "plugins" / "whitemagic-agy-kit" / "rules" / "AGENTS.md",
 ]
 AGY_RULE_BYTE_CAP = 24000

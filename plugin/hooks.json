@@ -13,7 +13,7 @@
     "enabled": true,
     "PreToolUse": [
       {
-        "matcher": "run_command|read_file|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall",
+        "matcher": "run_command|read_file|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall|mcp_whitemagic_whitemagic_gen3_session_continuity|mcp_whitemagic_whitemagic_gen3_memory_recall",
         "hooks": [
           {
             "type": "command",

@@ -605,12 +605,28 @@ fn validate_safe(cmd: &str, args: &[String]) -> Result<(Kind, bool), String> {
         }
         "ls" | "tree" | "wc" | "du" | "df" | "stat" | "file" | "cat" | "head" | "tail" | "nl" => Ok((Kind::Ls, false)),
         "ruff" | "mypy" | "eslint" | "tsc" => Ok((Kind::Linter, true)),
-        "wm3" => {
-            let sub = args.iter().find(|a| !a.starts_with('-')).map(|s| s.as_str()).unwrap_or("");
-            if matches!(sub, "recall" | "stats" | "session" | "list") || args.iter().any(|a| a == "--version") {
+        "wm3" | "wm-gen3" => {
+            let mut sub = "";
+            let mut i = 0;
+            while i < args.len() {
+                let a = args[i].as_str();
+                if a == "--store" || a == "--galaxy" {
+                    i += 2;
+                    continue;
+                }
+                if a.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+                sub = a;
+                break;
+            }
+            if matches!(sub, "recall" | "evidence-recall" | "stats" | "status" | "session" | "list" | "build-info" | "inspect")
+                || args.iter().any(|a| a == "--version")
+            {
                 Ok((Kind::Generic, false))
             } else {
-                Err(format!("disallowed wm3 subcommand: {}", sub))
+                Err(format!("disallowed {} subcommand: {}", base, sub))
             }
         }
         "gh" => {

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# WhiteMagic AGY Turbo Kit v2.0.0 — Idempotent Cross-Platform Installer (macOS + Linux)
+# WhiteMagic AGY Turbo Kit v3.0.0 — Idempotent Cross-Platform Installer (macOS + Linux)
 # Installs:
-#   1. Zero-dependency Rust CLI output compressor `wm-squeeze` -> ~/.local/bin/wm-squeeze
-#   2. Native Antigravity plugin `whitemagic-agy-kit` (or `--sync-global` to update ~/.gemini/config without plugin duplication)
-#   3. Hardened `INK-Q/agy-fast` plugin (--auto-update off) if Node >= 20 is available
+#   1. Zero-dependency Rust binaries `wm-squeeze` & `wm-codegraph` -> ~/.local/bin/
+#   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` MCP when `wm-codegraph` is built; or `--sync-global`)
+#   3. Hardened `INK-Q/agy-fast` plugin (--auto-update off) if Node >= 20 is available (preserves existing valid installs)
 #   4. Disables 6 unused heavy official plugins (-10.4k tokens/session) if present
-#   5. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `wm-local-digest`, `wm-dream`, `statusline.py`)
+#   5. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `wm-local-digest`, `wm-dream`, `wm-handoff`, `statusline.py`)
 #   6. Non-destructive `~/.gemini/antigravity-cli/settings.json` safe allowlist + statusLine tuning (timestamped backup; leaves model untouched)
-#   7. Selective `"eager": true` MCP promotion for locally detected `wm3` / `firecrawl-local-mcp`
+#   7. Selective `"eager": true` MCP promotion for locally detected `wm3` / `whitemagic_gen3` / `firecrawl-local-mcp`
 set -euo pipefail
 
 KIT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -32,18 +32,31 @@ done
 
 mkdir -p "$PLUGINS_DIR" "$LOCAL_BIN" "$AGY_CLI_DIR" "${HOME}/.gemini/config/hooks"
 
+install_bin() {
+    # Atomic temp-file + mv replaces the directory entry with a fresh inode,
+    # avoiding Apple Silicon macOS AMFI SIGKILL (exit 137) and Linux ETXTBSY
+    # when upgrading a running/mapped binary (e.g. wm-codegraph --mcp) in place.
+    local src="$1" dst="$2"
+    local tmp="${dst}.tmp.$$"
+    cp "$src" "$tmp"
+    chmod +x "$tmp"
+    mv -f "$tmp" "$dst"
+}
+
 echo "=== 1. Building zero-dependency Rust binaries: wm-squeeze & wm-codegraph ==="
 if command -v cargo >/dev/null 2>&1; then
     cargo build --release --manifest-path "${KIT_DIR}/tools/wm-squeeze/Cargo.toml"
-    cp "${KIT_DIR}/tools/wm-squeeze/target/release/wm-squeeze" "${LOCAL_BIN}/wm-squeeze"
+    install_bin "${KIT_DIR}/tools/wm-squeeze/target/release/wm-squeeze" "${LOCAL_BIN}/wm-squeeze"
     cargo build --release --manifest-path "${KIT_DIR}/tools/wm-codegraph/Cargo.toml"
-    cp "${KIT_DIR}/tools/wm-codegraph/target/release/wm-codegraph" "${LOCAL_BIN}/wm-codegraph"
-    chmod +x "${LOCAL_BIN}/wm-squeeze" "${LOCAL_BIN}/wm-codegraph"
+    install_bin "${KIT_DIR}/tools/wm-codegraph/target/release/wm-codegraph" "${LOCAL_BIN}/wm-codegraph"
     echo "Installed ${LOCAL_BIN}/wm-squeeze & ${LOCAL_BIN}/wm-codegraph"
 elif command -v rustc >/dev/null 2>&1; then
-    rustc -O "${KIT_DIR}/tools/wm-squeeze/src/main.rs" -o "${LOCAL_BIN}/wm-squeeze"
-    rustc -O "${KIT_DIR}/tools/wm-codegraph/src/main.rs" -o "${LOCAL_BIN}/wm-codegraph"
-    chmod +x "${LOCAL_BIN}/wm-squeeze" "${LOCAL_BIN}/wm-codegraph"
+    rustc -O "${KIT_DIR}/tools/wm-squeeze/src/main.rs" -o "${LOCAL_BIN}/wm-squeeze.tmp.$$"
+    chmod +x "${LOCAL_BIN}/wm-squeeze.tmp.$$"
+    mv -f "${LOCAL_BIN}/wm-squeeze.tmp.$$" "${LOCAL_BIN}/wm-squeeze"
+    rustc -O "${KIT_DIR}/tools/wm-codegraph/src/main.rs" -o "${LOCAL_BIN}/wm-codegraph.tmp.$$"
+    chmod +x "${LOCAL_BIN}/wm-codegraph.tmp.$$"
+    mv -f "${LOCAL_BIN}/wm-codegraph.tmp.$$" "${LOCAL_BIN}/wm-codegraph"
     echo "Compiled ${LOCAL_BIN}/wm-squeeze & ${LOCAL_BIN}/wm-codegraph via rustc"
 else
     echo "[warn] Rust toolchain not found; skipping native binaries (hooks fail-open cleanly without them)."
@@ -72,7 +85,7 @@ hooks = {
         "enabled": True,
         "PreToolUse": [
             {
-                "matcher": "run_command|read_file|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall",
+                "matcher": "run_command|read_file|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall|mcp_whitemagic_whitemagic_gen3_session_continuity|mcp_whitemagic_whitemagic_gen3_memory_recall",
                 "hooks": [
                     {"type": "command", "command": "python3 -S -B ~/.gemini/config/hooks/pre_tool_guard.py", "timeout": 5}
                 ],
@@ -107,6 +120,27 @@ else
     cp -R "${KIT_DIR}/plugin" "$TARGET_PLUGIN"
     chmod +x "${TARGET_PLUGIN}/hooks/"*.py
 
+    if [ -x "${LOCAL_BIN}/wm-codegraph" ]; then
+        cat > "${TARGET_PLUGIN}/mcp_config.json" <<EOF
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "${LOCAL_BIN}/wm-codegraph",
+      "args": [
+        "--mcp"
+      ],
+      "tools": {
+        "code_graph": {
+          "eager": true
+        }
+      }
+    }
+  }
+}
+EOF
+        echo "Wired eager code_graph MCP in ${TARGET_PLUGIN}/mcp_config.json"
+    fi
+
     if command -v agy >/dev/null 2>&1; then
         agy plugin validate --strict "$TARGET_PLUGIN"
         agy plugin enable whitemagic-agy-kit
@@ -119,8 +153,8 @@ echo "=== 3. Checking hardened agy-fast (auto-update off) ==="
 if [ "$SKIP_AGY_FAST" -eq 0 ]; then
     if command -v node >/dev/null 2>&1 && [ "$(node -p "process.versions.node.split('.')[0]")" -ge 20 ]; then
         AF_DIR="${PLUGINS_DIR}/agy-fast"
-        if [ -d "$AF_DIR/.git" ]; then
-            echo "agy-fast already cloned at $AF_DIR (keeping pinned revision)"
+        if [ -d "$AF_DIR/.git" ] || [ -f "$AF_DIR/plugin.json" ]; then
+            echo "agy-fast already installed at $AF_DIR (keeping existing revision)"
         else
             rm -rf "$AF_DIR"
             git clone --depth 1 https://github.com/INK-Q/agy-fast.git "$AF_DIR"
@@ -144,11 +178,9 @@ fi
 
 echo "=== 5. Installing portable CLI tools & cache-warmth statusline ==="
 for tool in wm-sim agy-bench agy-mode wm-local-digest wm-dream wm-handoff; do
-    cp "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
-    chmod +x "${LOCAL_BIN}/${tool}"
+    install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
 done
-cp "${KIT_DIR}/bin/statusline.py" "${AGY_CLI_DIR}/statusline.py"
-chmod +x "${AGY_CLI_DIR}/statusline.py"
+install_bin "${KIT_DIR}/bin/statusline.py" "${AGY_CLI_DIR}/statusline.py"
 
 echo "=== 6. Updating ~/.gemini/antigravity-cli/settings.json (non-destructive; model untouched) ==="
 python3 - <<'PY'
@@ -213,9 +245,11 @@ base_allow = [
     "command(npm run lint)",
     "command(npm run build)",
     "command(wm3)",
+    "command(wm-gen3)",
     "command(wm-sim)",
     "command(wm-squeeze --safe)",
     "command(wm-codegraph)",
+    "mcp(whitemagic-agy-kit_codegraph/*)",
     "command(wm-handoff)",
     "command(wm-local-digest)",
     "command(wm-dream)",
@@ -279,6 +313,25 @@ if fc:
 if changed:
     mcp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     print(f"Verified selective eager MCP entries in {mcp_path}: {list(servers.keys())}")
+
+# Also promote core continuity tools on the official whitemagic-plugins Gen3 plugin if installed
+wm_plugin_mcp = home / ".gemini" / "config" / "plugins" / "whitemagic" / "mcp_config.json"
+if wm_plugin_mcp.is_file():
+    try:
+        pdata = json.loads(wm_plugin_mcp.read_text(encoding="utf-8"))
+        pservers = pdata.get("mcpServers") or {}
+        if "whitemagic_gen3" in pservers:
+            ptools = pservers["whitemagic_gen3"].setdefault("tools", {})
+            pchanged = False
+            for t in ("memory_recall", "session_continuity", "session_checkpoint"):
+                if t not in ptools:
+                    ptools[t] = {"eager": True}
+                    pchanged = True
+            if pchanged:
+                wm_plugin_mcp.write_text(json.dumps(pdata, indent=2) + "\n", encoding="utf-8")
+                print(f"Promoted selective eager Gen3 tools in {wm_plugin_mcp}")
+    except Exception:
+        pass
 PY
 
 echo ""

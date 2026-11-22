@@ -22,7 +22,7 @@ from pathlib import Path
 
 DESTRUCTIVE_PATTERNS = [
     (
-        r"(?:^|[;&|]\s*)rm\s+-[^\s]*r[^\s]*f[^\s]*\s+(?:/\s*$|/\*|\~|\$HOME(?:\s|$)|/(?:home|Users)/[^/\s]+(?:\s|$))",
+        r"(?:^|[;&|]\s*)rm\s+(?:-(?:[^\s]*r[^\s]*f|[^\s]*f[^\s]*r)[^\s]*|-[^\s]*r[^\s]*\s+-[^\s]*f[^\s]*|-[^\s]*f[^\s]*\s+-[^\s]*r[^\s]*)\s+(?:/\s*$|/\*|\~|\$HOME(?:\s|$)|/(?:home|Users)/[^/\s]+(?:\s|$))",
         "Recursive force-delete targeting root or home directory",
     ),
     (r"\bdrop\s+(?:table|database|schema|view)\b", "SQL DROP statement detected"),
@@ -159,9 +159,20 @@ def is_safe_squeezable(cmd_base, cmd_args):
     if cmd_base in ("ls", "tree", "du", "ruff", "mypy", "eslint", "tsc"):
         return True
 
-    if cmd_base == "wm3":
-        sub = next((a for a in cmd_args if not a.startswith("-")), "")
-        return sub in ("recall", "stats", "list")
+    if cmd_base in ("wm3", "wm-gen3"):
+        sub = ""
+        i = 0
+        while i < len(cmd_args):
+            a = cmd_args[i]
+            if a in ("--store", "--galaxy"):
+                i += 2
+                continue
+            if a.startswith("-"):
+                i += 1
+                continue
+            sub = a
+            break
+        return sub in ("recall", "evidence-recall", "stats", "status", "session", "list", "build-info", "inspect") or "--version" in cmd_args
 
     if cmd_base == "gh":
         s0 = cmd_args[0] if cmd_args else ""
@@ -353,7 +364,7 @@ def handle_read_file(args, payload):
 
 
 def handle_whitemagic_mcp(tool_name, args):
-    if tool_name == "mcp_whitemagic_session_continuity":
+    if tool_name in ("mcp_whitemagic_session_continuity", "mcp_whitemagic_whitemagic_gen3_session_continuity"):
         tb = args.get("token_budget")
         if tb is None or (isinstance(tb, (int, float)) and tb > 2000):
             return {"decision": "allow", "overwrite": {"token_budget": 1200}}
@@ -367,6 +378,11 @@ def handle_whitemagic_mcp(tool_name, args):
             ow["max_content_bytes"] = 900
         if ow:
             return {"decision": "allow", "overwrite": ow}
+    elif tool_name == "mcp_whitemagic_whitemagic_gen3_memory_recall":
+        # Gen3 cyberbrain memory_recall schema accepts {query, limit, scope, historical} (no max_content_bytes)
+        lim = args.get("limit")
+        if lim is None or (isinstance(lim, (int, float)) and lim > 6):
+            return {"decision": "allow", "overwrite": {"limit": 5}}
     return {"decision": "allow"}
 
 
@@ -415,7 +431,12 @@ def main():
         return
 
     # 4. WhiteMagic MCP auto-budget enforcement
-    if tool_name in ("mcp_whitemagic_session_continuity", "mcp_whitemagic_memory_recall"):
+    if tool_name in (
+        "mcp_whitemagic_session_continuity",
+        "mcp_whitemagic_memory_recall",
+        "mcp_whitemagic_whitemagic_gen3_session_continuity",
+        "mcp_whitemagic_whitemagic_gen3_memory_recall",
+    ):
         emit(handle_whitemagic_mcp(tool_name, args))
         return
 

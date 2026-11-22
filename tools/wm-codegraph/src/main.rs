@@ -870,12 +870,65 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn extract_json_str(raw: &str, key: &str) -> Option<String> {
+fn find_json_key_value_start(raw: &str, key: &str) -> Option<usize> {
     let needle = format!("\"{}\"", key);
-    let idx = raw.find(&needle)?;
-    let rest = &raw[idx + needle.len()..];
-    let colon = rest.find(':')?;
-    let after = rest[colon + 1..].trim_start();
+    let mut offset = 0;
+    while let Some(rel) = raw[offset..].find(&needle) {
+        let pos = offset + rel;
+        let after_key = pos + needle.len();
+        let rest = &raw[after_key..];
+        let ws = rest.len() - rest.trim_start().len();
+        if rest[ws..].starts_with(':') {
+            let val_part = &rest[ws + 1..];
+            let vws = val_part.len() - val_part.trim_start().len();
+            return Some(after_key + ws + 1 + vws);
+        }
+        offset = after_key;
+    }
+    None
+}
+
+fn extract_json_object_slice<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
+    let start = find_json_key_value_start(raw, key)?;
+    let slice = &raw[start..];
+    if !slice.starts_with('{') {
+        return None;
+    }
+    let bytes = slice.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+        } else {
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&slice[..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn extract_json_str(raw: &str, key: &str) -> Option<String> {
+    let start = find_json_key_value_start(raw, key)?;
+    let after = &raw[start..];
     if !after.starts_with('"') {
         return None;
     }
@@ -900,6 +953,13 @@ fn extract_json_str(raw: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_json_usize(raw: &str, key: &str) -> Option<usize> {
+    let start = find_json_key_value_start(raw, key)?;
+    let after = &raw[start..];
+    let tok: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    tok.parse().ok()
 }
 
 fn extract_json_id(raw: &str) -> String {
@@ -945,13 +1005,16 @@ fn run_mcp() {
                 id
             ),
             "tools/call" => {
-                let mode = extract_json_str(trimmed, "mode").unwrap_or_else(|| "overview".into());
-                let target = extract_json_str(trimmed, "target").unwrap_or_default();
-                let root = extract_json_str(trimmed, "root")
+                let args_src = extract_json_object_slice(trimmed, "arguments").unwrap_or(trimmed);
+                let mode = extract_json_str(args_src, "mode").unwrap_or_else(|| "overview".into());
+                let target = extract_json_str(args_src, "target").unwrap_or_default();
+                let depth = extract_json_usize(args_src, "depth").unwrap_or(2);
+                let root = extract_json_str(args_src, "root")
+                    .filter(|s| !s.is_empty())
                     .map(PathBuf::from)
                     .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
                 let idx = RepoIndex::build(&root);
-                let text = idx.dispatch(&mode, &target, 2);
+                let text = idx.dispatch(&mode, &target, depth);
                 format!(
                     "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}],\"isError\":false}}}}",
                     id,

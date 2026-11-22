@@ -11,9 +11,12 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 LOCAL_BIN = Path.home() / ".local" / "bin"
 WM_SQUEEZE = LOCAL_BIN / "wm-squeeze"
-PRE_HOOK = Path.home() / ".gemini" / "config" / "hooks" / "pre_tool_guard.py"
-STOP_HOOK = Path.home() / ".gemini" / "config" / "hooks" / "stop_telemetry.py"
-START_HOOK = Path.home() / ".gemini" / "config" / "hooks" / "session_start_brief.py"
+_PLUGIN_HOOKS = Path.home() / ".gemini" / "config" / "plugins" / "whitemagic-agy-kit" / "hooks"
+_GLOBAL_HOOKS = Path.home() / ".gemini" / "config" / "hooks"
+_HOOKS_DIR = _PLUGIN_HOOKS if (_PLUGIN_HOOKS / "pre_tool_guard.py").is_file() else _GLOBAL_HOOKS
+PRE_HOOK = _HOOKS_DIR / "pre_tool_guard.py"
+STOP_HOOK = _HOOKS_DIR / "stop_telemetry.py"
+START_HOOK = _HOOKS_DIR / "session_start_brief.py"
 STATUSLINE = Path.home() / ".gemini" / "antigravity-cli" / "statusline.py"
 
 PASS = 0
@@ -63,6 +66,7 @@ def test_wm_squeeze():
         ["cargo", "publish"],
         ["python3", "-c", "print(1)"],
         ["sh", "-c", "id"],
+        ["wm-gen3", "init"],
     ]
     env = {**os.environ, "WM_SQUEEZE_NO_STATS": "1"}
     refused_ok = True
@@ -150,10 +154,15 @@ def test_wm_squeeze():
 
 def test_pre_tool_hook():
     print("\n2. PreToolUse Guard & Deterministic Optimizer:")
-    # Destructive guard
+    # Destructive guard (rm -rf, rm -fr, rm -r -f)
     rc, out, _, ms = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": "rm -rf /"}}})
     d = json.loads(out)
     check("destructive rm -rf / -> force_ask", rc == 0 and d.get("decision") == "force_ask", f"{ms:.1f}ms")
+
+    for variant in ("rm -fr /", "rm -r -f /", "rm -f -r ~"):
+        rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": variant}}})
+        d = json.loads(out)
+        check(f"destructive {variant} -> force_ask", rc == 0 and d.get("decision") == "force_ask")
 
     # Safe noisy run_command overwrite
     rc, out, _, ms = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": "git diff HEAD~1"}}})
@@ -229,6 +238,15 @@ def test_pre_tool_hook():
     d = json.loads(out)
     check("wm memory_recall limit=12 -> clamped 5 & max_content_bytes=900", d.get("overwrite") == {"limit": 5, "max_content_bytes": 900})
 
+    # Official whitemagic-plugins Gen3 MCP auto-budget (schema-exact)
+    _, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "mcp_whitemagic_whitemagic_gen3_session_continuity", "args": {}}})
+    d = json.loads(out)
+    check("wm_gen3 session_continuity -> token_budget=1200", d.get("overwrite") == {"token_budget": 1200})
+
+    _, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "mcp_whitemagic_whitemagic_gen3_memory_recall", "args": {"query": "test", "limit": 12}}})
+    d = json.loads(out)
+    check("wm_gen3 memory_recall limit=12 -> clamped 5 only (no unsupported max_content_bytes)", d.get("overwrite") == {"limit": 5})
+
     # Fail-open on corrupt stdin
     rc, out, _, _ = run_hook(PRE_HOOK, "{broken-json")
     check("fail-open on invalid stdin", rc == 0 and json.loads(out).get("decision") == "allow")
@@ -280,12 +298,29 @@ def test_statusline_and_lifecycle():
     p = subprocess.run([str(cg), "callers", "squeeze", "--root", str(KIT)], capture_output=True, text=True)
     check("wm-codegraph callers finds squeeze -> main", p.returncode == 0 and "main" in p.stdout)
 
-    mcp_in = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
+    mcp_in = (
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
+        + json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "code_graph",
+                    "arguments": {"mode": "callers", "target": "squeeze", "root": str(KIT), "depth": 1},
+                },
+            }
+        )
+        + "\n"
+    )
     p = subprocess.run([str(cg), "--mcp"], input=mcp_in, capture_output=True, text=True)
     check("wm-codegraph --mcp responds to tools/list", p.returncode == 0 and "code_graph" in p.stdout)
+    check("wm-codegraph --mcp honors depth=1 argument", p.returncode == 0 and "BFS depth <= 1" in p.stdout)
 
     p = subprocess.run([str(LOCAL_BIN / "wm-handoff"), "--cwd", str(KIT)], capture_output=True, text=True)
     check("wm-handoff emits verbatim crystal with sha256", p.returncode == 0 and "crystal_sha256=" in p.stdout)
+    p_help = subprocess.run([str(LOCAL_BIN / "wm-handoff"), "--help"], capture_output=True, text=True)
+    check("wm-handoff --help documents --save-wm3", p_help.returncode == 0 and "--save-wm3" in p_help.stdout)
 
     p = subprocess.run([str(LOCAL_BIN / "wm-sim"), "prefix-hash"], capture_output=True, text=True)
     check("wm-sim prefix-hash computes ContextCacheToken", p.returncode == 0 and "ContextCacheToken SHA-256" in p.stdout)

@@ -14,6 +14,7 @@ import glob
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -138,6 +139,7 @@ def main():
     ap.add_argument("--conv", help="Conversation ID prefix (defaults to newest transcript)")
     ap.add_argument("--cwd", default=os.getcwd(), help="Git working directory to snapshot")
     ap.add_argument("--out", help="Optional output markdown file path")
+    ap.add_argument("--save-wm3", action="store_true", help="Also persist handoff crystal to WhiteMagic Gen3 (wm3 / wm-gen3)")
     args = ap.parse_args()
 
     tp = latest_transcript(args.conv)
@@ -185,6 +187,35 @@ def main():
         body = body[:6750] + "\n... [verbatim truncation cap reached]"
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
     crystal = f"{body}\n\n`crystal_sha256={digest} | est_tokens~{len(body)//4}`\n"
+
+    if args.save_wm3:
+        wm_bin = Path(
+            os.environ.get(
+                "WM3_BIN",
+                shutil.which("wm3")
+                or shutil.which("wm-gen3")
+                or str(Path.home() / ".local" / "bin" / "wm-gen3"),
+            )
+        )
+        xdg_store = Path.home() / ".local" / "share" / "whitemagic" / "gen3"
+        shared_store = Path("/Users/Shared/ai/wm-store-gen3")
+        default_store = str(
+            xdg_store if xdg_store.is_dir() else (shared_store if shared_store.is_dir() else xdg_store)
+        )
+        wm_store = Path(os.environ.get("WM3_STORE", default_store))
+        if not wm_bin.exists():
+            sys.stderr.write(f"wm-handoff: --save-wm3 binary not found at {wm_bin}\n")
+        else:
+            proc = subprocess.run(
+                [str(wm_bin), "--store", str(wm_store), "remember", "--source", "tool:wm-handoff", crystal],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                sys.stderr.write(f"wm-handoff: --save-wm3 failed: {proc.stderr or proc.stdout}\n")
+            else:
+                sys.stderr.write(f"Saved handoff crystal to WhiteMagic Gen3 ({wm_store})\n")
 
     if args.out:
         Path(args.out).write_text(crystal, encoding="utf-8")
