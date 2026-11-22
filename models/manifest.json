@@ -1,0 +1,55 @@
+{
+  "schema": "wm.tricameral.models/1.0",
+  "default_hf_repo": "lbailey94/whitemagic-tricameral-spores",
+  "default_hf_revision": "main",
+  "default_gdrive_remote": "gdrive:BlackGarden_v4/spores",
+  "profiles": {
+    "huginn": ["huginn-1"],
+    "ravens": ["huginn-1", "muninn-4"],
+    "tricameral": ["huginn-1", "muninn-4", "valkyrie-m3"]
+  },
+  "models": {
+    "huginn-1": {
+      "organ": "Huginn-1 School-S3",
+      "tier": "S0",
+      "role": "System 0 / 0.5 Thought, Tricameral Router, 6D Galactic Recall Reranker, Sutra Glyph Compiler & Kekkai Firewall",
+      "filename": "huginn1_school_s3.tm7b",
+      "aliases": ["huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"],
+      "format": "TM7B\\x06",
+      "params_m": 25.24,
+      "rss_mb_approx": 122,
+      "size_mb_approx": 122,
+      "hf_path": "spores/huginn1_school_s3.tm7b",
+      "gdrive_path": "huginn1_school_s3.tm7b",
+      "sha256": ""
+    },
+    "muninn-4": {
+      "organ": "Muninn-4 School-v2-S3",
+      "tier": "S1",
+      "role": "System 1 / 1.5 Hippocampal Memory Crystallizer, Catuskoti Reconciler, SIM Auditor & 1.31 MB .hms Session Handoff",
+      "filename": "muninn4_school_v2_s3.tm7b",
+      "aliases": ["muninn4_gpu_school_s3.tm7b", "muninn4_wso_school_grad.tm7b", "muninn4_wso_plateau.tm7b"],
+      "format": "TM7B\\x05",
+      "params_m": 100.3,
+      "rss_mb_approx": 357,
+      "size_mb_approx": 357,
+      "hf_path": "spores/muninn4_school_v2_s3.tm7b",
+      "gdrive_path": "muninn4_school_v2_s3.tm7b",
+      "sha256": ""
+    },
+    "valkyrie-m3": {
+      "organ": "Valkyrie-M3 Full",
+      "tier": "S2",
+      "role": "System 2 Formal Prover, Safe-Rust/Python/Lean/Bend2 Deep Synthesis & CSPD Cartridge Executor",
+      "filename": "valkyrie_m3_leg2_wsd_final.tm7b",
+      "aliases": ["valkyrie_m3_leg2_school_s3.tm7b", "valkyrie_m3_full_wsd_final.tm7b"],
+      "format": "TM7B\\x06",
+      "params_m": 241.9,
+      "rss_mb_approx": 890,
+      "size_mb_approx": 843,
+      "hf_path": "spores/valkyrie_m3_leg2_wsd_final.tm7b",
+      "gdrive_path": "valkyrie_m3_leg2_wsd_final.tm7b",
+      "sha256": ""
+    }
+  }
+}

@@ -1,6 +1,6 @@
-# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v3.0.0)
+# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v3.1.0 — Portable Tricameral Edition)
 
-Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity CLI (`agy 1.5.14+`), Desktop 2.0, and IDE optimization suite focused on **KV/prefix-cache preservation, birth-time token compression, structural code-graph navigation, latency reduction, and credit longevity**.
+Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity CLI (`agy 1.5.14+`), Desktop 2.0, and IDE optimization suite focused on **KV/prefix-cache preservation, birth-time token compression, structural code-graph navigation, $0 local Tricameral CyberBrain micro-organs, latency reduction, and credit longevity**.
 
 Built from empirical offline forensics across `50` real sessions (`12,740` turns, `2.27B` input tokens) plus controlled 4-level live `agy -p` A/B benchmarks ([`benchmarks/RESULTS_2026-11-21.md`](./benchmarks/RESULTS_2026-11-21.md)) and designed strictly within Antigravity's documented extension interfaces (`plugin.json`, `hooks.json`, `mcp_config.json`, `rules/AGENTS.md`, `statusLine`, and `--model` / `--settings`).
 
@@ -42,12 +42,32 @@ Built from empirical offline forensics across `50` real sessions (`12,740` turns
 
 ---
 
-## Quickstart (macOS & Linux)
+## What's New in v3.1.0 (Portable Tricameral Edition)
+
+- **macOS Apple Silicon + Gen3 Parity (PR #1):** Atomic `install_bin` (`cp` + `mv -f`) fixes Apple Silicon AMFI `SIGKILL` (`exit 137`) & Linux `ETXTBSY`; `wm-codegraph --mcp` honors `depth`; official `whitemagic-plugins` Gen3 (`wm-gen3` / `whitemagic_gen3`) auto-budgeting + eager promotion; `rm -fr` guard; `wm-local-digest` Ollama fallback; `wm-handoff --save-wm3`.
+- **Vendored Safe-Rust Tricameral Engine (`tools/wm-tricameral-engine/` -> `muninn-engine`):** Cross-platform (`x86_64` AVX2 + `aarch64` Apple Silicon scalar fallback) `T-MAC` 4-bit LUT inference engine with a 24-entry **Unified Radix Cache (URC)** and zero-cold-load `--daemon <unix_socket>`.
+- **Portable Sovereign Micro-Organ CLIs & 1-Tool Eager MCP (`wm-huginn`, `wm-muninn`, `wm-tricameral`, `wm-tricameral-mcp`):**
+  - `Huginn-1 School-S3` (`S0`, ~122 MB RSS): `100%` 6-System score (`-93.8%` tokens) — 6D Galactic recall reranking, 12-token Sutra glyphs, `[UPD_ERASE]` state compression, `.hms` estate holograms, and `< 175 ms` `PreToolUse` Kekkai neural guard (100% fail-open when daemon is off).
+  - `Muninn-4 School-v2-S3` (`S1`, ~357 MB RSS): `100%` 6-Layer Hippocampal score (`-97.4%` tokens) — episodic crystallization, Catuskoti conflict reconciliation, SIM auditing, `1.31 MB` `.hms` session handoff, and executable file-filter synthesis.
+  - `tricameral_dispatch`: Single ultra-compact eager Stdio MCP tool wired automatically alongside `code_graph` (`-98.5%` / `66.25×` token reduction across 6 chained workflows).
+- **Zero-Bloat Weight Registry (`models/manifest.json` + `wm-models`):** Keeps git `< 1 MB`; pulls `.tm7b` spores cleanly on Mac/Linux via HuggingFace (`HF_TOKEN` for private repos or public URLs) or `rclone` (`--source gdrive`).
+
+---
+
+## Quickstart & Upgrading (macOS & Linux)
 
 ```bash
+# Fresh install
 git clone https://github.com/lbailey94/whitemagic-agy-kit.git ~/.local/src/whitemagic-agy-kit
 cd ~/.local/src/whitemagic-agy-kit
-./install.sh                  # native AGY plugin (or --sync-global to merge into ~/.gemini/config)
+./install.sh                     # native AGY plugin (or --sync-global to merge into ~/.gemini/config)
+
+# Upgrading on Mac / Inspiron (1-command sync)
+git pull && ./install.sh
+
+# Optional: pull local Tricameral micro-organ spores (~122 MB for Huginn-1, ~479 MB for both Ravens)
+wm-models pull huginn            # set HF_TOKEN=... for private HF repo, or add --source gdrive
+wm-models list
 ```
 
 Verify and benchmark offline or live:

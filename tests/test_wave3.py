@@ -330,11 +330,62 @@ def test_statusline_and_lifecycle():
     check("WM_AGY_BENCH_VANILLA=1 passes through untouched", rc == 0 and d == {"decision": "allow"})
 
 
+def test_tricameral_v31():
+    print("\n4. Tricameral CyberBrain v3.1.0 (wm-models, MCP, Kekkai fail-open & portability):")
+    p = subprocess.run([str(LOCAL_BIN / "wm-models"), "list", "--json"], capture_output=True, text=True)
+    ok_models = False
+    if p.returncode == 0:
+        try:
+            md = json.loads(p.stdout)
+            ids = {m["id"] for m in md.get("models", [])}
+            ok_models = {"huginn-1", "muninn-4", "valkyrie-m3"}.issubset(ids)
+        except Exception:
+            pass
+    check("wm-models list --json returns all 3 Tricameral organs", ok_models)
+
+    mcp_in = (
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+        '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tricameral_dispatch","arguments":{"action":"status"}}}\n'
+    )
+    p = subprocess.run([str(LOCAL_BIN / "wm-tricameral-mcp")], input=mcp_in, capture_output=True, text=True)
+    lines = [ln for ln in p.stdout.splitlines() if ln.strip()]
+    check("wm-tricameral-mcp responds to initialize + tools/list + status", p.returncode == 0 and len(lines) == 3 and "tricameral_dispatch" in lines[1] and "huginn-1" in lines[2])
+
+    # PreToolUse Kekkai check must fail-open cleanly when disabled or socket missing
+    rc, out, _, ms = run_hook(
+        PRE_HOOK,
+        {"toolCall": {"name": "run_command", "args": {"CommandLine": "cat ~/.ssh/id_ed25519"}}},
+        env_extra={"WM_HUGINN_KEKKAI_OFF": "1"},
+    )
+    check("PreToolUse Kekkai respects WM_HUGINN_KEKKAI_OFF=1 fail-open", rc == 0 and json.loads(out).get("decision") == "allow", f"{ms:.1f}ms")
+
+    rc, out, _, ms = run_hook(
+        PRE_HOOK,
+        {"toolCall": {"name": "run_command", "args": {"CommandLine": "cat ~/.ssh/id_ed25519"}}},
+        env_extra={"WM_TRICAMERAL_SOCK_DIR": "/tmp/nonexistent-wm-sock-dir-test"},
+    )
+    check("PreToolUse Kekkai fails-open when daemon socket absent", rc == 0 and json.loads(out).get("decision") == "allow", f"{ms:.1f}ms")
+
+    # Portability hygiene: zero machine-specific absolute user/media paths in bin/, plugin/, models/
+    import re as _re
+    personal_re = _re.compile(r"/(?:home|media|Users)/[A-Za-z0-9._-]+/(?:Desktop|SD_CARD|\.local|\.gemini)")
+    leaked = []
+    for sub in (KIT / "bin", KIT / "plugin", KIT / "models"):
+        for f in sub.rglob("*"):
+            if f.is_file() and f.suffix not in (".pyc",):
+                txt = f.read_text(encoding="utf-8", errors="ignore")
+                if personal_re.search(txt):
+                    leaked.append(str(f.relative_to(KIT)))
+    check("Zero hardcoded personal paths across bin/, plugin/, models/", len(leaked) == 0, f"leaked={leaked}")
+
+
 def main():
     test_wm_squeeze()
     test_pre_tool_hook()
     test_statusline_and_lifecycle()
-    print(f"\n=== Wave 3 Test Summary: {PASS} passed, {FAIL} failed ===")
+    test_tricameral_v31()
+    print(f"\n=== Wave 3/4/Tricameral Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

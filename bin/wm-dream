@@ -94,6 +94,12 @@ def main():
     if fail_counts:
         top_f = "; ".join(f"({n}x) {k}" for k, n in fail_counts.most_common(2))
         lines.append(f"  - Top recurring tool failures: {top_f[:160]}")
+    hms_h1 = DATA_DIR / "huginn1_estate.hms"
+    hms_m4 = DATA_DIR / "muninn4_hippocampus.hms"
+    if hms_h1.exists() or hms_m4.exists():
+        h1_kb = hms_h1.stat().st_size // 1024 if hms_h1.exists() else 0
+        m4_kb = hms_m4.stat().st_size // 1024 if hms_m4.exists() else 0
+        lines.append(f"  - Tricameral Holograms: Huginn-1={h1_kb}KB | Muninn-4={m4_kb}KB (use wm-huginn / wm-muninn)")
     if rule_warns:
         lines.append(f"  - WARN rule budget: {', '.join(rule_warns)}")
 

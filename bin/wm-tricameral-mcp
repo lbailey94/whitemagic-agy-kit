@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""wm-tricameral-mcp — 1-Tool Eager Stdio MCP Server for the WhiteMagic Tricameral CyberBrain.
+
+Exposes a single compact MCP tool (`tricameral_dispatch`, ~160 schema tokens) over newline-delimited
+JSON-RPC 2.0 (protocol 2024-11-05) so Antigravity can invoke Huginn-1 (S0/S0.5), Muninn-4 (S1/S1.5),
+and Valkyrie-M3 (S2) at 0.00 CU with zero CLI shell overhead.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
+
+LOCAL_BIN = Path.home() / ".local" / "bin"
+
+
+def _find_cli(name: str) -> str:
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    cand = LOCAL_BIN / name
+    if cand.is_file():
+        return str(cand)
+    sib = Path(__file__).resolve().parent / name
+    return str(sib)
+
+
+def dispatch_tool(args: Dict[str, Any]) -> Dict[str, Any]:
+    action = str(args.get("action") or "status").strip()
+    query = str(args.get("query") or "")
+    key = str(args.get("key") or "active_state")
+    candidates = args.get("candidates") or []
+    max_new = int(args.get("max_new") or 32)
+
+    if action == "status":
+        cmd: List[str] = [_find_cli("wm-models"), "list", "--json"]
+    elif action in ("route", "sutra", "kekkai", "squeeze", "recall_rank", "hms_sync", "copilot"):
+        mode = action.replace("_", "-")
+        cmd = [_find_cli("wm-huginn"), mode, query, "--max-new", str(max_new)]
+        if mode in ("squeeze", "hms-sync"):
+            cmd.extend(["--key", key])
+        if mode == "recall-rank" and isinstance(candidates, list) and candidates:
+            cmd.append("--candidates")
+            cmd.extend(str(c) for c in candidates[:5])
+    elif action in ("crystallize", "reconcile", "sim_audit", "handoff", "exec_filter", "dream_teach"):
+        mode = action.replace("_", "-")
+        cmd = [_find_cli("wm-muninn"), mode, query, "--max-new", str(max_new)]
+        if mode in ("crystallize", "reconcile", "handoff"):
+            cmd.extend(["--key", key])
+    elif action == "tricameral":
+        cmd = [_find_cli("wm-tricameral"), query, "--max-new", str(max_new)]
+    else:
+        return {"isError": True, "text": json.dumps({"error": f"Unknown action: {action}"})}
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+            return {"isError": True, "text": json.dumps({"error": msg, "action": action})}
+        return {"isError": False, "text": proc.stdout.strip()}
+    except Exception as exc:
+        return {"isError": True, "text": json.dumps({"error": str(exc), "action": action})}
+
+
+TOOL_SCHEMA = {
+    "name": "tricameral_dispatch",
+    "description": (
+        "Dispatch $0 local Safe-Rust Tricameral CyberBrain micro-organs "
+        "(Huginn-1 S0, Muninn-4 S1, Valkyrie-M3 S2) for routing, 6D recall reranking, "
+        "Sutra glyphing, Kekkai security vetoes, neural state compression, and .hms session holograms."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "status", "route", "sutra", "kekkai", "squeeze", "recall_rank", "hms_sync", "copilot",
+                    "crystallize", "reconcile", "sim_audit", "handoff", "exec_filter", "dream_teach", "tricameral",
+                ],
+                "description": "Tricameral organ action to execute",
+            },
+            "query": {"type": "string", "description": "Input prompt, command, log, or records"},
+            "key": {"type": "string", "description": "Target state key for squeeze/hms_sync/crystallize/reconcile/handoff"},
+            "candidates": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Up to 5 candidate memory excerpts for recall_rank",
+            },
+            "max_new": {"type": "integer", "description": "Max generated tokens (default 32)"},
+        },
+        "required": ["action"],
+    },
+}
+
+
+def main() -> None:
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+        method = str(req.get("method") or "")
+        req_id = req.get("id")
+        if method.startswith("notifications/"):
+            continue
+
+        if method == "initialize":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "wm-tricameral-mcp", "version": "3.1.0"},
+                },
+            }
+        elif method == "tools/list":
+            resp = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": [TOOL_SCHEMA]}}
+        elif method == "tools/call":
+            params = req.get("params") or {}
+            args = params.get("arguments") or {}
+            res = dispatch_tool(args if isinstance(args, dict) else {})
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": res["text"]}],
+                    "isError": bool(res["isError"]),
+                },
+            }
+        else:
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+            }
+        sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

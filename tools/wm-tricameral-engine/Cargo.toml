@@ -1,0 +1,27 @@
+[package]
+name = "wm-tricameral-engine"
+version = "0.4.0"
+edition = "2024"
+description = "Cross-platform Safe-Rust T-MAC 4-bit Nibble LUT + Unified Radix Cache (URC) + UNIX-socket daemon inference engine for WhiteMagic Tricameral spores (Huginn-1, Muninn-4, Valkyrie-M3)"
+license = "MIT"
+
+[lib]
+name = "wm_tricameral_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "muninn-engine"
+path = "src/main.rs"
+
+[dependencies]
+pulp = "0.22"
+rayon = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

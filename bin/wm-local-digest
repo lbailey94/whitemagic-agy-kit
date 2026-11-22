@@ -98,6 +98,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=220, help="Max LLM output tokens when --llm is set (default: 220)")
     ap.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds for --llm (default: 30)")
     ap.add_argument("--llm", action="store_true", help="Synthesize selected chunks via local llama-server (:18898); default is <1.5s hybrid bge-small+BM25 extract to keep Gemini 4 prefix cache warm")
+    ap.add_argument("--tricameral", action="store_true", help="Rank & compress via local Safe-Rust wm-huginn (0.00 CU)")
     args = ap.parse_args()
 
     if args.file:
@@ -142,6 +143,23 @@ def main():
     chunks = chunk_text(text)
     selected = rank_chunks(chunks, args.query, top_k=args.top_k)
     context = "\n\n".join(f"--- Chunk {idx+1}/{len(chunks)} ---\n{c}" for idx, c in selected)
+
+    if args.tricameral:
+        import shutil as _shutil
+        import subprocess as _sp
+        huginn_bin = _shutil.which("wm-huginn") or str(Path.home() / ".local" / "bin" / "wm-huginn")
+        if Path(huginn_bin).exists():
+            cands = [c.strip().replace("\n", " ")[:180] for _, c in selected[:5]]
+            try:
+                r_out = json.loads(_sp.check_output([huginn_bin, "recall-rank", args.query, "--candidates", *cands], text=True, timeout=8))
+                pick_idx = max(0, min(len(selected) - 1, int(r_out.get("selected_index", 1)) - 1))
+                win_idx, win_txt = selected[pick_idx]
+                red = 100.0 * (1.0 - len(win_txt) / max(len(text), 1))
+                print(f"[wm-local-digest | $0 wm-huginn recall-rank (margin={r_out.get('conformal_pick_margin')}) | {src_label} -> Chunk {win_idx+1}/{len(chunks)} (-{red:.0f}%)]")
+                print(win_txt[:2400])
+                return
+            except Exception:
+                pass
 
     if not args.llm:
         out = context[:3600]

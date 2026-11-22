@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""wm-huginn — Sovereign System 0 / 0.5 WhiteMagic Micro-Organ CLI (`0.00 CU`, Resident UNIX-Socket + URC).
+
+Backed by `Huginn-1 School-S3` (`TM7B\\x06`, 384d/6h/1152ff/4c, 25.24M unique params / 12.2M non-embedding backbone,
+~122 MB RSS) running inside `#![forbid(unsafe_code)]` Safe-Rust `muninn-engine --daemon` with a 24-entry
+Unified Radix Cache (URC) for Hybrid DeltaNet-2 + RoPE prefix state snapshots.
+
+All 6 WhiteMagic Systems Supported:
+  1. `wm-huginn recall-rank "<query>" --candidates c1 c2 ...` -> 6D Galactic `[PREF_JUDGE]` memory filter (~90% token savings)
+  2. `wm-huginn sutra "<query>"`                              -> 12-token Sutra AST thought-glyph compiler
+  3. `wm-huginn squeeze "<log_or_diff>" --key <state_key>`    -> Neural `[UPD_ERASE]` state-delta compressor (~95% token savings)
+  4. `wm-huginn hms-sync "<event_text>"`                      -> Updates persistent `.hms` rolling estate hologram on disk
+  5. `wm-huginn kekkai "<command_or_request>"`                -> `< 175 ms` `PreToolUse` constitutional zero-trust firewall (`[VETO_NEG0]`)
+  6. `wm-huginn route "<query>"` / `wm-huginn copilot "<q>"`  -> Active Inference / EFE Tricameral Router & conformal Shadow Co-Pilot
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+MODELS_DIR = Path(os.environ.get("WM_MODELS_DIR", str(Path.home() / ".local" / "share" / "whitemagic" / "models")))
+DEFAULT_HMS = Path(os.environ.get("WM_HUGINN_HMS", str(Path.home() / ".local" / "share" / "whitemagic" / "huginn1_estate.hms")))
+DEFAULT_SOCK = Path(os.environ.get("WM_TRICAMERAL_SOCK_DIR", "/tmp")) / "wm_huginn.sock"
+
+
+def resolve_engine_bin() -> Path:
+    env_bin = os.environ.get("WM_TRICAMERAL_BIN")
+    cands = [
+        Path(env_bin).expanduser() if env_bin else None,
+        Path(shutil.which("muninn-engine")) if shutil.which("muninn-engine") else None,
+        Path.home() / ".local" / "bin" / "muninn-engine",
+        Path(shutil.which("muninn_engine")) if shutil.which("muninn_engine") else None,
+    ]
+    for c in cands:
+        if c and c.is_file() and os.access(c, os.X_OK):
+            return c
+    raise FileNotFoundError("Safe-Rust 'muninn-engine' binary not found. Run ./install.sh in whitemagic-agy-kit.")
+
+
+def _model_search_dirs() -> List[Path]:
+    dirs = [MODELS_DIR]
+    extra = os.environ.get("WM_MODELS_EXTRA_DIRS", "")
+    for part in extra.split(os.pathsep):
+        if part.strip():
+            dirs.append(Path(part.strip()).expanduser())
+    return dirs
+
+
+def resolve_default_huginn_spore() -> Path:
+    names = ["huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"]
+    for d in _model_search_dirs():
+        for nm in names:
+            p = d / nm
+            if p.exists():
+                return p
+    raise FileNotFoundError(
+        f"No Huginn-1 .tm7b spore found in {MODELS_DIR}. Pull weights with: wm-models pull huginn"
+    )
+
+
+def send_unix_json(sock_path: Path, payload: Dict[str, Any], timeout: float = 15.0) -> Dict[str, Any]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(str(sock_path))
+        s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    return json.loads(buf.decode("utf-8"))
+
+
+def ensure_huginn_daemon(spore: Path, sock_path: Path = DEFAULT_SOCK) -> bool:
+    if sock_path.exists():
+        try:
+            r = send_unix_json(sock_path, {"cmd": "ping"}, timeout=1.5)
+            if r.get("status") == "ok":
+                return True
+        except Exception:
+            sock_path.unlink(missing_ok=True)
+    engine = resolve_engine_bin()
+    cmd = [
+        str(engine),
+        "--weights", str(spore),
+        "--shells", "3",
+        "--r-loops", "2",
+        "--rep-penalty", "1.0",
+        "--prefill-chunk", "16",
+        "--energy-halt", "0.95",
+        "--daemon", str(sock_path),
+    ]
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if sock_path.exists():
+            try:
+                r = send_unix_json(sock_path, {"cmd": "ping"}, timeout=1.0)
+                if r.get("status") == "ok":
+                    return True
+            except Exception:
+                pass
+        time.sleep(0.05)
+    return False
+
+
+def stop_daemon(sock_path: Path = DEFAULT_SOCK) -> Dict[str, Any]:
+    if not sock_path.exists():
+        return {"status": "already_stopped", "socket": str(sock_path)}
+    try:
+        r = send_unix_json(sock_path, {"cmd": "shutdown"}, timeout=2.0)
+    except Exception:
+        r = {"status": "unlinked_stale"}
+    sock_path.unlink(missing_ok=True)
+    return r
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="wm-huginn: 6-System Sovereign WhiteMagic Micro-Organ CLI")
+    ap.add_argument(
+        "mode",
+        choices=["route", "sutra", "kekkai", "squeeze", "recall-rank", "hms-sync", "copilot", "prompt", "daemon-status", "daemon-start", "daemon-stop"],
+        help="WhiteMagic execution mode",
+    )
+    ap.add_argument("query", nargs="?", default="", help="Input query, command, log text, or raw prompt")
+    ap.add_argument("--candidates", nargs="*", default=[], help="Candidate memories for recall-rank (#1..#5)")
+    ap.add_argument("--key", default="active_state", help="Target key for squeeze/hms-sync mode")
+    ap.add_argument("--hms-path", default=str(DEFAULT_HMS), help="Path to persistent .hms hologram state")
+    ap.add_argument("--weights", default="", help="Override .tm7b path")
+    ap.add_argument("--r-loops", type=int, default=0, help="Recurrence loops (default: 1 for route, 2 for others)")
+    ap.add_argument("--shells", type=int, default=0, help="Active Guna shells (default: 2 for route, 3 for others)")
+    ap.add_argument("--max-new", type=int, default=28)
+    ap.add_argument("--no-daemon", action="store_true", help="Disable resident UNIX-socket daemon")
+    args = ap.parse_args()
+
+    if args.mode == "daemon-stop":
+        print(json.dumps(stop_daemon(DEFAULT_SOCK), indent=2))
+        return
+
+    try:
+        spore = Path(args.weights).expanduser() if args.weights else resolve_default_huginn_spore()
+        engine = resolve_engine_bin()
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"wm-huginn: {exc}\n")
+        sys.exit(2)
+
+    if args.mode in ("daemon-status", "daemon-start"):
+        ok = ensure_huginn_daemon(spore, DEFAULT_SOCK)
+        if not ok:
+            sys.stderr.write("wm-huginn: failed to start daemon\n")
+            sys.exit(1)
+        print(json.dumps(send_unix_json(DEFAULT_SOCK, {"cmd": "ping"}), indent=2))
+        return
+
+    r_loops = args.r_loops if args.r_loops > 0 else (1 if args.mode == "route" else 2)
+    shells = args.shells if args.shells > 0 else (2 if args.mode == "route" else 3)
+
+    if args.mode == "hms-sync":
+        hms_p = Path(args.hms_path).expanduser()
+        hms_p.parent.mkdir(parents=True, exist_ok=True)
+        prompt = f"[UPD_ERASE] {args.query}\n[USR] What is the current active value of {args.key}?\n[AST]"
+        req = {
+            "id": "wm_huginn_hms",
+            "prompt": prompt,
+            "max_new": args.max_new,
+            "r_loops": 2,
+            "shells": 3,
+            "rep_penalty": 1.0,
+            "mac_6d": [0.90, 0.0, 0.95, 0.85, 0.90, 0.80],
+            "save_state": str(hms_p),
+            "load_state": str(hms_p) if hms_p.exists() else "",
+        }
+        if not args.no_daemon and ensure_huginn_daemon(spore, DEFAULT_SOCK):
+            row = send_unix_json(DEFAULT_SOCK, req)
+            print(json.dumps({
+                "organ": spore.name,
+                "mode": "hms-sync",
+                "transport": "unix_socket_daemon",
+                "hms_path": str(hms_p),
+                "hologram_saved_bytes": row.get("hologram_saved_bytes", 0),
+                "hologram_loaded_bytes": row.get("hologram_loaded_bytes", 0),
+                "elapsed_ms": row.get("elapsed_ms", 0.0),
+                "conformal_pick_margin": row.get("pick_margin", 0.0),
+                "output": row.get("gen_text", "").replace("[EOS]", "").strip(),
+            }, indent=2))
+            return
+
+    if args.mode == "route":
+        prompt = f"[ROUTE] [USR] {args.query}\n[AST]"
+        mac_6d = [0.95, 0.0, 0.90, 1.00, 0.90, 0.95]
+    elif args.mode == "sutra":
+        prompt = f"[USR] {args.query}\n[AST]"
+        mac_6d = [0.95, 0.0, 0.90, 1.00, 0.90, 0.95]
+    elif args.mode == "kekkai":
+        prompt = f"[VETO_NEG0] {args.query}\n[AST]"
+        mac_6d = [0.95, 0.0, 0.90, 1.00, 0.90, -1.00]
+    elif args.mode == "squeeze":
+        prompt = f"[UPD_ERASE] [MAC_GAL] L=+0.90 O=+0.00 T=+0.95 E=+0.85 V=+0.90 C=+0.80\n{args.query}\n[USR] What is the current active value of {args.key}?\n[AST]"
+        mac_6d = [0.90, 0.0, 0.95, 0.85, 0.90, 0.80]
+    elif args.mode == "recall-rank":
+        c_lines = "\n".join(f"#{i+1}: {c}" for i, c in enumerate(args.candidates[:5]))
+        prompt = f"[PREF_PICK] Rank these engineering options and pick the single strongest candidate.\n{c_lines}\n[USR] Pick the best option (#1-#5):\n[AST]"
+        mac_6d = [-0.80, 1.00, 0.90, 0.85, 0.90, 0.70]
+    elif args.mode == "copilot":
+        tag = "[CODE_RS]" if "rust" in args.query.lower() else "[CODE_PY]"
+        prompt = f"{tag} {args.query}\n[AST]"
+        mac_6d = [0.95, 0.0, 0.85, 0.95, 0.85, 0.90]
+    else:
+        prompt = args.query
+        mac_6d = [0.95, 0.0, 0.90, 0.95, 0.90, 0.90]
+
+    req_item = {
+        "id": "wm_huginn_q",
+        "prompt": prompt,
+        "max_new": args.max_new,
+        "r_loops": r_loops,
+        "shells": shells,
+        "rep_penalty": 1.0,
+        "mac_6d": mac_6d,
+    }
+
+    transport = "cli_oneshot"
+    if not args.no_daemon and ensure_huginn_daemon(spore, DEFAULT_SOCK):
+        row = send_unix_json(DEFAULT_SOCK, req_item)
+        transport = "unix_socket_daemon"
+    else:
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+            in_p = Path(f.name)
+            f.write(json.dumps(req_item) + "\n")
+        out_p = in_p.with_suffix(".out.jsonl")
+        cmd = [
+            str(engine),
+            "--weights", str(spore),
+            "--shells", str(shells),
+            "--r-loops", str(r_loops),
+            "--rep-penalty", "1.0",
+            "--prefill-chunk", "16",
+            "--energy-halt", "0.95",
+            "--batch-jsonl", str(in_p),
+            "--batch-out", str(out_p),
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        row = json.loads(out_p.read_text(encoding="utf-8").splitlines()[0])
+        in_p.unlink(missing_ok=True)
+        out_p.unlink(missing_ok=True)
+
+    txt = row.get("gen_text", "").replace("[EOS]", "").strip()
+    margin = float(row.get("pick_margin", 0.0))
+
+    tier = "S0"
+    if "[ROUTE|VALKYRIE_S2]" in txt or "[TIER_S2]" in txt or "[EFE=HIGH" in txt:
+        tier = "S2"
+    elif "[ROUTE|MUNINN_S1]" in txt or "[TIER_S1]" in txt or "[EFE=MED" in txt:
+        tier = "S1"
+
+    out_obj: Dict[str, Any] = {
+        "organ": spore.name,
+        "mode": args.mode,
+        "transport": transport,
+        "routed_tier": tier,
+        "elapsed_ms": row.get("elapsed_ms", 0.0),
+        "urc_hit_tokens": row.get("urc_hit_tokens", 0),
+        "conformal_pick_margin": round(margin, 3),
+        "conformal_high_confidence": margin >= 5.0,
+        "output": txt,
+    }
+    if args.mode == "kekkai":
+        out_obj["veto"] = ("[VETO_NEG0]" in txt) or ("REFUSE" in txt.upper()) or ("REJECT" in txt.upper())
+    if args.mode == "recall-rank":
+        m = re.search(r"#([1-5])", txt)
+        out_obj["selected_index"] = int(m.group(1)) if m else 1
+        if args.candidates and 1 <= out_obj["selected_index"] <= len(args.candidates):
+            out_obj["selected_candidate"] = args.candidates[out_obj["selected_index"] - 1]
+    print(json.dumps(out_obj, indent=2))
+
+
+if __name__ == "__main__":
+    main()

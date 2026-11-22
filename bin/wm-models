@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""wm-models — Cross-platform WhiteMagic Tricameral Spore (.tm7b) Manager.
+
+Downloads, links, lists, and verifies local `.tm7b` weights in
+`~/.local/share/whitemagic/models/` (overridable via `WM_MODELS_DIR`).
+
+Supports two zero-bloat weight transports:
+  - `--source hf`     HuggingFace Hub (public OR private via `HF_TOKEN`; uses `hf`/`huggingface-cli` if installed or pure stdlib HTTPS)
+  - `--source gdrive` Google Drive via `rclone` (`WM_GDRIVE_REMOTE`, default `gdrive:BlackGarden_v4/spores`)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
+DEFAULT_MODELS_DIR = Path(os.environ.get("WM_MODELS_DIR", str(Path.home() / ".local" / "share" / "whitemagic" / "models")))
+SOCK_DIR = Path(os.environ.get("WM_TRICAMERAL_SOCK_DIR", "/tmp"))
+
+
+def find_manifest() -> Path:
+    candidates = [
+        Path(os.environ.get("WM_MODELS_MANIFEST", "")) if os.environ.get("WM_MODELS_MANIFEST") else None,
+        Path(__file__).resolve().parents[1] / "models" / "manifest.json",
+        Path.home() / ".local" / "share" / "whitemagic" / "models" / "manifest.json",
+        Path.home() / ".gemini" / "config" / "plugins" / "whitemagic-agy-kit" / "models" / "manifest.json",
+    ]
+    for c in candidates:
+        if c and c.is_file():
+            return c
+    raise FileNotFoundError("Could not locate models/manifest.json (set WM_MODELS_MANIFEST or reinstall whitemagic-agy-kit)")
+
+
+def load_manifest() -> Dict[str, Any]:
+    return json.loads(find_manifest().read_text(encoding="utf-8"))
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def resolve_local_spore(models_dir: Path, spec: Dict[str, Any]) -> Path | None:
+    names = [spec["filename"], *spec.get("aliases", [])]
+    search_dirs = [models_dir]
+    extra = os.environ.get("WM_MODELS_EXTRA_DIRS", "")
+    for part in extra.split(os.pathsep):
+        if part.strip():
+            search_dirs.append(Path(part.strip()).expanduser())
+    for d in search_dirs:
+        for nm in names:
+            p = d / nm
+            if p.exists():
+                return p
+    return None
+
+
+def ping_sock(sock_path: Path) -> bool:
+    if not sock_path.exists():
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(str(sock_path))
+            s.sendall(b'{"cmd":"ping"}\n')
+            data = s.recv(4096)
+            return b'"ok"' in data
+    except Exception:
+        return False
+
+
+def download_hf(repo: str, rev: str, hf_path: str, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    if not token:
+        tok_file = Path.home() / ".cache" / "huggingface" / "token"
+        if tok_file.is_file():
+            token = tok_file.read_text(encoding="utf-8").strip()
+
+    url = f"https://huggingface.co/{repo}/resolve/{rev}/{hf_path}"
+    headers = {"User-Agent": "whitemagic-agy-kit/3.1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}")
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got = 0
+            with open(tmp, "wb") as out:
+                while True:
+                    buf = resp.read(1024 * 1024)
+                    if not buf:
+                        break
+                    out.write(buf)
+                    got += len(buf)
+                    if total > 0 and sys.stderr.isatty():
+                        pct = 100.0 * got / total
+                        sys.stderr.write(f"\r  downloading {dst.name}: {got/1e6:.1f}/{total/1e6:.1f} MB ({pct:.1f}%)")
+                        sys.stderr.flush()
+            if sys.stderr.isatty():
+                sys.stderr.write("\n")
+        os.replace(tmp, dst)
+    except urllib.error.HTTPError as e:
+        tmp.unlink(missing_ok=True)
+        hint = " (set HF_TOKEN for private repos)" if e.code in (401, 403, 404) else ""
+        raise RuntimeError(f"HF download failed ({e.code}) for {url}{hint}") from e
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def download_gdrive(remote_root: str, rel_path: str, dst: Path) -> None:
+    rclone = shutil.which("rclone")
+    if not rclone:
+        raise RuntimeError("rclone not found on PATH; install rclone or use --source hf")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}")
+    src = f"{remote_root.rstrip('/')}/{rel_path.lstrip('/')}"
+    try:
+        subprocess.run([rclone, "copyto", "--progress", src, str(tmp)], check=True)
+        os.replace(tmp, dst)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def cmd_list(manifest: Dict[str, Any], models_dir: Path, as_json: bool) -> None:
+    engine = (
+        os.environ.get("WM_TRICAMERAL_BIN")
+        or shutil.which("muninn-engine")
+        or (str(Path.home() / ".local" / "bin" / "muninn-engine") if (Path.home() / ".local" / "bin" / "muninn-engine").exists() else "")
+    )
+    rows = []
+    for key, spec in manifest["models"].items():
+        found = resolve_local_spore(models_dir, spec)
+        size_mb = round(found.stat().st_size / (1024 * 1024), 1) if found else 0.0
+        rows.append({
+            "id": key,
+            "organ": spec["organ"],
+            "tier": spec["tier"],
+            "installed": bool(found),
+            "path": str(found) if found else str(models_dir / spec["filename"]),
+            "size_mb": size_mb if found else spec["size_mb_approx"],
+            "format": spec["format"],
+        })
+    daemons = {
+        "huginn": ping_sock(SOCK_DIR / "wm_huginn.sock"),
+        "muninn": ping_sock(SOCK_DIR / "wm_muninn.sock"),
+        "valkyrie": ping_sock(SOCK_DIR / "wm_valkyrie.sock"),
+    }
+    if as_json:
+        print(json.dumps({"models_dir": str(models_dir), "engine": engine, "daemons": daemons, "models": rows}, indent=2))
+        return
+    print(f"Models Dir : {models_dir}")
+    print(f"Engine Bin : {engine or '(not installed — run ./install.sh)'}")
+    print(f"Daemons    : huginn={'UP' if daemons['huginn'] else 'off'} | muninn={'UP' if daemons['muninn'] else 'off'} | valkyrie={'UP' if daemons['valkyrie'] else 'off'}")
+    print("")
+    for r in rows:
+        mark = "INSTALLED" if r["installed"] else "missing  "
+        print(f"  [{mark}] {r['id']:<12} ({r['tier']}) {r['organ']:<22} {r['size_mb']:>6.1f} MB  -> {r['path']}")
+
+
+def cmd_pull(manifest: Dict[str, Any], models_dir: Path, target: str, source: str, repo: str, rev: str, remote: str, force: bool) -> None:
+    profiles = manifest.get("profiles", {})
+    models = manifest["models"]
+    if target in profiles:
+        keys: List[str] = list(profiles[target])
+    elif target in models:
+        keys = [target]
+    else:
+        raise SystemExit(f"Unknown profile/model '{target}'. Choices: {list(profiles.keys()) + list(models.keys())}")
+
+    for k in keys:
+        spec = models[k]
+        existing = resolve_local_spore(models_dir, spec)
+        dst = models_dir / spec["filename"]
+        if existing and not force:
+            print(f"[skip] {k} already available at {existing}")
+            continue
+        print(f"[pull] {k} ({spec['organ']}, ~{spec['size_mb_approx']} MB) via {source} -> {dst}")
+        if source == "hf":
+            download_hf(repo, rev, spec["hf_path"], dst)
+        else:
+            download_gdrive(remote, spec["gdrive_path"], dst)
+        hdr = dst.read_bytes()[:5]
+        if not hdr.startswith(b"TM7B"):
+            raise RuntimeError(f"Downloaded file {dst} does not have a valid TM7B header ({hdr!r})")
+        exp_sha = spec.get("sha256") or ""
+        if exp_sha:
+            got_sha = sha256_file(dst)
+            if got_sha != exp_sha:
+                raise RuntimeError(f"SHA-256 mismatch for {dst}: got {got_sha}, expected {exp_sha}")
+        print(f"[ok]   {k} ready ({dst.stat().st_size / (1024*1024):.1f} MB)")
+
+
+def cmd_link(models_dir: Path, src_path: str, alias: str) -> None:
+    src = Path(src_path).expanduser().resolve()
+    if not src.is_file():
+        raise SystemExit(f"Source file does not exist: {src}")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    dst = models_dir / (alias or src.name)
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    dst.symlink_to(src)
+    print(f"Linked {dst} -> {src}")
+
+
+def cmd_verify(manifest: Dict[str, Any], models_dir: Path) -> None:
+    ok = True
+    for k, spec in manifest["models"].items():
+        p = resolve_local_spore(models_dir, spec)
+        if not p:
+            print(f"[miss] {k:<12} not installed")
+            continue
+        hdr = p.read_bytes()[:5]
+        valid_hdr = hdr[:4] == b"TM7B" and hdr[4] in (5, 6)
+        digest = sha256_file(p)
+        exp = spec.get("sha256") or ""
+        sha_ok = (not exp) or (digest == exp)
+        status = "PASS" if (valid_hdr and sha_ok) else "FAIL"
+        if status != "PASS":
+            ok = False
+        print(f"[{status}] {k:<12} hdr=TM7B\\x0{hdr[4] if len(hdr) >= 5 else 0} size={p.stat().st_size/(1024*1024):.1f}MB sha256={digest[:16]}... ({p.name})")
+    if not ok:
+        raise SystemExit(1)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="wm-models: Manage WhiteMagic Tricameral .tm7b spores")
+    ap.add_argument("--models-dir", default=str(DEFAULT_MODELS_DIR), help="Override model storage directory")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_ls = sub.add_parser("list", help="List installed & available spores and daemon status")
+    p_ls.add_argument("--json", action="store_true")
+
+    p_pull = sub.add_parser("pull", help="Download a profile (huginn|ravens|tricameral) or individual model")
+    p_pull.add_argument("target", nargs="?", default="huginn")
+    p_pull.add_argument("--source", choices=["hf", "gdrive"], default=os.environ.get("WM_MODELS_SOURCE", "hf"))
+    p_pull.add_argument("--repo", default=os.environ.get("WM_HF_REPO", ""))
+    p_pull.add_argument("--rev", default=os.environ.get("WM_HF_REV", ""))
+    p_pull.add_argument("--remote", default=os.environ.get("WM_GDRIVE_REMOTE", ""))
+    p_pull.add_argument("--force", action="store_true")
+
+    p_link = sub.add_parser("link", help="Symlink a local .tm7b file into ~/.local/share/whitemagic/models/")
+    p_link.add_argument("src")
+    p_link.add_argument("--as", dest="alias", default="")
+
+    sub.add_parser("verify", help="Verify TM7B headers and SHA-256 digests of installed spores")
+
+    args = ap.parse_args()
+    manifest = load_manifest()
+    models_dir = Path(args.models_dir).expanduser()
+
+    if args.cmd == "list":
+        cmd_list(manifest, models_dir, args.json)
+    elif args.cmd == "pull":
+        cmd_pull(
+            manifest,
+            models_dir,
+            args.target,
+            args.source,
+            args.repo or manifest["default_hf_repo"],
+            args.rev or manifest["default_hf_revision"],
+            args.remote or manifest["default_gdrive_remote"],
+            args.force,
+        )
+    elif args.cmd == "link":
+        cmd_link(models_dir, args.src, args.alias)
+    elif args.cmd == "verify":
+        cmd_verify(manifest, models_dir)
+
+
+if __name__ == "__main__":
+    main()

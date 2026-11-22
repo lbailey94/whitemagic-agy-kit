@@ -1,36 +1,44 @@
 #!/usr/bin/env bash
-# WhiteMagic AGY Turbo Kit v3.0.0 — Idempotent Cross-Platform Installer (macOS + Linux)
+# WhiteMagic AGY Turbo Kit v3.1.0 — Idempotent Cross-Platform Installer (macOS + Linux)
 # Installs:
-#   1. Zero-dependency Rust binaries `wm-squeeze` & `wm-codegraph` -> ~/.local/bin/
-#   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` MCP when `wm-codegraph` is built; or `--sync-global`)
+#   1. Zero-dependency Rust binaries `wm-squeeze`, `wm-codegraph`, & Safe-Rust `muninn-engine` -> ~/.local/bin/
+#   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` & `tricameral_dispatch` MCPs; or `--sync-global`)
 #   3. Hardened `INK-Q/agy-fast` plugin (--auto-update off) if Node >= 20 is available (preserves existing valid installs)
 #   4. Disables 6 unused heavy official plugins (-10.4k tokens/session) if present
-#   5. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `wm-local-digest`, `wm-dream`, `wm-handoff`, `statusline.py`)
+#   5. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `wm-local-digest`, `wm-dream`, `wm-handoff`, `wm-models`, `wm-huginn`, `wm-muninn`, `wm-tricameral`, `wm-tricameral-mcp`, `statusline.py`)
 #   6. Non-destructive `~/.gemini/antigravity-cli/settings.json` safe allowlist + statusLine tuning (timestamped backup; leaves model untouched)
 #   7. Selective `"eager": true` MCP promotion for locally detected `wm3` / `whitemagic_gen3` / `firecrawl-local-mcp`
+#   8. Optional Tricameral spore pull (`--with-huginn` | `--with-ravens` | `--with-tricameral`) via `wm-models`
 set -euo pipefail
 
 KIT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PLUGINS_DIR="${HOME}/.gemini/config/plugins"
 LOCAL_BIN="${HOME}/.local/bin"
 AGY_CLI_DIR="${HOME}/.gemini/antigravity-cli"
+MODELS_DIR="${WM_MODELS_DIR:-${HOME}/.local/share/whitemagic/models}"
 SKIP_AGY_FAST=0
+SKIP_TRICAMERAL_ENGINE=0
 KEEP_HEAVY_PLUGINS=0
 SYNC_GLOBAL=0
+PULL_PROFILE=""
 
 for arg in "$@"; do
     case "$arg" in
         --skip-agy-fast) SKIP_AGY_FAST=1 ;;
+        --skip-tricameral-engine) SKIP_TRICAMERAL_ENGINE=1 ;;
         --keep-heavy-plugins) KEEP_HEAVY_PLUGINS=1 ;;
         --sync-global) SYNC_GLOBAL=1 ;;
+        --with-huginn) PULL_PROFILE="huginn" ;;
+        --with-ravens) PULL_PROFILE="ravens" ;;
+        --with-tricameral) PULL_PROFILE="tricameral" ;;
         -h|--help)
-            echo "Usage: ./install.sh [--skip-agy-fast] [--keep-heavy-plugins] [--sync-global]"
+            echo "Usage: ./install.sh [--skip-agy-fast] [--skip-tricameral-engine] [--keep-heavy-plugins] [--sync-global] [--with-huginn|--with-ravens|--with-tricameral]"
             exit 0
             ;;
     esac
 done
 
-mkdir -p "$PLUGINS_DIR" "$LOCAL_BIN" "$AGY_CLI_DIR" "${HOME}/.gemini/config/hooks"
+mkdir -p "$PLUGINS_DIR" "$LOCAL_BIN" "$AGY_CLI_DIR" "${HOME}/.gemini/config/hooks" "$MODELS_DIR"
 
 install_bin() {
     # Atomic temp-file + mv replaces the directory entry with a fresh inode,
@@ -43,13 +51,21 @@ install_bin() {
     mv -f "$tmp" "$dst"
 }
 
-echo "=== 1. Building zero-dependency Rust binaries: wm-squeeze & wm-codegraph ==="
+echo "=== 1. Building Rust binaries: wm-squeeze, wm-codegraph & Safe-Rust muninn-engine ==="
 if command -v cargo >/dev/null 2>&1; then
     cargo build --release --manifest-path "${KIT_DIR}/tools/wm-squeeze/Cargo.toml"
     install_bin "${KIT_DIR}/tools/wm-squeeze/target/release/wm-squeeze" "${LOCAL_BIN}/wm-squeeze"
     cargo build --release --manifest-path "${KIT_DIR}/tools/wm-codegraph/Cargo.toml"
     install_bin "${KIT_DIR}/tools/wm-codegraph/target/release/wm-codegraph" "${LOCAL_BIN}/wm-codegraph"
     echo "Installed ${LOCAL_BIN}/wm-squeeze & ${LOCAL_BIN}/wm-codegraph"
+    if [ "$SKIP_TRICAMERAL_ENGINE" -eq 0 ] && [ -f "${KIT_DIR}/tools/wm-tricameral-engine/Cargo.toml" ]; then
+        if cargo build --release --manifest-path "${KIT_DIR}/tools/wm-tricameral-engine/Cargo.toml"; then
+            install_bin "${KIT_DIR}/tools/wm-tricameral-engine/target/release/muninn-engine" "${LOCAL_BIN}/muninn-engine"
+            echo "Installed ${LOCAL_BIN}/muninn-engine (Safe-Rust Tricameral Engine)"
+        else
+            echo "[warn] muninn-engine build failed (requires Rust >= 1.88 / edition 2024); continuing without Tricameral engine."
+        fi
+    fi
 elif command -v rustc >/dev/null 2>&1; then
     rustc -O "${KIT_DIR}/tools/wm-squeeze/src/main.rs" -o "${LOCAL_BIN}/wm-squeeze.tmp.$$"
     chmod +x "${LOCAL_BIN}/wm-squeeze.tmp.$$"
@@ -69,6 +85,8 @@ if [ "$SYNC_GLOBAL" -eq 1 ]; then
     cp "${KIT_DIR}/plugin/hooks/post_tool_sim.py" "${HOME}/.gemini/config/hooks/post_tool_sim.py"
     cp "${KIT_DIR}/plugin/hooks/stop_telemetry.py" "${HOME}/.gemini/config/hooks/stop_telemetry.py"
     chmod +x "${HOME}/.gemini/config/hooks/"*.py
+    mkdir -p "${HOME}/.gemini/config/skills/huginn-tricameral-router"
+    cp "${KIT_DIR}/plugin/skills/huginn-tricameral-router/SKILL.md" "${HOME}/.gemini/config/skills/huginn-tricameral-router/SKILL.md"
     python3 - <<'PY'
 import json
 from pathlib import Path
@@ -118,28 +136,40 @@ else
     TARGET_PLUGIN="${PLUGINS_DIR}/whitemagic-agy-kit"
     rm -rf "$TARGET_PLUGIN"
     cp -R "${KIT_DIR}/plugin" "$TARGET_PLUGIN"
+    mkdir -p "${TARGET_PLUGIN}/models"
+    cp "${KIT_DIR}/models/manifest.json" "${TARGET_PLUGIN}/models/manifest.json"
     chmod +x "${TARGET_PLUGIN}/hooks/"*.py
 
-    if [ -x "${LOCAL_BIN}/wm-codegraph" ]; then
-        cat > "${TARGET_PLUGIN}/mcp_config.json" <<EOF
-{
-  "mcpServers": {
-    "codegraph": {
-      "command": "${LOCAL_BIN}/wm-codegraph",
-      "args": [
-        "--mcp"
-      ],
-      "tools": {
-        "code_graph": {
-          "eager": true
-        }
-      }
+    python3 - "$LOCAL_BIN" "$TARGET_PLUGIN" <<'PY'
+import json, sys
+from pathlib import Path
+
+local_bin = Path(sys.argv[1])
+target_plugin = Path(sys.argv[2])
+servers = {}
+
+cg = local_bin / "wm-codegraph"
+if cg.is_file():
+    servers["codegraph"] = {
+        "command": str(cg),
+        "args": ["--mcp"],
+        "tools": {"code_graph": {"eager": True}},
     }
-  }
-}
-EOF
-        echo "Wired eager code_graph MCP in ${TARGET_PLUGIN}/mcp_config.json"
-    fi
+
+tri_mcp = local_bin / "wm-tricameral-mcp"
+engine = local_bin / "muninn-engine"
+if engine.is_file():
+    servers["tricameral"] = {
+        "command": str(tri_mcp),
+        "args": [],
+        "tools": {"tricameral_dispatch": {"eager": True}},
+    }
+
+if servers:
+    out = target_plugin / "mcp_config.json"
+    out.write_text(json.dumps({"mcpServers": servers}, indent=2) + "\n", encoding="utf-8")
+    print(f"Wired eager plugin MCPs in {out}: {list(servers.keys())}")
+PY
 
     if command -v agy >/dev/null 2>&1; then
         agy plugin validate --strict "$TARGET_PLUGIN"
@@ -176,10 +206,11 @@ if [ "$KEEP_HEAVY_PLUGINS" -eq 0 ] && command -v agy >/dev/null 2>&1; then
     done
 fi
 
-echo "=== 5. Installing portable CLI tools & cache-warmth statusline ==="
-for tool in wm-sim agy-bench agy-mode wm-local-digest wm-dream wm-handoff; do
+echo "=== 5. Installing portable CLI tools, model manifest & cache-warmth statusline ==="
+for tool in wm-sim agy-bench agy-mode wm-local-digest wm-dream wm-handoff wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp; do
     install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
 done
+cp "${KIT_DIR}/models/manifest.json" "${MODELS_DIR}/manifest.json"
 install_bin "${KIT_DIR}/bin/statusline.py" "${AGY_CLI_DIR}/statusline.py"
 
 echo "=== 6. Updating ~/.gemini/antigravity-cli/settings.json (non-destructive; model untouched) ==="
@@ -250,6 +281,11 @@ base_allow = [
     "command(wm-squeeze --safe)",
     "command(wm-codegraph)",
     "mcp(whitemagic-agy-kit_codegraph/*)",
+    "mcp(whitemagic-agy-kit_tricameral/*)",
+    "command(wm-models)",
+    "command(wm-huginn)",
+    "command(wm-muninn)",
+    "command(wm-tricameral)",
     "command(wm-handoff)",
     "command(wm-local-digest)",
     "command(wm-dream)",
@@ -282,8 +318,8 @@ print(f"Updated {p} ({len(merged_allow)} allow, {len(existing_deny)} deny, statu
 PY
 
 echo "=== 7. Auto-wiring selective eager MCP tools for locally present servers ==="
-python3 - <<'PY'
-import json, shutil
+SYNC_GLOBAL_FLAG="${SYNC_GLOBAL}" python3 - <<'PY'
+import json, os, shutil
 from pathlib import Path
 
 home = Path.home()
@@ -295,6 +331,17 @@ else:
 
 servers = data.setdefault("mcpServers", {})
 changed = False
+
+if os.environ.get("SYNC_GLOBAL_FLAG") == "1":
+    engine = home / ".local" / "bin" / "muninn-engine"
+    tri_mcp = home / ".local" / "bin" / "wm-tricameral-mcp"
+    if engine.is_file() and tri_mcp.is_file():
+        servers["tricameral"] = {
+            "command": str(tri_mcp),
+            "args": [],
+            "tools": {"tricameral_dispatch": {"eager": True}},
+        }
+        changed = True
 
 wm3 = shutil.which("wm3") or (str(home / ".local" / "bin" / "wm3") if (home / ".local" / "bin" / "wm3").exists() else None)
 if wm3:
@@ -334,9 +381,17 @@ if wm_plugin_mcp.is_file():
         pass
 PY
 
+if [ -n "$PULL_PROFILE" ]; then
+    echo ""
+    echo "=== 8. Pulling Tricameral model profile: ${PULL_PROFILE} ==="
+    "${LOCAL_BIN}/wm-models" pull "$PULL_PROFILE"
+fi
+
 echo ""
-echo "=== 8. Verification Audit ==="
+echo "=== 9. Verification Audit ==="
 export PATH="${LOCAL_BIN}:${PATH}"
 wm-sim audit || true
+wm-models list || true
 echo ""
 echo "Done! Launch with 'agy' (or 'agy-mode longevity' / 'agy-mode orchestrator')."
+echo "To pull local Tricameral spores later: wm-models pull huginn | ravens | tricameral"

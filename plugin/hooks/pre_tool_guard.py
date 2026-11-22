@@ -17,8 +17,54 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import sys
 from pathlib import Path
+
+KEKKAI_SENSITIVE_RE = re.compile(
+    r"(?:\.ssh/|id_ed25519|id_rsa|\.aws/credentials|/etc/shadow|\bcurl\b[^;\n]*\|\s*(?:ba)?sh|\bwget\b[^;\n]*\|\s*(?:ba)?sh|\blandlock\b[^;\n]*\b(?:disable|bypass)\b|\bseccomp\b[^;\n]*\b(?:disable|bypass)\b)",
+    re.IGNORECASE,
+)
+HUGINN_SOCK = Path(os.environ.get("WM_TRICAMERAL_SOCK_DIR", "/tmp")) / "wm_huginn.sock"
+
+
+def check_huginn_kekkai_socket(cmd):
+    """Zero-spawn (<175ms) neural Kekkai check over resident wm_huginn.sock for sensitive commands."""
+    if os.environ.get("WM_HUGINN_KEKKAI_OFF") == "1" or not HUGINN_SOCK.exists():
+        return None
+    if not KEKKAI_SENSITIVE_RE.search(cmd):
+        return None
+    try:
+        req = {
+            "id": "pretool_kekkai",
+            "prompt": f"[VETO_NEG0] {cmd[:240]}\n[AST]",
+            "max_new": 16,
+            "r_loops": 2,
+            "shells": 3,
+            "rep_penalty": 1.0,
+            "mac_6d": [0.95, 0.0, 0.90, 1.00, 0.90, -1.00],
+        }
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.8)
+            s.connect(str(HUGINN_SOCK))
+            s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(8192)
+                if not chunk:
+                    break
+                buf += chunk
+        row = json.loads(buf.decode("utf-8"))
+        txt = str(row.get("gen_text") or "")
+        margin = float(row.get("pick_margin") or 0.0)
+        if ("[VETO_NEG0]" in txt or "REFUSE" in txt.upper() or "REJECT" in txt.upper()) and margin >= 2.0:
+            return (
+                f"[Huginn-1 Kekkai Neural Guard | {row.get('elapsed_ms', 0):.0f}ms | margin={margin:.2f}] "
+                f"Sensitive command flagged ({txt.replace('[EOS]', '').strip()[:96]}). Confirm explicitly before proceeding."
+            )
+    except Exception:
+        return None
+    return None
 
 DESTRUCTIVE_PATTERNS = [
     (
@@ -408,7 +454,7 @@ def main():
         emit({"decision": "allow"})
         return
 
-    # 1. Data-loss guard for all shell/check/edit tools
+    # 1. Data-loss guard + Huginn-1 Kekkai neural firewall for shell/check/edit tools
     for cmd in extract_commands(args):
         for pattern, reason in DESTRUCTIVE_PATTERNS:
             if re.search(pattern, cmd, flags=re.IGNORECASE):
@@ -417,6 +463,10 @@ def main():
                     "reason": f"[Data-Loss Guard] {reason}. Confirm explicitly before proceeding.",
                 })
                 return
+        kekkai_reason = check_huginn_kekkai_socket(cmd)
+        if kekkai_reason:
+            emit({"decision": "force_ask", "reason": kekkai_reason})
+            return
 
     # 2. Safe CLI output compression for run_command
     if tool_name == "run_command" and args.get("CommandLine"):

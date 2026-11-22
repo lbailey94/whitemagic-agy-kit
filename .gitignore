@@ -1,5 +1,9 @@
 tools/wm-squeeze/target/
 tools/wm-codegraph/target/
+tools/wm-tricameral-engine/target/
+*.tm7b
+*.hms
+*.cspd
 __pycache__/
 *.pyc
 .DS_Store
