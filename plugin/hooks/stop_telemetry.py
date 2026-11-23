@@ -36,10 +36,16 @@ def summarize_tail(transcript_path):
     unc_sum = 0
     cac_sum = 0
     out_sum = 0
+    max_single_unc = 0
+    model_flips = 0
+    gaps_30s = 0
+    compactions = 0
     spills = 0
     last_ctx = 0
     last_hit = None
     model = ""
+    prev_model = ""
+    prev_ts = None
 
     for line in chunk.splitlines():
         if not line.startswith("{"):
@@ -54,6 +60,7 @@ def summarize_tail(transcript_path):
             cac = int(o.get("cache_read_tokens") or 0)
             out = int(o.get("output_tokens") or 0)
             ctx = unc + cac
+            cur_m = str(o.get("model") or "")
             if ctx > 0:
                 turns += 1
                 unc_sum += unc
@@ -61,8 +68,25 @@ def summarize_tail(transcript_path):
                 out_sum += out
                 last_ctx = ctx
                 last_hit = round(100.0 * cac / ctx, 1)
-            if o.get("model"):
-                model = str(o["model"])
+                if unc > max_single_unc:
+                    max_single_unc = unc
+                if cur_m and prev_model and cur_m != prev_model:
+                    model_flips += 1
+                if cur_m:
+                    prev_model = cur_m
+                ts_s = o.get("created_at") or o.get("timestamp")
+                if ts_s:
+                    try:
+                        dt = datetime.fromisoformat(str(ts_s).replace("Z", "+00:00"))
+                        if prev_ts is not None and (dt - prev_ts).total_seconds() >= 30.0:
+                            gaps_30s += 1
+                        prev_ts = dt
+                    except Exception:
+                        pass
+            if cur_m:
+                model = cur_m
+        elif t == "CHECKPOINT":
+            compactions += 1
         elif t == "GENERIC":
             c = str(o.get("content") or "")
             if "output.txt" in c and "truncated" in c.lower():
@@ -78,6 +102,10 @@ def summarize_tail(transcript_path):
         "session_uncached": unc_sum,
         "session_cached": cac_sum,
         "session_out": out_sum,
+        "max_single_uncached": max_single_unc,
+        "model_flips": model_flips,
+        "gaps_30s": gaps_30s,
+        "compactions": compactions,
         "spills": spills,
     }
 

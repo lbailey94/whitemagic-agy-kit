@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WhiteMagic AGY Turbo Kit v3.1.0 — Idempotent Cross-Platform Installer (macOS + Linux)
+# WhiteMagic AGY Turbo Kit v4.1.0 — Idempotent Cross-Platform Installer (macOS + Linux)
 # Installs:
 #   1. Zero-dependency Rust binaries `wm-squeeze`, `wm-codegraph`, & Safe-Rust `muninn-engine` -> ~/.local/bin/
 #   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` & `tricameral_dispatch` MCPs; or `--sync-global`)
@@ -132,7 +132,7 @@ hp.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 print(f"Updated global {hp}")
 PY
 else
-    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.0.0 ==="
+    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.1.0 ==="
     # Build fused TS MCP & benchmark bundle if needed
     TURBO_MCP_DIR="${KIT_DIR}/tools/agy-turbo-mcp"
     NODE_BIN="$(command -v node || true)"
@@ -228,6 +228,26 @@ PY
     else
         echo "[warn] 'agy' CLI not found on PATH; plugin copied to $TARGET_PLUGIN"
     fi
+
+    # Step 2b: Deduplicate user skills that are already provided by whitemagic-agy-kit
+    USER_SKILLS_DIR="${HOME}/.gemini/config/skills"
+    if [ -d "$USER_SKILLS_DIR" ] && [ -d "${TARGET_PLUGIN}/skills" ]; then
+        DEDUP_BAK="${HOME}/.gemini/config/skills-dedup-backup-$(date +%Y%m%d_%H%M%S)"
+        MOVED_CNT=0
+        for pskill in "${TARGET_PLUGIN}/skills/"*; do
+            [ -d "$pskill" ] || continue
+            sname="$(basename "$pskill")"
+            if [ -e "${USER_SKILLS_DIR}/${sname}" ]; then
+                mkdir -p "$DEDUP_BAK"
+                mv "${USER_SKILLS_DIR}/${sname}" "${DEDUP_BAK}/${sname}"
+                MOVED_CNT=$((MOVED_CNT + 1))
+                echo "Deduplicated user skill '${sname}' -> ${DEDUP_BAK}/${sname}"
+            fi
+        done
+        if [ "$MOVED_CNT" -gt 0 ]; then
+            echo "Moved ${MOVED_CNT} duplicate user skill(s) outside ~/.gemini/config/skills/"
+        fi
+    fi
 fi
 
 echo "=== 3. Retiring standalone agy-fast (now fused into whitemagic-agy-kit v4.0.0) ==="
@@ -246,7 +266,7 @@ if [ "$KEEP_HEAVY_PLUGINS" -eq 0 ] && command -v agy >/dev/null 2>&1; then
 fi
 
 echo "=== 5. Installing portable CLI tools, model manifest & cache-warmth statusline ==="
-for tool in wm-sim agy-bench agy-mode wm-local-digest wm-dream wm-handoff wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-mcp wm-vps wm-triage; do
+for tool in wm-sim agy-bench agy-mode agy-token-audit wm-local-digest wm-dream wm-handoff wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-mcp wm-vps wm-triage; do
     if [ -f "${KIT_DIR}/bin/${tool}" ]; then
         install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
     fi
@@ -340,6 +360,7 @@ base_allow = [
     "mcp(grok/grok_dispatch)",
     "command(agy-bench)",
     "command(agy-mode)",
+    "command(agy-token-audit)",
     "command(agy --version)",
     "command(agy changelog)",
     "command(agy plugin list)",
@@ -353,9 +374,10 @@ base_allow = [
 perms = cur.get("permissions") or {}
 existing_allow = perms.get("allow") or []
 merged_allow = list(dict.fromkeys(existing_allow + [r for r in base_allow if r not in existing_allow]))
-existing_deny = perms.get("deny") or []
-if "write_file(.env)" not in existing_deny:
-    existing_deny.append("write_file(.env)")
+existing_deny = [d for d in (perms.get("deny") or []) if d != "write_file(.env)"]
+ssh_deny = f"write_file({Path.home() / '.ssh'})"
+if ssh_deny not in existing_deny:
+    existing_deny.append(ssh_deny)
 perms["allow"] = merged_allow
 perms["deny"] = existing_deny
 cur["permissions"] = perms

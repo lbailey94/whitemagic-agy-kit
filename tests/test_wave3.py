@@ -1201,6 +1201,139 @@ def test_remote_confinement_attestation():
                 os.environ[k] = v
 
 
+def test_v41_token_burn_shield():
+    print("\n8. v4.1.0 Token-Burn Shield (Wide-Span Clamp, Heredoc Squeeze, Telemetry, Skill Dedup):")
+    with tempfile.TemporaryDirectory() as td:
+        big = Path(td) / "big400.py"
+        big.write_text("\n".join(f"line_{i} = 'padding text here for line length test'" for i in range(420)), encoding="utf-8")
+        tr_hi = Path(td) / "tr_130k.jsonl"
+        tr_hi.write_text(json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 15000, "cache_read_tokens": 115000, "model": "gemini-4-hydrogen-xhigh"}) + "\n")
+        tr_lo = Path(td) / "tr_40k.jsonl"
+        tr_lo.write_text(json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 8000, "cache_read_tokens": 32000, "model": "gemini-4-hydrogen-xhigh"}) + "\n")
+
+        # Wide explicit span (1..800) at <120k -> clamped to EndLine=200
+        rc, out, _, _ = run_hook(
+            PRE_HOOK,
+            {"conversationId": "v41-wide-lo", "stepIdx": 1, "transcriptPath": str(tr_lo), "toolCall": {"name": "read_file", "args": {"Path": str(big), "StartLine": 1, "EndLine": 800}}},
+        )
+        d = json.loads(out)
+        check("wide span 1..800 (<120k) -> EndLine=200", rc == 0 and d.get("overwrite") == {"EndLine": 200})
+
+        # Wide explicit span (1..800) at >=120k -> clamped to EndLine=150
+        rc, out, _, _ = run_hook(
+            PRE_HOOK,
+            {"conversationId": "v41-wide-hi", "stepIdx": 1, "transcriptPath": str(tr_hi), "toolCall": {"name": "read_file", "args": {"Path": str(big), "StartLine": 1, "EndLine": 800}}},
+        )
+        d = json.loads(out)
+        check("wide span 1..800 (>=120k) -> EndLine=150", rc == 0 and d.get("overwrite") == {"EndLine": 150})
+
+        # Unbounded tail (StartLine=50, EndLine=None) -> clamped to EndLine=249
+        rc, out, _, _ = run_hook(
+            PRE_HOOK,
+            {"conversationId": "v41-tail", "stepIdx": 1, "transcriptPath": str(tr_lo), "toolCall": {"name": "read_file", "args": {"Path": str(big), "StartLine": 50}}},
+        )
+        d = json.loads(out)
+        check("unbounded tail StartLine=50 -> EndLine=249", rc == 0 and d.get("overwrite") == {"EndLine": 249})
+
+        # Normal 200-line slice untouched
+        rc, out, _, _ = run_hook(
+            PRE_HOOK,
+            {"conversationId": "v41-norm", "stepIdx": 1, "transcriptPath": str(tr_lo), "toolCall": {"name": "read_file", "args": {"Path": str(big), "StartLine": 1, "EndLine": 200}}},
+        )
+        d = json.loads(out)
+        check("normal 1..200 slice untouched", rc == 0 and "overwrite" not in d)
+
+        # git ... 2>/dev/null -> squeezed via wm-squeeze --safe
+        rc, out, _, _ = run_hook(
+            PRE_HOOK,
+            {"toolCall": {"name": "run_command", "args": {"CommandLine": f"git -C {td} status --short 2>/dev/null"}}},
+        )
+        d = json.loads(out)
+        check("git status 2>/dev/null -> wm-squeeze --safe", rc == 0 and "--safe" in (d.get("overwrite") or {}).get("CommandLine", ""))
+
+        # Multiline python3 heredoc -> rewritten with pipefail + wm-squeeze --pipe and executes cleanly
+        heredoc_cmd = "python3 - <<'PY'\nfor i in range(400):\n    print(f'row {i}: ' + 'x' * 50)\nPY"
+        rc, out, _, _ = run_hook(
+            PRE_HOOK,
+            {"toolCall": {"name": "run_command", "args": {"CommandLine": heredoc_cmd}}},
+        )
+        d = json.loads(out)
+        rewritten = (d.get("overwrite") or {}).get("CommandLine", "")
+        check("multiline python3 heredoc rewritten with pipefail + wm-squeeze", rc == 0 and "set -o pipefail;" in rewritten and "--pipe" in rewritten)
+        p_exec = subprocess.run(["bash", "-c", rewritten], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"})
+        check("rewritten heredoc caps stdout <=8.2KB & rc=0", p_exec.returncode == 0 and len(p_exec.stdout.encode("utf-8")) <= 8400 and "[wm-squeeze:" in p_exec.stdout)
+
+        # Failing heredoc preserves non-zero exit code via pipefail
+        fail_cmd = "python3 - <<'PY'\nimport sys; print('err'); sys.exit(3)\nPY"
+        _, out_f, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": fail_cmd}}})
+        rew_f = (json.loads(out_f).get("overwrite") or {}).get("CommandLine", "")
+        p_fail = subprocess.run(["bash", "-c", rew_f], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"})
+        check("rewritten failing heredoc preserves exit code 3", p_fail.returncode == 3)
+
+        # Enhanced stop_telemetry metrics (model_flips, max_single_uncached, gaps_30s, compactions)
+        tr_flip = Path(td) / "tr_flip.jsonl"
+        tr_flip.write_text(
+            "\n".join([
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 10000, "cache_read_tokens": 40000, "output_tokens": 200, "model": "gemini-4-neon-xhigh", "created_at": "2026-11-23T20:00:00Z"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 150000, "cache_read_tokens": 0, "output_tokens": 300, "model": "gemini-4-hydrogen-xhigh", "created_at": "2026-11-23T20:01:10Z"}),
+                json.dumps({"type": "CHECKPOINT", "content": "compaction"}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        telem_out = Path(td) / "telem.jsonl"
+        rc, out, _, _ = run_hook(
+            STOP_HOOK,
+            {"conversationId": "v41-stop", "transcriptPath": str(tr_flip), "terminationReason": "NO_TOOL_CALL", "cwd": td},
+            env_extra={"WM_AGY_TELEMETRY": str(telem_out)},
+        )
+        rec = json.loads(telem_out.read_text().splitlines()[-1])
+        check(
+            "stop_telemetry emits model_flips/max_single_uncached/gaps_30s/compactions",
+            rc == 0 and rec.get("model_flips") == 1 and rec.get("max_single_uncached") == 150000 and rec.get("gaps_30s") == 1 and rec.get("compactions") == 1,
+        )
+
+        # post_tool_sim spill capture
+        spill_telem = Path(td) / "spill_telem.jsonl"
+        rc, out, _, _ = run_hook(
+            POST_HOOK,
+            {"conversationId": "v41-spill", "toolCall": {"name": "run_command", "args": {"CommandLine": "cat big"}}, "result": "A" * 18000},
+            env_extra={"WM_AGY_TELEMETRY": str(spill_telem)},
+        )
+        srec = json.loads(spill_telem.read_text().splitlines()[-1])
+        check("post_tool_sim logs tool_spill >16KB", rc == 0 and srec.get("event") == "tool_spill" and srec.get("bytes") == 18000)
+
+    # agy-token-audit --recent 3 --json
+    p_audit = subprocess.run([str(LOCAL_BIN / "agy-token-audit"), "--recent", "3", "--json"], capture_output=True, text=True)
+    ok_audit = False
+    if p_audit.returncode == 0:
+        try:
+            aj = json.loads(p_audit.stdout)
+            ok_audit = "aggregate" in aj and "sessions" in aj and len(aj["sessions"]) >= 1
+        except Exception:
+            pass
+    check("agy-token-audit --recent 3 --json succeeds", ok_audit)
+
+    # Zero duplicate skill names between ~/.gemini/config/skills/ and plugin/skills/
+    user_sk = Path.home() / ".gemini" / "config" / "skills"
+    plug_sk = Path.home() / ".gemini" / "config" / "plugins" / "whitemagic-agy-kit" / "skills"
+    dups = set()
+    if user_sk.is_dir() and plug_sk.is_dir():
+        u_names = {p.name for p in user_sk.iterdir() if p.is_dir()}
+        p_names = {p.name for p in plug_sk.iterdir() if p.is_dir()}
+        dups = u_names & p_names
+    check("zero duplicate skills between ~/.gemini/config/skills and plugin", len(dups) == 0, f"dups={sorted(dups)}")
+
+    # Env-Write Guard replaces relative write_file(.env) sandbox rule portably
+    rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "write_file", "args": {"Path": "/tmp/demo/.env", "Content": "SECRET=1"}}})
+    check("write_file(.env) -> force_ask Env-Write Guard", rc == 0 and json.loads(out).get("decision") == "force_ask")
+    rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "mcp_whitemagic-agy-kit_fast_apply_edits", "args": {"edits": [{"path": ".env.local", "hunks": []}]}}})
+    check("apply_edits(.env.local) -> force_ask Env-Write Guard", rc == 0 and json.loads(out).get("decision") == "force_ask")
+    rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "write_file", "args": {"Path": "/tmp/demo/.env.example", "Content": "KEY="}}})
+    check("write_file(.env.example) -> allow", rc == 0 and json.loads(out).get("decision") == "allow")
+    inst_txt = (KIT / "install.sh").read_text(encoding="utf-8")
+    check("install.sh no longer appends invalid write_file(.env)", 'existing_deny.append("write_file(.env)")' not in inst_txt)
+
+
 def main():
     test_wm_squeeze()
     test_pre_tool_hook()
@@ -1210,7 +1343,8 @@ def main():
     test_bwrap_confinement()
     test_signed_confinement_receipts()
     test_remote_confinement_attestation()
-    print(f"\n=== Wave 3/4/v4.0 Test Summary: {PASS} passed, {FAIL} failed ===")
+    test_v41_token_burn_shield()
+    print(f"\n=== Wave 3/4/v4.1 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

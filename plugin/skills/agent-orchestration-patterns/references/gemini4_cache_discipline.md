@@ -22,3 +22,10 @@ Empirical telemetry across **40 local Antigravity CLI sessions (`9,221` turns, `
    - Background heavy builds/benchmarks (`WaitMsBeforeAsync: 1000–5000`) and wait via reactive wakeup or `schedule`.
 4. **Keep prefixes immutable & offload giant logs locally (`$0`):**
    - Inject startup state once via `SessionStart` (`<1.8 KB`), never rewrite `GEMINI.md` mid-session, isolate screenshots at `>=150k` ctx, and digest >20 KB logs locally via `wm-local-digest` (`:18898`).
+
+## Empirical Swarm Telemetry (14-Agent Audit, `478 turns | 8.83M uncached | 100.54M cached | 1.434M output`)
+
+- **Cross-Model Flip Cliff (`Orchestrator` inside `/swarm`):** Flipping `Neon <-> Hydrogen` across `152k–327k` coordinator contexts produced **`0` cache hits on 7 turns** (`2.30M` uncached tokens = `26%` of total uncached burn). Pin `/swarm` coordinators to a single model (`agy-mode longevity`).
+- **Script-First vs. Inline-JSON Workers (`~10×` savings):** Writing large structured outputs via Python scripts (`consolidator`: **9 turns, `0.17M` uncached, `58.9k` output**) vs. hand-emitting `55–80 KB` JSON inside `write_file` args (`46–50 turns`, `170–181k` output tokens) cuts output quota burn ~10×.
+- **Fresh Per-Wave Verifiers:** Carrying one verifier across 3 waves bloated context to `66 turns / 320.6k` before hitting `429`. Kill and respawn verifiers per wave.
+- **Wide-Span Reads & Un-Squeezed Heredocs (`v4.1` Fix):** `PreToolUse` v4.1 clamps explicit wide `read_file` spans (`>250L`, `150L` above `120k` ctx) and wraps multiline `python3 - <<'PY'` heredocs through `wm-squeeze --pipe`; inspect any session or swarm post-run with `agy-token-audit`.

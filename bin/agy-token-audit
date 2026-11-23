@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""
+agy-token-audit — Forensic token, prefix-cache & tool-burn auditor for Antigravity CLI sessions and swarms.
+Zero-PII safe by default on --report-md exports.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+BRAIN_DIR = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def sanitize_report(text: str) -> str:
+    home_str = str(Path.home())
+    text = text.replace(home_str, "~")
+    user = os.environ.get("USER") or Path.home().name
+    if user:
+        text = text.replace(f"/Users/{user}", "~").replace(f"/home/{user}", "~").replace(f"/media/{user}", "/media/<USER>")
+    text = EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+    return text
+
+
+def discover_swarm_workers(coord_id: str) -> list[tuple[str, str]]:
+    """Auto-discover swarm worker conversation_ids and names from coordinator transcript."""
+    tf = BRAIN_DIR / coord_id / ".system_generated" / "logs" / "transcript.jsonl"
+    found: list[tuple[str, str]] = [("coordinator", coord_id)]
+    seen = {coord_id}
+    if not tf.is_file():
+        return found
+
+    pending_names: list[str] = []
+    for line in tf.read_text(errors="replace").splitlines():
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        t = o.get("type")
+        if t == "PLANNER_RESPONSE":
+            for tc in o.get("tool_calls") or []:
+                if (tc.get("name") or "") == "swarm":
+                    args = tc.get("args") or tc.get("arguments") or {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    if isinstance(args, dict) and args.get("action") == "add" and args.get("name"):
+                        pending_names.append(str(args["name"]))
+        elif t == "GENERIC":
+            c = str(o.get("content") or "")
+            if '"conversation_id"' in c or "conversation_id" in c:
+                # Extract pairs of ("name":"..." ... "conversation_id":"...") or raw UUIDs
+                for m in re.finditer(r'"name"\s*:\s*"([^"]+)"[^}]*?"conversation_id"\s*:\s*"([0-9a-f-]{36})"', c):
+                    wname, wcid = m.group(1), m.group(2)
+                    if wcid not in seen:
+                        seen.add(wcid)
+                        found.append((wname, wcid))
+                # Reverse order in JSON if conversation_id came before name
+                for m in re.finditer(r'"conversation_id"\s*:\s*"([0-9a-f-]{36})"[^}]*?"name"\s*:\s*"([^"]+)"', c):
+                    wcid, wname = m.group(1), m.group(2)
+                    if wcid not in seen:
+                        seen.add(wcid)
+                        found.append((wname, wcid))
+                # Fallback if swarm output had only conversation_id
+                if '"status":"added"' in c.replace(" ", ""):
+                    for uid in UUID_RE.findall(c):
+                        if uid not in seen:
+                            seen.add(uid)
+                            lbl = pending_names.pop(0) if pending_names else f"worker-{uid[:8]}"
+                            found.append((lbl, uid))
+    return found
+
+
+def audit_transcript(label: str, conv_id: str) -> dict[str, Any]:
+    tf = BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+    if not tf.is_file():
+        return {"label": label, "conv_id": conv_id, "missing": True}
+
+    turns = 0
+    unc_sum = cac_sum = out_sum = 0
+    t0_unc = 0
+    max_unc = 0
+    flips = 0
+    flip_unc = 0
+    gaps30 = 0
+    gap_unc = 0
+    compactions = 0
+    hook_hits = 0
+    spills = 0
+    think_chars = 0
+    models: Counter[str] = Counter()
+    tools: Counter[str] = Counter()
+    prev_model = ""
+    prev_ts: datetime | None = None
+
+    for line in tf.read_text(errors="replace").splitlines():
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        t = o.get("type")
+        if t == "PLANNER_RESPONSE":
+            u = int(o.get("input_tokens") or 0)
+            c = int(o.get("cache_read_tokens") or 0)
+            ot = int(o.get("output_tokens") or 0)
+            m = str(o.get("model") or "")
+            th = o.get("thinking") or ""
+            think_chars += len(str(th))
+            for tc in o.get("tool_calls") or []:
+                tn = str(tc.get("name") or tc.get("tool") or "unknown")
+                tools[tn] += 1
+            if u + c + ot > 0:
+                turns += 1
+                if turns == 1:
+                    t0_unc = u
+                unc_sum += u
+                cac_sum += c
+                out_sum += ot
+                if u > max_unc:
+                    max_unc = u
+                if m:
+                    models[m] += 1
+                flipped = bool(m and prev_model and m != prev_model)
+                if flipped:
+                    flips += 1
+                    flip_unc += u
+                if m:
+                    prev_model = m
+                ts_s = o.get("created_at") or o.get("timestamp")
+                if ts_s:
+                    try:
+                        dt = datetime.fromisoformat(str(ts_s).replace("Z", "+00:00"))
+                        if prev_ts is not None and (dt - prev_ts).total_seconds() >= 30.0:
+                            gaps30 += 1
+                            if not flipped:
+                                gap_unc += u
+                        prev_ts = dt
+                    except Exception:
+                        pass
+        elif t == "CHECKPOINT":
+            compactions += 1
+        elif t == "GENERIC":
+            c = str(o.get("content") or "")
+            low = c.lower()
+            if "pre-tool hook" in low or "wm-squeeze" in low:
+                hook_hits += 1
+            if "output.txt" in c and "truncated" in low:
+                spills += 1
+
+    hit_pct = round(100.0 * cac_sum / max(unc_sum + cac_sum, 1), 1)
+    return {
+        "label": label,
+        "conv_id": conv_id,
+        "missing": False,
+        "turns": turns,
+        "hit_pct": hit_pct,
+        "t0_unc": t0_unc,
+        "tot_unc": unc_sum,
+        "tot_cac": cac_sum,
+        "tot_out": out_sum,
+        "max_unc": max_unc,
+        "flips": flips,
+        "flip_unc": flip_unc,
+        "gaps30": gaps30,
+        "gap_unc": gap_unc,
+        "compactions": compactions,
+        "hook_hits": hook_hits,
+        "spills": spills,
+        "thinking_tok_est": think_chars // 4,
+        "models": dict(models),
+        "tools": dict(tools),
+    }
+
+
+def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    active = [r for r in rows if not r.get("missing")]
+    tot_tools: Counter[str] = Counter()
+    tot_models: Counter[str] = Counter()
+    for r in active:
+        tot_tools.update(r["tools"])
+        tot_models.update(r["models"])
+    tot_unc = sum(r["tot_unc"] for r in active)
+    tot_cac = sum(r["tot_cac"] for r in active)
+    tot_out = sum(r["tot_out"] for r in active)
+    tot_trn = sum(r["turns"] for r in active)
+    return {
+        "sessions_audited": len(active),
+        "turns": tot_trn,
+        "hit_pct": round(100.0 * tot_cac / max(tot_unc + tot_cac, 1), 1),
+        "tot_unc": tot_unc,
+        "tot_cac": tot_cac,
+        "tot_out": tot_out,
+        "max_unc": max((r["max_unc"] for r in active), default=0),
+        "flips": sum(r["flips"] for r in active),
+        "flip_unc": sum(r["flip_unc"] for r in active),
+        "gaps30": sum(r["gaps30"] for r in active),
+        "gap_unc": sum(r["gap_unc"] for r in active),
+        "compactions": sum(r["compactions"] for r in active),
+        "hook_hits": sum(r["hook_hits"] for r in active),
+        "spills": sum(r["spills"] for r in active),
+        "thinking_tok_est": sum(r["thinking_tok_est"] for r in active),
+        "top_tools": tot_tools.most_common(15),
+        "models": dict(tot_models),
+    }
+
+
+def format_table(rows: list[dict[str, Any]], agg: dict[str, Any]) -> str:
+    lines = [
+        f"=== AGY Token & Cache Forensics ({agg['sessions_audited']} sessions | {agg['turns']} turns | {agg['hit_pct']}% hit) ===",
+        f"{'SESSION':18s} | {'TRN':>3s} | {'HIT%':>5s} | {'T0_UNC':>7s} | {'TOT_UNC':>8s} | {'TOT_CAC':>8s} | {'TOT_OUT':>7s} | {'MAX_UNC':>7s} | {'FLP':>3s} | {'G30':>3s} | {'CMP':>3s} | {'HK':>2s}",
+        "-" * 105,
+    ]
+    for r in rows:
+        if r.get("missing"):
+            lines.append(f"{r['label'][:18]:18s} | MISSING")
+            continue
+        lines.append(
+            f"{r['label'][:18]:18s} | {r['turns']:3d} | {r['hit_pct']:4.1f}% | {r['t0_unc']/1000:6.1f}k | "
+            f"{r['tot_unc']/1e6:7.2f}M | {r['tot_cac']/1e6:7.2f}M | {r['tot_out']/1000:6.1f}k | "
+            f"{r['max_unc']/1000:6.1f}k | {r['flips']:3d} | {r['gaps30']:3d} | {r['compactions']:3d} | {r['hook_hits']:2d}"
+        )
+    lines.append("-" * 105)
+    lines.append(
+        f"{'TOTAL':18s} | {agg['turns']:3d} | {agg['hit_pct']:4.1f}% | {'':>7s} | "
+        f"{agg['tot_unc']/1e6:7.2f}M | {agg['tot_cac']/1e6:7.2f}M | {agg['tot_out']/1000:6.1f}k | "
+        f"{agg['max_unc']/1000:6.1f}k | {agg['flips']:3d} | {agg['gaps30']:3d} | {agg['compactions']:3d} | {agg['hook_hits']:2d}"
+    )
+    lines.append("")
+    lines.append(
+        f"Burn Attribution: cross-model flips={agg['flips']} ({agg['flip_unc']/1e6:.2f}M unc) | "
+        f">=30s idle gaps={agg['gaps30']} ({agg['gap_unc']/1e6:.2f}M unc) | "
+        f"compactions={agg['compactions']} | thinking_est={agg['thinking_tok_est']/1000:.1f}k tok | spills={agg['spills']}"
+    )
+    if agg["top_tools"]:
+        lines.append("Top Tools: " + ", ".join(f"{k}={v}" for k, v in agg["top_tools"][:10]))
+    return "\n".join(lines)
+
+
+def build_markdown_report(rows: list[dict[str, Any]], agg: dict[str, Any], target_label: str) -> str:
+    md = [
+        f"# Antigravity CLI Token & Prefix-Cache Telemetry Report ({target_label})",
+        "",
+        f"- **Sessions Audited:** `{agg['sessions_audited']}`",
+        f"- **Total Turns:** `{agg['turns']}`",
+        f"- **Aggregate Prefix Cache Hit Rate:** `{agg['hit_pct']}%` (`{agg['tot_cac']/1e6:.2f}M` cached vs `{agg['tot_unc']/1e6:.2f}M` uncached input)",
+        f"- **Total Output Tokens:** `{agg['tot_out']/1000:.1f}k` (`~{agg['thinking_tok_est']/1000:.1f}k` estimated thinking tokens)",
+        f"- **Cross-Model Flips:** `{agg['flips']}` (`{agg['flip_unc']/1e6:.2f}M` uncached input tokens on flip turns)",
+        f"- **>=30s Inter-Turn Gaps:** `{agg['gaps30']}` (`{agg['gap_unc']/1e6:.2f}M` non-flip uncached input tokens)",
+        f"- **Auto-Compactions (`CHECKPOINT`):** `{agg['compactions']}` | **Spills:** `{agg['spills']}` | **PreToolUse Squeeze/Hook Hits:** `{agg['hook_hits']}`",
+        "",
+        "## Per-Session Breakdown",
+        "",
+        "| Session | Turns | Cache Hit | Turn-0 Unc | Uncached In | Cached In | Output Tok | Max Single Unc | Flips | >=30s Gaps | Compactions |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for r in rows:
+        if r.get("missing"):
+            continue
+        md.append(
+            f"| `{r['label'][:22]}` | {r['turns']} | {r['hit_pct']}% | {r['t0_unc']/1000:.1f}k | "
+            f"{r['tot_unc']/1e6:.2f}M | {r['tot_cac']/1e6:.2f}M | {r['tot_out']/1000:.1f}k | "
+            f"{r['max_unc']/1000:.1f}k | {r['flips']} | {r['gaps30']} | {r['compactions']} |"
+        )
+    md.extend(
+        [
+            "",
+            "## Tool Call Distribution",
+            "",
+            "| Tool | Calls |",
+            "| :--- | ---: |",
+        ]
+    )
+    for tn, cnt in agg["top_tools"]:
+        md.append(f"| `{tn}` | {cnt} |")
+    md.extend(
+        [
+            "",
+            "## Empirical Takeaways & Mitigations Implemented (`whitemagic-agy-kit v4.1.0`)",
+            "",
+            "1. **Orchestrator Model-Flip Cache Eviction:** Alternating between models (`Neon <-> Hydrogen`) on large contexts (`150k-327k`) dropped prefix cache hits to `0%` on flip turns. Mitigation: pin `/swarm` coordinators to a single model (`agy-mode longevity`).",
+            "2. **Wide-Span `read_file` Context Bloat:** Explicit `StartLine=1, EndLine=800` slices bypassed unbounded-only read guards and triggered compaction spikes (`384k` uncached). Mitigation: clamp any span >250 lines (`150L` above `120k` ctx, `120L` on burst reads).",
+            "3. **Un-Squeezed Multiline Python Heredocs:** Multiline `python3 - <<'PY'` commands bypassed `wm-squeeze --safe`. Mitigation: `PreToolUse` v4.1 wraps standalone inline Python heredocs via `set -o pipefail; python3 - <<'TAG' 2>&1 | wm-squeeze --pipe --kind generic`.",
+            "4. **Script-First Workers vs. Large `write_file` Payloads:** Writing large structured files via Python scripts cut turns ~5x and output tokens ~3x (`9 turns / 0.17M unc / 58.9k out`) compared to inline JSON emission (`46-50 turns / 170-181k out`).",
+            "5. **Skill Deduplication:** Removed overlapping user-level copies of plugin-bundled skills to trim Turn-0 uncached system prompt overhead.",
+            "",
+        ]
+    )
+    return sanitize_report("\n".join(md))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Forensic token & prefix-cache audit for Antigravity CLI sessions and swarms.")
+    ap.add_argument("--recent", type=int, default=15, help="Audit N most recent sessions (default 15)")
+    ap.add_argument("--conv", type=str, help="Audit a single conversation ID (auto-discovers spawned swarm workers if present)")
+    ap.add_argument("--swarm", type=str, help="Audit a swarm coordinator ID and all its spawned workers")
+    ap.add_argument("--json", action="store_true", help="Print JSON output")
+    ap.add_argument("--report-md", type=str, help="Write Zero-PII Markdown telemetry report to path")
+    args = ap.parse_args()
+
+    targets: list[tuple[str, str]] = []
+    target_label = f"recent-{args.recent}"
+    if args.swarm:
+        targets = discover_swarm_workers(args.swarm)
+        target_label = f"swarm-{args.swarm[:8]}"
+    elif args.conv:
+        targets = discover_swarm_workers(args.conv)
+        target_label = f"conv-{args.conv[:8]}"
+    else:
+        logs = sorted(
+            BRAIN_DIR.glob("*/.system_generated/logs/transcript.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[: max(1, args.recent)]
+        for lp in logs:
+            cid = lp.parents[2].name
+            targets.append((cid[:14], cid))
+
+    rows = [audit_transcript(lbl, cid) for lbl, cid in targets]
+    agg = aggregate(rows)
+
+    if args.report_md:
+        rp = Path(args.report_md)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(build_markdown_report(rows, agg, target_label), encoding="utf-8")
+
+    if args.json:
+        print(json.dumps({"target": target_label, "aggregate": agg, "sessions": rows}, indent=2))
+    else:
+        print(format_table(rows, agg))
+        if args.report_md:
+            print(f"\nWrote Zero-PII Markdown report -> {args.report_md}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

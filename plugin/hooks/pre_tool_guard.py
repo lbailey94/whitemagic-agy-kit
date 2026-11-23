@@ -240,8 +240,29 @@ def maybe_squeeze_command(cmd_line):
     s = (cmd_line or "").strip()
     if not s or "wm-squeeze" in s:
         return None
-    # Strip harmless trailing 2>&1 (wm-squeeze already merges stdout + stderr)
-    s = re.sub(r"\s+2>&1\s*$", "", s).strip()
+
+    # Safe inline Python heredoc output cap (`python3 - <<'PY' ...`)
+    if "\n" in s and os.environ.get("WM_SQUEEZE_HEREDOC_OFF") != "1":
+        lines = s.splitlines()
+        first = lines[0].strip()
+        m = re.match(
+            r"^(python3?(?:\s+-u)?)\s+-\s+<<(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2(?:\s+2>&1)?\s*$",
+            first,
+        )
+        if m and not any(ch in first for ch in ("|", ";", "&", "$", "`")):
+            tag = m.group(3)
+            last_non_empty = next((ln.strip() for ln in reversed(lines[1:]) if ln.strip()), "")
+            if last_non_empty == tag:
+                sq_bin = find_wm_squeeze()
+                if sq_bin:
+                    clean_first = re.sub(r"\s+2>&1\s*$", "", first).strip()
+                    new_first = (
+                        f"set -o pipefail; {clean_first} 2>&1 | {shlex.quote(sq_bin)} --pipe --kind generic"
+                    )
+                    return "\n".join([new_first] + lines[1:])
+
+    # Strip harmless trailing 2>&1 / 2>/dev/null (wm-squeeze captures stdout + stderr)
+    s = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
     if not s:
         return None
 
@@ -355,6 +376,35 @@ def check_and_record_read_dedup(conv_id, abs_path, start_line, end_line, step_id
     return None
 
 
+def track_and_check_burst(conv_id, abs_path, step_idx):
+    """Return True when >=4 distinct large files (>200 lines) were read within 10 steps."""
+    if not conv_id or step_idx <= 0:
+        return False
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        bf = STATE_DIR / f"burst_{re.sub(r'[^a-zA-Z0-9_-]', '', conv_id)[:20]}.json"
+        entries = []
+        if bf.is_file():
+            try:
+                raw = json.loads(bf.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    entries = raw
+            except Exception:
+                entries = []
+        kept = [
+            e for e in entries
+            if isinstance(e, list) and len(e) == 2 and isinstance(e[1], int)
+            and 0 <= (step_idx - e[1]) <= 10
+        ]
+        distinct_paths = {e[0] for e in kept}
+        burst_triggered = len(distinct_paths) >= 4
+        kept.append([abs_path, step_idx])
+        bf.write_text(json.dumps(kept[-32:]), encoding="utf-8")
+        return burst_triggered
+    except Exception:
+        return False
+
+
 def handle_read_file(args, payload):
     raw_path = args.get("Path") or args.get("path") or ""
     if not raw_path:
@@ -395,17 +445,37 @@ def handle_read_file(args, payload):
     e_line = args.get("EndLine")
     b_off = args.get("ByteOffset")
     overwrite = {}
-
-    # C2: Auto-clamp unbounded large text file reads (>250 lines)
-    if s_line is None and e_line is None and b_off is None and os.environ.get("WM_READ_CLAMP_OFF") != "1":
-        if file_exceeds_lines(p, threshold=250):
-            s_line = 1
-            e_line = 200
-            overwrite = {"StartLine": 1, "EndLine": 200}
-
-    # C3: Exact unchanged duplicate-slice dedup
     conv_id = str(payload.get("conversationId") or "")
     step_idx = int(payload.get("stepIdx") or 0)
+
+    # C2: Auto-clamp unbounded, unbounded-tail, or wide-span (>250L / >200L@120k) reads
+    if b_off is None and os.environ.get("WM_READ_CLAMP_OFF") != "1":
+        cur_ctx = latest_ctx_tokens(transcript)
+        max_span = 150 if cur_ctx >= 120_000 else 200
+        clamp_trigger = 200 if cur_ctx >= 120_000 else 250
+        is_large_file = file_exceeds_lines(p, threshold=clamp_trigger)
+        if is_large_file and conv_id and step_idx > 0:
+            if track_and_check_burst(conv_id, abs_p, step_idx):
+                max_span = min(max_span, 120)
+
+        if s_line is None and e_line is None:
+            if is_large_file:
+                s_line = 1
+                e_line = max_span
+                overwrite = {"StartLine": 1, "EndLine": max_span}
+        elif s_line is not None and e_line is None:
+            if is_large_file:
+                s_int = int(s_line)
+                e_line = s_int + max_span - 1
+                overwrite = {"EndLine": e_line}
+        elif s_line is not None and e_line is not None:
+            s_int = int(s_line)
+            e_int = int(e_line)
+            if (e_int - s_int + 1) > clamp_trigger:
+                e_line = s_int + max_span - 1
+                overwrite = {"EndLine": e_line}
+
+    # C3: Exact unchanged duplicate-slice dedup
     if conv_id and step_idx > 0:
         cur_ctx = cur_ctx or latest_ctx_tokens(transcript)
         dedup_reason = check_and_record_read_dedup(
@@ -486,6 +556,41 @@ def handle_manage_task(args, payload):
     return {"decision": "allow"}
 
 
+ENV_SECRET_BASENAME_RE = re.compile(r"^\.env(?:\.([A-Za-z0-9_.-]+))?$", re.IGNORECASE)
+SAFE_ENV_SUFFIXES = {"example", "sample", "template", "dist", "schema"}
+
+
+def check_env_write_guard(tool_name, args):
+    """Require explicit confirmation when writing/editing .env secret files (portable replacement for relative deny rules)."""
+    paths = []
+    if tool_name in ("write_file", "edit_file"):
+        p = args.get("Path") or args.get("path") or ""
+        if p:
+            paths.append(str(p))
+    elif tool_name.endswith("_apply_edits"):
+        edits = args.get("edits")
+        if isinstance(edits, str):
+            try:
+                edits = json.loads(edits)
+            except Exception:
+                edits = []
+        if isinstance(edits, list):
+            for item in edits:
+                if isinstance(item, dict) and item.get("path"):
+                    paths.append(str(item["path"]))
+    for raw_p in paths:
+        base = os.path.basename(raw_p.strip())
+        m = ENV_SECRET_BASENAME_RE.match(base)
+        if m and (m.group(1) or "").lower() not in SAFE_ENV_SUFFIXES:
+            return {
+                "decision": "force_ask",
+                "reason": (
+                    f"[Env-Write Guard] Modifying secrets file `{base}` requires explicit user confirmation."
+                ),
+            }
+    return None
+
+
 def main():
     if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
         emit({"decision": "allow"})
@@ -509,6 +614,10 @@ def main():
         return
 
     # 1. Data-loss guard + Huginn-1 Kekkai neural firewall for shell/check/edit tools
+    env_guard = check_env_write_guard(tool_name, args)
+    if env_guard:
+        emit(env_guard)
+        return
     for cmd in extract_commands(args):
         for pattern, reason in DESTRUCTIVE_PATTERNS:
             if re.search(pattern, cmd, flags=re.IGNORECASE):
