@@ -21,6 +21,9 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -176,7 +179,7 @@ def _build_confinement_receipt(
 
 
 def canonical_receipt_bytes(receipt: dict) -> bytes:
-    payload = {k: v for k, v in receipt.items() if k != "signature_b64"}
+    payload = {k: v for k, v in receipt.items() if k not in ("signature_b64", "remote_attestation")}
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
@@ -485,6 +488,248 @@ def append_receipt_ledger(receipt: dict, ledger_path: str | Path | None = None) 
     return p
 
 
+def _extract_ed25519_public_pem(ed25519_public_key=None) -> str | None:
+    from cryptography.hazmat.primitives import serialization
+
+    if isinstance(ed25519_public_key, str) and "-----BEGIN PUBLIC KEY-----" in ed25519_public_key:
+        return ed25519_public_key
+    pub = _load_ed25519_public_key(ed25519_public_key)
+    return pub.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+
+
+def _sign_rfc9421_hmac_headers(
+    method: str,
+    path: str,
+    authority: str,
+    key_file: str | Path | None = None,
+    key_id: str | None = None,
+) -> dict[str, str]:
+    raw_kf = str(key_file).strip() if key_file is not None else os.environ.get("WM_TRUSTED_AGENT_KEY_FILE", "").strip()
+    kf_path = Path(raw_kf).expanduser() if raw_kf else (Path.home() / ".config" / "whitemagic" / "trusted_agent_key.json")
+    if not kf_path.is_file():
+        return {}
+    try:
+        data = json.loads(kf_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    target_kid = (key_id if key_id is not None else os.environ.get("WM_TRUSTED_AGENT_KEY_ID", "")).strip()
+    selected_kid: str | None = None
+    selected_entry: dict | None = None
+    if target_kid:
+        cand = data.get(target_kid)
+        if isinstance(cand, dict) and cand.get("enabled") is not False and str(cand.get("alg") or "").strip().lower() == "hmac-sha256":
+            selected_kid = target_kid
+            selected_entry = cand
+    else:
+        for kid, cand in data.items():
+            if isinstance(cand, dict) and cand.get("enabled") is not False and str(cand.get("alg") or "").strip().lower() == "hmac-sha256":
+                selected_kid = str(kid)
+                selected_entry = cand
+                break
+
+    if not selected_kid or selected_entry is None:
+        return {}
+
+    raw_secret = selected_entry.get("secret")
+    if not isinstance(raw_secret, str) or not raw_secret:
+        return {}
+    try:
+        if raw_secret.startswith("b64:"):
+            secret_bytes = base64.b64decode(raw_secret[4:].strip(), validate=True)
+        else:
+            secret_bytes = _parse_hmac_secret(raw_secret)
+    except Exception:
+        return {}
+    if not secret_bytes:
+        return {}
+
+    pure_path = urllib.parse.urlsplit(str(path or "/")).path or "/"
+    norm_method = str(method or "POST").strip().upper()
+    norm_auth = str(authority or "").strip()
+    if not norm_auth:
+        return {}
+
+    created = int(time.time())
+    sig_params = f'("@method" "@path" "@authority");created={created};keyid="{selected_kid}";alg="hmac-sha256"'
+    sig_base = (
+        f'"@method": {norm_method}\n'
+        f'"@path": {pure_path}\n'
+        f'"@authority": {norm_auth}\n'
+        f'"@signature-params": {sig_params}'
+    ).encode("utf-8")
+    sig_b64 = base64.b64encode(hmac.new(secret_bytes, sig_base, hashlib.sha256).digest()).decode("ascii")
+    return {
+        "Signature-Input": f"sig1={sig_params}",
+        "Signature": f"sig1=:{sig_b64}:",
+    }
+
+
+def _attest_error_result(
+    url: str,
+    error: str,
+    *,
+    http_status: int | None = None,
+    agent_verified: str | None = None,
+    verdict: str | None = None,
+    signature_verified: bool = False,
+    verification_receipt: dict | None = None,
+) -> dict:
+    return {
+        "ok": False,
+        "url": url,
+        "http_status": http_status,
+        "valid": False,
+        "verdict": verdict,
+        "signature_verified": signature_verified,
+        "agent_verified": agent_verified,
+        "verification_receipt": verification_receipt,
+        "error": error,
+    }
+
+
+def attest_confinement_receipt(
+    receipt: dict,
+    *,
+    attest_url: str | None = None,
+    hmac_key: str | bytes | None = None,
+    public_key_pem: str | None = None,
+    timeout_sec: int = 15,
+    key_file: str | Path | None = None,
+    api_key: str | None = None,
+) -> dict:
+    url = str(
+        attest_url
+        or os.environ.get("WM_CONFINEMENT_ATTEST_URL")
+        or "https://api.whitemagic.dev/verify-confinement?receipt=1"
+    ).strip()
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return _attest_error_result(url, f"invalid attestation URL (require http/https with host): {url!r}")
+    if not isinstance(receipt, dict):
+        return _attest_error_result(url, "receipt must be a JSON object")
+
+    receipt_wire = {k: v for k, v in receipt.items() if k != "remote_attestation"}
+    body: dict = {"receipt": receipt_wire}
+    sig_alg = receipt_wire.get("signature_alg")
+    if hmac_key is not None:
+        if isinstance(hmac_key, (bytes, bytearray)):
+            body["hmac_key"] = "hex:" + bytes(hmac_key).hex()
+        else:
+            body["hmac_key"] = str(hmac_key)
+    elif sig_alg == "hmac-sha256":
+        try:
+            env_key = _load_hmac_key_from_env()
+        except (ValueError, OSError) as exc:
+            return _attest_error_result(url, f"failed to load HMAC key for remote attestation: {exc}")
+        if env_key is not None:
+            body["hmac_key"] = "hex:" + env_key.hex()
+    elif sig_alg == "ed25519" and public_key_pem:
+        body["public_key_pem"] = public_key_pem
+    elif not sig_alg:
+        body["require_signature"] = False
+
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-WM-Trial": "1",
+    }
+    headers.update(
+        _sign_rfc9421_hmac_headers(
+            "POST",
+            parsed.path or "/",
+            parsed.netloc,
+            key_file=key_file,
+        )
+    )
+    eff_api_key = (api_key if api_key is not None else os.environ.get("WM_API_KEY", "")).strip()
+    if eff_api_key:
+        headers["Authorization"] = f"Bearer {eff_api_key}"
+        headers["X-WM-Key"] = eff_api_key
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    http_status: int | None = None
+    agent_verified: str | None = None
+    try:
+        with urllib.request.urlopen(req, timeout=max(1, int(timeout_sec))) as resp:
+            http_status = int(getattr(resp, "status", None) or resp.getcode())
+            agent_verified = resp.headers.get("X-WM-Agent-Verified")
+            raw_resp = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        http_status = int(getattr(exc, "code", 0) or 0) or None
+        if exc.headers is not None:
+            agent_verified = exc.headers.get("X-WM-Agent-Verified")
+        return _attest_error_result(
+            url,
+            f"remote attestation HTTP {http_status}: {exc.reason}",
+            http_status=http_status,
+            agent_verified=agent_verified,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return _attest_error_result(url, f"remote attestation request failed: {exc}")
+
+    try:
+        resp_data = json.loads(raw_resp)
+    except Exception as exc:
+        return _attest_error_result(
+            url,
+            f"malformed JSON from remote attestation endpoint: {exc}",
+            http_status=http_status,
+            agent_verified=agent_verified,
+        )
+    if not isinstance(resp_data, dict):
+        return _attest_error_result(
+            url,
+            "remote attestation response must be a JSON object",
+            http_status=http_status,
+            agent_verified=agent_verified,
+        )
+
+    valid = resp_data.get("valid") is True
+    verdict = resp_data.get("verdict") if isinstance(resp_data.get("verdict"), str) else None
+    signature_verified = resp_data.get("signature_verified") is True
+    v_rcpt = resp_data.get("verification_receipt") if isinstance(resp_data.get("verification_receipt"), dict) else None
+    if not valid:
+        errs = resp_data.get("errors")
+        if isinstance(errs, list) and errs:
+            err_msg = "; ".join(str(e) for e in errs)
+        elif resp_data.get("error"):
+            err_msg = str(resp_data.get("error"))
+        else:
+            err_msg = f"remote attestation rejected (valid={resp_data.get('valid')!r}, verdict={verdict!r})"
+        return _attest_error_result(
+            url,
+            err_msg,
+            http_status=http_status,
+            agent_verified=agent_verified,
+            verdict=verdict,
+            signature_verified=signature_verified,
+            verification_receipt=v_rcpt,
+        )
+
+    return {
+        "ok": True,
+        "url": url,
+        "http_status": http_status,
+        "valid": True,
+        "verdict": verdict,
+        "signature_verified": signature_verified,
+        "agent_verified": agent_verified,
+        "verification_receipt": v_rcpt,
+        "error": None,
+    }
+
+
 def run_confined_verify(
     wt_path: Path,
     verify_cmd: str,
@@ -493,6 +738,8 @@ def run_confined_verify(
     sign_alg: str | None = None,
     require_sign: bool = False,
     receipt_log: str | None = None,
+    attest_remote: bool = False,
+    attest_url: str | None = None,
 ) -> dict:
     try:
         sign_active, resolved_alg, sign_key = _resolve_signing_plan(
@@ -650,11 +897,35 @@ def run_confined_verify(
         verify_stderr_tail=(proc.stderr or "")[-800:],
     )
     rcpt = _sign_with_plan(rcpt, sign_active, resolved_alg, sign_key)
+    att_ok = True
+    att_err: str | None = None
+    if attest_remote:
+        att_hmac = sign_key if (sign_active and resolved_alg == "hmac-sha256" and isinstance(sign_key, (bytes, bytearray))) else None
+        att_pub_pem: str | None = None
+        if sign_active and resolved_alg == "ed25519" and sign_key is not None:
+            try:
+                att_pub_pem = _extract_ed25519_public_pem(sign_key)
+            except (ValueError, OSError):
+                att_pub_pem = None
+        att = attest_confinement_receipt(
+            rcpt,
+            attest_url=attest_url,
+            hmac_key=att_hmac,
+            public_key_pem=att_pub_pem,
+            timeout_sec=min(max(int(timeout_sec), 5), 30),
+        )
+        rcpt["remote_attestation"] = att
+        if not att.get("ok"):
+            att_ok = False
+            att_err = att.get("error") or "remote confinement attestation failed"
     append_receipt_ledger(rcpt, ledger_path=receipt_log)
-    return {
-        "ok": proc.returncode == 0,
+    out_res: dict = {
+        "ok": (proc.returncode == 0) and att_ok,
         "confinement_receipt": rcpt,
     }
+    if att_err and proc.returncode == 0:
+        out_res["error"] = att_err
+    return out_res
 
 
 def resolve_model(raw: str | None) -> str:
@@ -701,6 +972,8 @@ def _run_one(
     payload_sign_receipt: bool | None = None,
     payload_sign_alg: str | None = None,
     payload_receipt_log: str | None = None,
+    payload_attest_remote: bool = False,
+    payload_attest_url: str | None = None,
 ) -> dict:
     name = str(task.get("name") or f"grok-{idx + 1}")
     prompt = str(task.get("prompt") or "").strip()
@@ -716,6 +989,8 @@ def _run_one(
     sign_receipt = task.get("sign_receipt", payload_sign_receipt)
     sign_alg = task.get("sign_alg", payload_sign_alg)
     receipt_log = task.get("receipt_log", payload_receipt_log)
+    attest_remote = bool(task.get("attest_remote", payload_attest_remote))
+    attest_url = task.get("attest_url", payload_attest_url)
     eff_verify_cmd = str(verify_cmd or "git status --short") if action == "worktree" else (str(verify_cmd) if verify_cmd else None)
 
     if confined:
@@ -852,6 +1127,8 @@ def _run_one(
                     sign_alg=sign_alg,
                     require_sign=bool(sign_receipt is True or (sign_alg is not None and str(sign_alg).strip())),
                     receipt_log=receipt_log,
+                    attest_remote=attest_remote,
+                    attest_url=attest_url,
                 )
                 rec["confinement_receipt"] = vres["confinement_receipt"]
                 if not vres["ok"]:
@@ -889,6 +1166,8 @@ def _run_one(
             sign_alg=sign_alg,
             require_sign=bool(sign_receipt is True or (sign_alg is not None and str(sign_alg).strip())),
             receipt_log=receipt_log,
+            attest_remote=attest_remote,
+            attest_url=attest_url,
         )
         rec["confinement_receipt"] = vres["confinement_receipt"]
         if not vres["ok"]:
@@ -921,6 +1200,8 @@ def run_swarm(payload: dict) -> dict:
     payload_sign_receipt = payload.get("sign_receipt")
     payload_sign_alg = payload.get("sign_alg")
     payload_receipt_log = payload.get("receipt_log")
+    payload_attest_remote = bool(payload.get("attest_remote", False))
+    payload_attest_url = payload.get("attest_url")
 
     any_confined = any(
         bool(t.get("confined", payload_confined)) if isinstance(t, dict) else payload_confined
@@ -1047,6 +1328,8 @@ def run_swarm(payload: dict) -> dict:
                 payload_sign_receipt,
                 payload_sign_alg,
                 payload_receipt_log,
+                payload_attest_remote,
+                payload_attest_url,
             ): i
             for i, t in enumerate(tasks)
         }
@@ -1105,7 +1388,13 @@ def run_swarm(payload: dict) -> dict:
     return {"_raw_text": encoded, **out}
 
 
-def cmd_verify_receipt(file_arg: str, hmac_key: str | None, pubkey_file: str | None) -> int:
+def cmd_verify_receipt(
+    file_arg: str,
+    hmac_key: str | None = None,
+    pubkey_file: str | None = None,
+    attest_remote: bool = False,
+    attest_url: str | None = None,
+) -> int:
     try:
         raw_text = sys.stdin.read() if file_arg == "-" else Path(file_arg).read_text(encoding="utf-8")
         data = json.loads(raw_text)
@@ -1122,14 +1411,33 @@ def cmd_verify_receipt(file_arg: str, hmac_key: str | None, pubkey_file: str | N
         hmac_key=hmac_key,
         ed25519_public_key=pubkey_file,
     )
-    out = {
+    out: dict = {
         "ok": ok,
         "reason": reason,
         "receipt_version": receipt.get("receipt_version") if isinstance(receipt, dict) else None,
         "signature_alg": receipt.get("signature_alg") if isinstance(receipt, dict) else None,
     }
+    overall_ok = ok
+    if attest_remote and ok:
+        pub_pem: str | None = None
+        if isinstance(receipt, dict) and receipt.get("signature_alg") == "ed25519":
+            try:
+                pub_pem = _extract_ed25519_public_pem(pubkey_file)
+            except (ValueError, OSError):
+                pub_pem = None
+        att = attest_confinement_receipt(
+            receipt,
+            attest_url=attest_url,
+            hmac_key=hmac_key,
+            public_key_pem=pub_pem,
+        )
+        out["remote_attestation"] = att
+        if not att.get("ok"):
+            overall_ok = False
+            out["ok"] = False
+            out["reason"] = att.get("error") or "remote confinement attestation failed"
     print(json.dumps(out, indent=2))
-    return 0 if ok else 1
+    return 0 if overall_ok else 1
 
 
 def main() -> int:
@@ -1143,6 +1451,8 @@ def main() -> int:
     run_p.add_argument("--sign-receipt", action="store_true", help="Sign confinement_receipt (fail-closed without key)")
     run_p.add_argument("--sign-alg", choices=["auto", "hmac-sha256", "ed25519"], default=None, help="Receipt signature algorithm")
     run_p.add_argument("--receipt-log", default=None, help="Append-only JSONL ledger path for confinement receipts")
+    run_p.add_argument("--attest-remote", action="store_true", help="Attest confinement_receipt remotely via RFC 9421 POST /verify-confinement")
+    run_p.add_argument("--attest-url", default=None, help="Override remote confinement attestation URL")
 
     wt_p = sub.add_parser("worktree", help="Run an isolated git-worktree Grok worker (optionally bwrap-confined)")
     wt_p.add_argument("--prompt", required=True, help="Worker prompt")
@@ -1155,17 +1465,27 @@ def main() -> int:
     wt_p.add_argument("--sign-receipt", action="store_true", help="Sign confinement_receipt (fail-closed without key)")
     wt_p.add_argument("--sign-alg", choices=["auto", "hmac-sha256", "ed25519"], default=None, help="Receipt signature algorithm")
     wt_p.add_argument("--receipt-log", default=None, help="Append-only JSONL ledger path for confinement receipts")
+    wt_p.add_argument("--attest-remote", action="store_true", help="Attest confinement_receipt remotely via RFC 9421 POST /verify-confinement")
+    wt_p.add_argument("--attest-url", default=None, help="Override remote confinement attestation URL")
 
     vr_p = sub.add_parser("verify-receipt", help="Verify a wm-confinement-receipt/1.1 JSON receipt")
     vr_p.add_argument("--file", default="-", help="Path to receipt JSON file or '-' for stdin")
     vr_p.add_argument("--hmac-key", default=None, help="HMAC key (UTF-8, hex:<hex>, or base64:<b64>)")
     vr_p.add_argument("--pubkey-file", default=None, help="Path to Ed25519 PEM or raw 32-byte public key")
+    vr_p.add_argument("--attest-remote", action="store_true", help="Attest confinement_receipt remotely via RFC 9421 POST /verify-confinement")
+    vr_p.add_argument("--attest-url", default=None, help="Override remote confinement attestation URL")
 
     args = parser.parse_args()
     if args.cmd == "status":
         return cmd_status()
     if args.cmd == "verify-receipt":
-        return cmd_verify_receipt(args.file, args.hmac_key, args.pubkey_file)
+        return cmd_verify_receipt(
+            args.file,
+            args.hmac_key,
+            args.pubkey_file,
+            attest_remote=args.attest_remote,
+            attest_url=args.attest_url,
+        )
     if args.cmd == "run":
         try:
             payload = json.loads(sys.stdin.read() or "{}")
@@ -1182,6 +1502,10 @@ def main() -> int:
             payload["sign_alg"] = args.sign_alg
         if args.receipt_log is not None:
             payload["receipt_log"] = args.receipt_log
+        if args.attest_remote:
+            payload["attest_remote"] = True
+        if args.attest_url is not None:
+            payload["attest_url"] = args.attest_url
         res = run_swarm(payload)
         print(res.pop("_raw_text", json.dumps(res, indent=2)))
         return 0 if res.get("ok") else 1
@@ -1204,6 +1528,10 @@ def main() -> int:
             payload["sign_alg"] = args.sign_alg
         if args.receipt_log is not None:
             payload["receipt_log"] = args.receipt_log
+        if args.attest_remote:
+            payload["attest_remote"] = True
+        if args.attest_url is not None:
+            payload["attest_url"] = args.attest_url
         res = run_swarm(payload)
         print(res.pop("_raw_text", json.dumps(res, indent=2)))
         return 0 if res.get("ok") else 1

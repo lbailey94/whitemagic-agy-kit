@@ -83,6 +83,8 @@ TOOL_SCHEMA = {
                         "verify_cmd": {"type": "string"},
                         "sign_receipt": {"type": "boolean"},
                         "sign_alg": {"type": "string", "enum": ["auto", "hmac-sha256", "ed25519"]},
+                        "attest_remote": {"type": "boolean"},
+                        "attest_url": {"type": "string"},
                     },
                     "required": ["prompt"],
                 },
@@ -114,6 +116,14 @@ TOOL_SCHEMA = {
             "receipt_log": {
                 "type": "string",
                 "description": "Optional append-only JSONL ledger path for signed confinement receipts",
+            },
+            "attest_remote": {
+                "type": "boolean",
+                "description": "Attest confinement_receipt remotely via RFC 9421 POST /verify-confinement",
+            },
+            "attest_url": {
+                "type": "string",
+                "description": "Override remote confinement attestation URL (default WM_CONFINEMENT_ATTEST_URL)",
             },
         },
         "required": ["action"],

@@ -910,6 +910,297 @@ def test_signed_confinement_receipts():
     check("Zero hardcoded /home/lucas paths in git-tracked bin/, plugin/, models/", not leaked_paths, detail=", ".join(leaked_paths))
 
 
+def test_remote_confinement_attestation():
+    print("\n=== Test 8: Remote RFC 9421 Confinement Attestation Loop ===")
+    import base64
+    import hashlib
+    import hmac
+    import http.server
+    import importlib.machinery
+    import importlib.util
+    import re
+    import socketserver
+    import threading
+
+    swarm_path = KIT / "bin" / "wm-grok-swarm"
+    loader = importlib.machinery.SourceFileLoader("wm_grok_swarm_attest_test", str(swarm_path))
+    spec = importlib.util.spec_from_loader("wm_grok_swarm_attest_test", loader)
+    swarm_mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(swarm_mod)
+
+    mcp_path = KIT / "bin" / "wm-grok-mcp"
+    mcp_loader = importlib.machinery.SourceFileLoader("wm_grok_mcp_test", str(mcp_path))
+    mcp_spec = importlib.util.spec_from_loader("wm_grok_mcp_test", mcp_loader)
+    mcp_mod = importlib.util.module_from_spec(mcp_spec)
+    mcp_loader.exec_module(mcp_mod)
+
+    # 8a) Schema check on wm-grok-mcp (top-level & task-level)
+    top_props = mcp_mod.TOOL_SCHEMA["inputSchema"]["properties"]
+    task_props = top_props["tasks"]["items"]["properties"]
+    check(
+        "wm-grok-mcp schema exposes attest_remote & attest_url at top-level and task-level",
+        top_props.get("attest_remote", {}).get("type") == "boolean"
+        and top_props.get("attest_url", {}).get("type") == "string"
+        and task_props.get("attest_remote", {}).get("type") == "boolean"
+        and task_props.get("attest_url", {}).get("type") == "string",
+    )
+
+    tap_secret = b"mock-tap-rfc9421-hmac-secret-32b"
+    tap_kid = "wm-mock-agent-1"
+    receipt_hmac_secret = b"mock-receipt-hmac-secret-key-32b"
+    state = {"mode": "valid", "seen": []}
+
+    class _MockAttestHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length") or "0")
+            raw_body = self.rfile.read(length) if length > 0 else b"{}"
+            body = json.loads(raw_body.decode("utf-8"))
+
+            sig_input = self.headers.get("Signature-Input") or ""
+            sig_hdr = self.headers.get("Signature") or ""
+            trial_hdr = self.headers.get("X-WM-Trial") or ""
+            host_hdr = self.headers.get("Host") or ""
+
+            # Verify RFC 9421 signature against tap_secret with @path stripped of ?receipt=1
+            m_in = re.match(r'^sig1=(\([^)]+\).*)$', sig_input.strip())
+            m_sig = re.match(r'^sig1=:([^:]+):$', sig_hdr.strip())
+            rfc_ok = False
+            if m_in and m_sig:
+                sig_params = m_in.group(1)
+                pure_path = self.path.split("?", 1)[0] or "/"
+                sig_base = (
+                    f'"@method": POST\n'
+                    f'"@path": {pure_path}\n'
+                    f'"@authority": {host_hdr}\n'
+                    f'"@signature-params": {sig_params}'
+                ).encode("utf-8")
+                expected = hmac.new(tap_secret, sig_base, hashlib.sha256).digest()
+                got = base64.b64decode(m_sig.group(1), validate=True)
+                rfc_ok = (
+                    '"@method" "@path" "@authority"' in sig_params
+                    and f'keyid="{tap_kid}"' in sig_params
+                    and "?receipt=1" not in sig_base.decode("utf-8")
+                    and hmac.compare_digest(expected, got)
+                )
+
+            state["seen"].append({
+                "path": self.path,
+                "trial_hdr": trial_hdr,
+                "rfc_ok": rfc_ok,
+                "has_receipt": isinstance(body.get("receipt"), dict),
+            })
+
+            mode = state["mode"]
+            if mode == "http500":
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"internal error"}')
+                return
+
+            if mode == "invalid":
+                resp = {
+                    "valid": False,
+                    "verdict": "UNTRUSTED",
+                    "signature_verified": False,
+                    "errors": ["mock signature rejected"],
+                }
+            else:
+                resp = {
+                    "valid": True,
+                    "verdict": "TRUSTED",
+                    "signature_verified": True,
+                    "policy_ok": True,
+                    "verification_receipt": {
+                        "receipt_version": "cpr-0.5",
+                        "verdict": "TRUSTED",
+                    },
+                }
+            encoded = json.dumps(resp).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            if rfc_ok:
+                self.send_header("X-WM-Agent-Verified", f"1; keyid={tap_kid}")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    srv = _ThreadingHTTPServer(("127.0.0.1", 0), _MockAttestHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+
+    saved_env = {
+        k: os.environ.get(k)
+        for k in (
+            "WM_TRUSTED_AGENT_KEY_FILE",
+            "WM_TRUSTED_AGENT_KEY_ID",
+            "WM_CONFINEMENT_ATTEST_URL",
+            "WM_CONFINEMENT_HMAC_KEY",
+            "WM_CONFINEMENT_SIGN",
+            "WM_CONFINEMENT_RECEIPT_LOG",
+        )
+    }
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            key_json = td_path / "trusted_agent_key.json"
+            key_json.write_text(
+                json.dumps(
+                    {
+                        tap_kid: {
+                            "alg": "hmac-sha256",
+                            "secret": "hex:" + tap_secret.hex(),
+                            "agent": "mock-agent",
+                            "enabled": True,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.environ["WM_TRUSTED_AGENT_KEY_FILE"] = str(key_json)
+            os.environ.pop("WM_TRUSTED_AGENT_KEY_ID", None)
+            os.environ["WM_CONFINEMENT_HMAC_KEY"] = "hex:" + receipt_hmac_secret.hex()
+            os.environ.pop("WM_CONFINEMENT_SIGN", None)
+
+            rcpt = swarm_mod._build_confinement_receipt(
+                bwrap_bin="/usr/bin/bwrap",
+                network_isolated=True,
+                worktree_path=str(td_path),
+                worktree_diff_sha256="a" * 64,
+                verify_exit_code=0,
+                scope_confined=True,
+                verify_cmd="echo ok",
+                bwrap_flags=["--ro-bind", "/", "/", "--unshare-net", "--die-with-parent"],
+            )
+            signed_rcpt = swarm_mod.sign_confinement_receipt(rcpt, sign_alg="hmac-sha256")
+            mock_url = f"http://127.0.0.1:{port}/verify-confinement?receipt=1"
+
+            # 8b) Valid remote attestation with RFC 9421 + X-WM-Trial: 1
+            state["mode"] = "valid"
+            att_ok = swarm_mod.attest_confinement_receipt(
+                signed_rcpt,
+                attest_url=mock_url,
+                hmac_key=receipt_hmac_secret,
+            )
+            last_seen = state["seen"][-1]
+            check(
+                "RFC 9421 headers (@path strips ?receipt=1) + X-WM-Trial: 1 + TRUSTED receipt attached",
+                att_ok.get("ok") is True
+                and att_ok.get("valid") is True
+                and att_ok.get("verdict") == "TRUSTED"
+                and att_ok.get("signature_verified") is True
+                and att_ok.get("agent_verified") == f"1; keyid={tap_kid}"
+                and isinstance(att_ok.get("verification_receipt"), dict)
+                and last_seen["rfc_ok"] is True
+                and last_seen["trial_hdr"] == "1"
+                and last_seen["has_receipt"] is True,
+                detail=str(att_ok.get("error") or att_ok.get("verdict")),
+            )
+
+            # 8c) Fail closed on HTTP 500 and valid=False
+            state["mode"] = "http500"
+            att_500 = swarm_mod.attest_confinement_receipt(
+                signed_rcpt,
+                attest_url=mock_url,
+                hmac_key=receipt_hmac_secret,
+            )
+            state["mode"] = "invalid"
+            att_inv = swarm_mod.attest_confinement_receipt(
+                signed_rcpt,
+                attest_url=mock_url,
+                hmac_key=receipt_hmac_secret,
+            )
+            check(
+                "Remote attestation fails closed on HTTP 500 and valid=False",
+                att_500.get("ok") is False
+                and att_500.get("http_status") == 500
+                and att_inv.get("ok") is False
+                and att_inv.get("valid") is False,
+            )
+
+            # 8d) Missing trusted_agent_key.json degrades cleanly to {} (X-WM-Trial: 1 still sent)
+            hdrs_missing = swarm_mod._sign_rfc9421_hmac_headers(
+                "POST",
+                "/verify-confinement?receipt=1",
+                f"127.0.0.1:{port}",
+                key_file=td_path / "does_not_exist.json",
+            )
+            state["mode"] = "valid"
+            att_no_tap = swarm_mod.attest_confinement_receipt(
+                signed_rcpt,
+                attest_url=mock_url,
+                hmac_key=receipt_hmac_secret,
+                key_file=td_path / "does_not_exist.json",
+            )
+            check(
+                "Missing trusted_agent_key.json returns {} cleanly and falls back to X-WM-Trial: 1",
+                hdrs_missing == {} and att_no_tap.get("ok") is True and att_no_tap.get("agent_verified") is None,
+            )
+
+            # 8e) CLI verify-receipt --attest-remote end-to-end (pass & fail-closed)
+            state["mode"] = "valid"
+            p_cli_ok = subprocess.run(
+                [
+                    str(LOCAL_BIN / "wm-grok-swarm"),
+                    "verify-receipt",
+                    "--file",
+                    "-",
+                    "--hmac-key",
+                    "hex:" + receipt_hmac_secret.hex(),
+                    "--attest-remote",
+                    "--attest-url",
+                    mock_url,
+                ],
+                input=json.dumps(signed_rcpt),
+                capture_output=True,
+                text=True,
+            )
+            cli_ok_json = json.loads(p_cli_ok.stdout)
+
+            state["mode"] = "invalid"
+            p_cli_fail = subprocess.run(
+                [
+                    str(LOCAL_BIN / "wm-grok-swarm"),
+                    "verify-receipt",
+                    "--file",
+                    "-",
+                    "--hmac-key",
+                    "hex:" + receipt_hmac_secret.hex(),
+                    "--attest-remote",
+                    "--attest-url",
+                    mock_url,
+                ],
+                input=json.dumps(signed_rcpt),
+                capture_output=True,
+                text=True,
+            )
+            cli_fail_json = json.loads(p_cli_fail.stdout)
+            check(
+                "CLI verify-receipt --attest-remote passes on valid mock and fails closed on rejection",
+                p_cli_ok.returncode == 0
+                and cli_ok_json.get("ok") is True
+                and cli_ok_json.get("remote_attestation", {}).get("verdict") == "TRUSTED"
+                and cli_ok_json.get("remote_attestation", {}).get("agent_verified") == f"1; keyid={tap_kid}"
+                and p_cli_fail.returncode != 0
+                and cli_fail_json.get("ok") is False,
+            )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def main():
     test_wm_squeeze()
     test_pre_tool_hook()
@@ -918,6 +1209,7 @@ def main():
     test_v4_fusion()
     test_bwrap_confinement()
     test_signed_confinement_receipts()
+    test_remote_confinement_attestation()
     print(f"\n=== Wave 3/4/v4.0 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
