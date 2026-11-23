@@ -2,6 +2,7 @@
 """Comprehensive end-to-end verification suite for WhiteMagic AGY Turbo Kit v2.0.0 (Wave 3)."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ _PLUGIN_HOOKS = Path.home() / ".gemini" / "config" / "plugins" / "whitemagic-agy
 _GLOBAL_HOOKS = Path.home() / ".gemini" / "config" / "hooks"
 _HOOKS_DIR = _PLUGIN_HOOKS if (_PLUGIN_HOOKS / "pre_tool_guard.py").is_file() else _GLOBAL_HOOKS
 PRE_HOOK = _HOOKS_DIR / "pre_tool_guard.py"
+POST_HOOK = _HOOKS_DIR / "post_tool_sim.py"
 STOP_HOOK = _HOOKS_DIR / "stop_telemetry.py"
 START_HOOK = _HOOKS_DIR / "session_start_brief.py"
 STATUSLINE = Path.home() / ".gemini" / "antigravity-cli" / "statusline.py"
@@ -380,12 +382,239 @@ def test_tricameral_v31():
     check("Zero hardcoded personal paths across bin/, plugin/, models/", len(leaked) == 0, f"leaked={leaked}")
 
 
+def test_v4_fusion():
+    print("\n5. Fused Turbo+Fast v4.0.0 (python3 -m, 2>&1, post_tool_sim, unified SessionStart, 5-tool MCP):")
+    sq = LOCAL_BIN / "wm-squeeze"
+    p_ok = subprocess.run([str(sq), "--safe", "--", "python3", "-m", "pytest", "--version"], capture_output=True, text=True)
+    check("wm-squeeze --safe allows python3 -m pytest", p_ok.returncode == 0)
+    p_bad = subprocess.run([str(sq), "--safe", "--", "python3", "-c", "print(1)"], capture_output=True, text=True)
+    check("wm-squeeze --safe refuses python3 -c (rc=2)", p_bad.returncode == 2)
+
+    for cmd in ("cargo test 2>&1", "go test ./...", "python3 -m pytest -q"):
+        rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}})
+        d = json.loads(out)
+        rewritten = (d.get("overwrite") or {}).get("CommandLine", "")
+        check(f"pre_tool_guard rewrites '{cmd}'", rc == 0 and "--safe" in rewritten)
+
+    for tool_name in ("mcp_whitemagic-agy-kit_fast_run_checks", "mcp_whitemagic-agy-kit_fast_apply_edits"):
+        rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": tool_name, "args": {"verify": "rm -rf /"}}})
+        check(f"{tool_name} destructive guard -> force_ask", rc == 0 and json.loads(out).get("decision") == "force_ask")
+
+    with tempfile.NamedTemporaryFile(suffix=".jsonl") as tf:
+        rc, out, _, _ = run_hook(
+            POST_HOOK,
+            {"toolCall": {"name": "mcp_whitemagic-agy-kit_fast_apply_edits", "args": {"edits": [{"path": "foo.py"}]}}, "error": "boom"},
+            env_extra={"WM_SIM_LEDGER": tf.name},
+        )
+        logged = Path(tf.name).read_text()
+        check("post_tool_sim logs rich cmd_preview for apply_edits", rc == 0 and "apply_edits: foo.py" in logged)
+
+    rc, out, _, _ = run_hook(START_HOOK, {"cwd": str(KIT)})
+    msg_repo = json.loads(out).get("injectSteps", [{}])[0].get("systemMessage", {}).get("systemMessage", "")
+    check("unified SessionStart repo snapshot <=2550B", rc == 0 and 0 < len(msg_repo.encode("utf-8")) <= 2550 and "[Workspace Snapshot]" in msg_repo and "Git:" in msg_repo)
+
+    rc, out, _, _ = run_hook(START_HOOK, {"cwd": str(Path.home())})
+    msg_home = json.loads(out).get("injectSteps", [{}])[0].get("systemMessage", {}).get("systemMessage", "")
+    check("unified SessionStart suppresses $HOME noise", rc == 0 and "[Workspace] ~" in msg_home and "Music/" not in msg_home)
+
+    node_bin = LOCAL_BIN / "node"
+    if not node_bin.exists():
+        node_bin = Path(shutil.which("node") or "node")
+    mcp_js = KIT / "plugin" / "dist" / "mcp-server.mjs"
+    with tempfile.TemporaryDirectory() as td:
+        tfile = Path(td) / "demo.py"
+        tfile.write_text("\n".join(f"x{i} = {i}" for i in range(20)) + "\ntarget_val = 1\n", encoding="utf-8")
+        reqs = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "antigravity-cli", "version": "1.5.15"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "code_graph", "arguments": {"mode": "overview", "root": str(KIT / "tools" / "wm-squeeze")}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "apply_edits", "arguments": {"cwd": td, "edits": [{"path": "demo.py", "hunks": [{"target": "target_val = 1", "replacement": "target_val = 2", "startLine": 1, "endLine": 5}]}]}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "run_checks", "arguments": {"cwd": td, "outputMode": "compact", "commands": [{"name": "ls", "command": "ls"}]}}},
+        ]
+        p = subprocess.run([str(node_bin), str(mcp_js)], input="\n".join(json.dumps(r) for r in reqs) + "\n", capture_output=True, text=True)
+        resps = {r["id"]: r for r in (json.loads(ln) for ln in p.stdout.splitlines() if ln.strip())}
+        check("fused MCP initialize v4.0.0", resps[1]["result"]["serverInfo"]["name"] == "whitemagic-agy-fast" and resps[1]["result"]["serverInfo"]["version"] == "4.0.0")
+        tnames = [t["name"] for t in resps[2]["result"]["tools"]]
+        check("fused MCP tools/list has all 5 tools", tnames == ["batch_search", "apply_edits", "read_slices", "run_checks", "code_graph"])
+        check("fused MCP code_graph overview", not resps[3]["result"]["isError"] and "main.rs" in resps[3]["result"]["content"][0]["text"])
+        check("fused MCP apply_edits auto-relocate", not resps[4]["result"]["isError"] and "auto-relocated" in resps[4]["result"]["content"][0]["text"])
+        check("fused MCP run_checks squeezed", not resps[5]["result"]["isError"] and "squeezed" in resps[5]["result"]["content"][0]["text"])
+
+    # Phase 3C: manage_task anti-poll guard + wm-grok-swarm/mcp + wm-vps + wm-triage
+    poll_conv = f"polltest-{int(time.time())}"
+    for step_i, expected_dec in ((1, "allow"), (2, "allow"), (3, "deny")):
+        rc, out, _, _ = run_hook(
+            PRE_HOOK,
+            {"conversationId": poll_conv, "stepIdx": step_i, "toolCall": {"name": "manage_task", "args": {"Action": "status", "TaskId": "t-1"}}},
+        )
+        check(f"manage_task(status) poll #{step_i} -> {expected_dec}", rc == 0 and json.loads(out).get("decision") == expected_dec)
+    rc, out, _, _ = run_hook(
+        PRE_HOOK,
+        {"conversationId": poll_conv, "stepIdx": 4, "toolCall": {"name": "manage_task", "args": {"Action": "list"}}},
+    )
+    check("manage_task(list) not blocked by anti-poll guard", rc == 0 and json.loads(out).get("decision") == "allow")
+
+    p_gs_help = subprocess.run([str(LOCAL_BIN / "wm-grok-swarm"), "--help"], capture_output=True, text=True)
+    check("wm-grok-swarm --help", p_gs_help.returncode == 0 and "status" in p_gs_help.stdout)
+    p_gs_bad = subprocess.run(
+        [str(LOCAL_BIN / "wm-grok-swarm"), "run", "--json-stdin"],
+        input=json.dumps({"action": "ask", "model": "claude-opus", "tasks": [{"prompt": "hi"}]}),
+        capture_output=True,
+        text=True,
+    )
+    check("wm-grok-swarm rejects non-grok model", p_gs_bad.returncode != 0 and "Unsupported Grok 4.7 model" in p_gs_bad.stdout)
+
+    gmcp_in = (
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+        '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"grok_dispatch","arguments":{"action":"status"}}}\n'
+    )
+    p_gmcp = subprocess.run([str(LOCAL_BIN / "wm-grok-mcp")], input=gmcp_in, capture_output=True, text=True)
+    glines = [json.loads(ln) for ln in p_gmcp.stdout.splitlines() if ln.strip()]
+    check("wm-grok-mcp initialize + tools/list + status", p_gmcp.returncode == 0 and len(glines) == 3 and glines[1]["result"]["tools"][0]["name"] == "grok_dispatch")
+
+    p_vps = subprocess.run([str(LOCAL_BIN / "wm-vps"), "--help"], capture_output=True, text=True)
+    check("wm-vps --help", p_vps.returncode == 0 and "health" in p_vps.stdout)
+
+    p_tri = subprocess.run([str(LOCAL_BIN / "wm-triage"), "--dry-run"], capture_output=True, text=True)
+    check("wm-triage --dry-run <= 4500B", p_tri.returncode == 0 and 0 < len(p_tri.stdout.encode("utf-8")) <= 4500 and "WhiteMagic Estate Triage" in p_tri.stdout)
+
+
+def test_bwrap_confinement():
+    print("\n6. bwrap Confinement for wm-grok-swarm & wm-grok-mcp:")
+    import importlib.machinery
+    import importlib.util
+    import socket
+
+    gmcp_in = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
+    p_gmcp = subprocess.run([str(LOCAL_BIN / "wm-grok-mcp")], input=gmcp_in, capture_output=True, text=True)
+    glines = [json.loads(ln) for ln in p_gmcp.stdout.splitlines() if ln.strip()]
+    schema = glines[0]["result"]["tools"][0]["inputSchema"]
+    top_props = schema.get("properties", {})
+    task_props = top_props.get("tasks", {}).get("items", {}).get("properties", {})
+    check(
+        "wm-grok-mcp schema exposes confined + verify_cmd (top-level and per-task)",
+        p_gmcp.returncode == 0
+        and {"confined", "verify_cmd"}.issubset(top_props.keys())
+        and {"confined", "verify_cmd"}.issubset(task_props.keys()),
+    )
+
+    swarm_path = str(KIT / "bin" / "wm-grok-swarm")
+    loader = importlib.machinery.SourceFileLoader("wm_grok_swarm_mod", swarm_path)
+    spec = importlib.util.spec_from_loader("wm_grok_swarm_mod", loader)
+    swarm_mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(swarm_mod)
+
+    with tempfile.TemporaryDirectory() as td:
+        wt = Path(td) / "wt"
+        wt.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=str(wt), check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(wt), check=True)
+        (wt / "hello.txt").write_text("v1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "hello.txt"], cwd=str(wt), check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(wt), check=True)
+
+        # 1) Fail-closed when WM_BWRAP_BIN points to nonexistent binary
+        old_bwrap_env = os.environ.get("WM_BWRAP_BIN")
+        try:
+            os.environ["WM_BWRAP_BIN"] = "/nonexistent/bwrap"
+            fc_verify = swarm_mod.run_confined_verify(wt, "echo should-not-run", 15)
+            fc_swarm = swarm_mod.run_swarm(
+                {
+                    "action": "worktree",
+                    "confined": True,
+                    "verify_cmd": "echo should-not-run",
+                    "tasks": [{"name": "t1", "prompt": "noop", "cwd": str(wt)}],
+                }
+            )
+            check(
+                "fail-closed when WM_BWRAP_BIN missing (verify & run_swarm)",
+                not fc_verify.get("ok")
+                and fc_verify.get("confinement_receipt", {}).get("scope_confined") is False
+                and not fc_swarm.get("ok")
+                and fc_swarm.get("workers", [{}])[0].get("confinement_receipt", {}).get("scope_confined") is False,
+            )
+        finally:
+            if old_bwrap_env is None:
+                os.environ.pop("WM_BWRAP_BIN", None)
+            else:
+                os.environ["WM_BWRAP_BIN"] = old_bwrap_env
+
+        # 2) Live bwrap confinement checks
+        bwrap_bin = swarm_mod.find_bwrap()
+        check("bwrap binary available for live confinement test", bool(bwrap_bin))
+        if bwrap_bin:
+            # 2a) Write inside wt succeeds & receipt has all 6 required keys
+            res_in = swarm_mod.run_confined_verify(wt, "touch confined_inside.txt && test -f confined_inside.txt", 30)
+            rcpt = res_in.get("confinement_receipt", {})
+            req_keys = {
+                "bwrap_bin",
+                "network_isolated",
+                "worktree_path",
+                "worktree_diff_sha256",
+                "verify_exit_code",
+                "scope_confined",
+            }
+            check(
+                "bwrap allows write inside wt_path & emits 6-key confinement_receipt",
+                res_in.get("ok") is True
+                and (wt / "confined_inside.txt").is_file()
+                and req_keys.issubset(rcpt.keys())
+                and rcpt.get("network_isolated") is True
+                and rcpt.get("scope_confined") is True
+                and rcpt.get("verify_exit_code") == 0
+                and len(str(rcpt.get("worktree_diff_sha256") or "")) == 64,
+            )
+
+            # 2b) Write outside wt_path to a real host path outside /tmp fails read-only
+            cache_dir = Path.home() / ".cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            outside_dir = Path(tempfile.mkdtemp(prefix="wm-bwrap-ro-test-", dir=str(cache_dir)))
+            outside_file = outside_dir / "escape.txt"
+            try:
+                res_out = swarm_mod.run_confined_verify(wt, f"touch '{outside_file}'", 30)
+                err_tail = (res_out.get("confinement_receipt", {}).get("verify_stderr_tail") or "").lower()
+                check(
+                    "bwrap blocks write outside wt_path (read-only host path)",
+                    not res_out.get("ok")
+                    and res_out.get("confinement_receipt", {}).get("verify_exit_code", 0) != 0
+                    and not outside_file.exists()
+                    and ("read-only" in err_tail or "permission denied" in err_tail),
+                    detail=err_tail.strip().splitlines()[-1] if err_tail.strip() else "",
+                )
+            finally:
+                shutil.rmtree(outside_dir, ignore_errors=True)
+
+            # 2c) --unshare-net isolates network namespace from host loopback listener
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                srv.bind(("127.0.0.1", 0))
+                srv.listen(1)
+                port = srv.getsockname()[1]
+                net_probe_cmd = (
+                    "python3 -c 'import socket, sys; "
+                    "s = socket.socket(); s.settimeout(1.0); "
+                    f"sys.exit(0 if s.connect_ex((\"127.0.0.1\", {port})) != 0 else 1)'"
+                )
+                res_net = swarm_mod.run_confined_verify(wt, net_probe_cmd, 30)
+                check(
+                    "bwrap --unshare-net isolates network from host loopback",
+                    res_net.get("ok") is True
+                    and res_net.get("confinement_receipt", {}).get("network_isolated") is True,
+                )
+            finally:
+                srv.close()
+
+
 def main():
     test_wm_squeeze()
     test_pre_tool_hook()
     test_statusline_and_lifecycle()
     test_tricameral_v31()
-    print(f"\n=== Wave 3/4/Tricameral Test Summary: {PASS} passed, {FAIL} failed ===")
+    test_v4_fusion()
+    test_bwrap_confinement()
+    print(f"\n=== Wave 3/4/v4.0 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

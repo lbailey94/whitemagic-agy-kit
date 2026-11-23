@@ -1,6 +1,8 @@
 tools/wm-squeeze/target/
 tools/wm-codegraph/target/
 tools/wm-tricameral-engine/target/
+tools/agy-turbo-mcp/node_modules/
+tools/agy-turbo-mcp/.tmp/
 *.tm7b
 *.hms
 *.cspd

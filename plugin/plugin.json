@@ -1,8 +1,8 @@
 {
   "name": "whitemagic-agy-kit",
   "displayName": "WhiteMagic AGY Turbo Kit",
-  "version": "3.1.1",
-  "description": "Cross-platform (macOS + Linux) Antigravity CLI performance, CoACT PreToolUse compression (wm-squeeze v3), incremental AST symbol/call-graph (wm-codegraph), Sovereign Tricameral CyberBrain (clean-room Huginn-2/Muninn-5/Valkyrie-M3 Safe-Rust engine, lossless cross-organ --draft-weights speculative decoding, Kekkai firewall, .hms holograms & 1-tool MCP), CliffCompaction handoffs (wm-handoff), cache-warmth telemetry, SIM memory, and $0 local offload.",
+  "version": "4.0.0",
+  "description": "Fused Antigravity CLI/Desktop/IDE accelerator: 5-tool eager MCP (batch_search, apply_edits with safe auto-relocate, read_slices, CoACT-squeezed run_checks, AST code_graph), wm-squeeze v3, unified zero-jitter SessionStart, PreToolUse guards, CliffCompaction handoffs, Tricameral CyberBrain, and SIM memory.",
   "author": {
     "name": "Lucas Bailey",
     "url": "https://github.com/lbailey94"

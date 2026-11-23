@@ -132,7 +132,22 @@ hp.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 print(f"Updated global {hp}")
 PY
 else
-    echo "=== 2. Installing native plugin: whitemagic-agy-kit ==="
+    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.0.0 ==="
+    # Build fused TS MCP & benchmark bundle if needed
+    TURBO_MCP_DIR="${KIT_DIR}/tools/agy-turbo-mcp"
+    NODE_BIN="$(command -v node || true)"
+    if [ -z "$NODE_BIN" ]; then
+        NODE_BIN="$(ls -1d "${HOME}"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -n 1 || true)"
+    fi
+    if [ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ]; then
+        ln -sf "$NODE_BIN" "${LOCAL_BIN}/node"
+        if [ -d "$TURBO_MCP_DIR" ] && [ ! -f "${KIT_DIR}/plugin/dist/mcp-server.mjs" -o "${TURBO_MCP_DIR}/src/mcp-server.ts" -nt "${KIT_DIR}/plugin/dist/mcp-server.mjs" ]; then
+            if [ -d "${TURBO_MCP_DIR}/node_modules" ] && command -v npm >/dev/null 2>&1; then
+                (cd "$TURBO_MCP_DIR" && npm run build)
+            fi
+        fi
+    fi
+
     TARGET_PLUGIN="${PLUGINS_DIR}/whitemagic-agy-kit"
     rm -rf "$TARGET_PLUGIN"
     cp -R "${KIT_DIR}/plugin" "$TARGET_PLUGIN"
@@ -140,25 +155,53 @@ else
     cp "${KIT_DIR}/models/manifest.json" "${TARGET_PLUGIN}/models/manifest.json"
     chmod +x "${TARGET_PLUGIN}/hooks/"*.py
 
-    python3 - "$LOCAL_BIN" "$TARGET_PLUGIN" <<'PY'
-import json, sys
+    python3 - "$LOCAL_BIN" "$TARGET_PLUGIN" "${HOME}/.gemini/config/mcp_config.json" <<'PY'
+import json, shutil, sys
 from pathlib import Path
 
 local_bin = Path(sys.argv[1])
 target_plugin = Path(sys.argv[2])
+global_mcp_path = Path(sys.argv[3])
 servers = {}
 
-cg = local_bin / "wm-codegraph"
-if cg.is_file():
-    servers["codegraph"] = {
-        "command": str(cg),
-        "args": ["--mcp"],
-        "tools": {"code_graph": {"eager": True}},
+node_bin = local_bin / "node"
+if not node_bin.is_file():
+    which_node = shutil.which("node")
+    if which_node:
+        node_bin = Path(which_node)
+
+mcp_js = target_plugin / "dist" / "mcp-server.mjs"
+if node_bin.is_file() and mcp_js.is_file():
+    servers["fast"] = {
+        "command": str(node_bin),
+        "args": [str(mcp_js)],
+        "tools": {
+            "batch_search": {"eager": True},
+            "apply_edits": {"eager": True},
+            "read_slices": {"eager": True},
+            "run_checks": {"eager": True},
+            "code_graph": {"eager": True},
+        },
     }
+else:
+    cg = local_bin / "wm-codegraph"
+    if cg.is_file():
+        servers["codegraph"] = {
+            "command": str(cg),
+            "args": ["--mcp"],
+            "tools": {"code_graph": {"eager": True}},
+        }
+
+global_servers = {}
+if global_mcp_path.is_file():
+    try:
+        global_servers = json.loads(global_mcp_path.read_text(encoding="utf-8")).get("mcpServers") or {}
+    except Exception:
+        global_servers = {}
 
 tri_mcp = local_bin / "wm-tricameral-mcp"
 engine = local_bin / "muninn-engine"
-if engine.is_file():
+if engine.is_file() and tri_mcp.is_file() and "tricameral" not in global_servers:
     servers["tricameral"] = {
         "command": str(tri_mcp),
         "args": [],
@@ -171,6 +214,14 @@ if servers:
     print(f"Wired eager plugin MCPs in {out}: {list(servers.keys())}")
 PY
 
+    # Migrate away from legacy global hooks.json to prevent double-firing with native plugin hooks
+    GLOBAL_HOOKS="${HOME}/.gemini/config/hooks.json"
+    if [ -f "$GLOBAL_HOOKS" ] && [ "$(wc -c < "$GLOBAL_HOOKS")" -gt 4 ]; then
+        cp "$GLOBAL_HOOKS" "${GLOBAL_HOOKS}.bak-$(date +%Y%m%d_%H%M%S)"
+        printf '{}\n' > "$GLOBAL_HOOKS"
+        echo "Backed up and cleared legacy global ${GLOBAL_HOOKS} (now managed by whitemagic-agy-kit plugin)"
+    fi
+
     if command -v agy >/dev/null 2>&1; then
         agy plugin validate --strict "$TARGET_PLUGIN"
         agy plugin enable whitemagic-agy-kit
@@ -179,23 +230,11 @@ PY
     fi
 fi
 
-echo "=== 3. Checking hardened agy-fast (auto-update off) ==="
-if [ "$SKIP_AGY_FAST" -eq 0 ]; then
-    if command -v node >/dev/null 2>&1 && [ "$(node -p "process.versions.node.split('.')[0]")" -ge 20 ]; then
-        AF_DIR="${PLUGINS_DIR}/agy-fast"
-        if [ -d "$AF_DIR/.git" ] || [ -f "$AF_DIR/plugin.json" ]; then
-            echo "agy-fast already installed at $AF_DIR (keeping existing revision)"
-        else
-            rm -rf "$AF_DIR"
-            git clone --depth 1 https://github.com/INK-Q/agy-fast.git "$AF_DIR"
-        fi
-        node "${AF_DIR}/scripts/install.mjs" config --auto-update off
-        if command -v agy >/dev/null 2>&1; then
-            agy plugin validate --strict "$AF_DIR"
-            agy plugin enable agy-fast
-        fi
-    else
-        echo "[warn] Node.js >= 20 not found; skipping agy-fast."
+echo "=== 3. Retiring standalone agy-fast (now fused into whitemagic-agy-kit v4.0.0) ==="
+if [ "$SKIP_AGY_FAST" -eq 0 ] && command -v agy >/dev/null 2>&1; then
+    if agy plugin list 2>/dev/null | grep -qE '^\- agy-fast \(enabled'; then
+        agy plugin disable agy-fast >/dev/null 2>&1 || true
+        echo "Disabled legacy standalone agy-fast plugin (tools now provided by whitemagic-agy-kit_fast)"
     fi
 fi
 
@@ -207,8 +246,10 @@ if [ "$KEEP_HEAVY_PLUGINS" -eq 0 ] && command -v agy >/dev/null 2>&1; then
 fi
 
 echo "=== 5. Installing portable CLI tools, model manifest & cache-warmth statusline ==="
-for tool in wm-sim agy-bench agy-mode wm-local-digest wm-dream wm-handoff wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp; do
-    install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
+for tool in wm-sim agy-bench agy-mode wm-local-digest wm-dream wm-handoff wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-mcp wm-vps wm-triage; do
+    if [ -f "${KIT_DIR}/bin/${tool}" ]; then
+        install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
+    fi
 done
 cp "${KIT_DIR}/models/manifest.json" "${MODELS_DIR}/manifest.json"
 install_bin "${KIT_DIR}/bin/statusline.py" "${AGY_CLI_DIR}/statusline.py"
@@ -280,6 +321,9 @@ base_allow = [
     "command(wm-sim)",
     "command(wm-squeeze --safe)",
     "command(wm-codegraph)",
+    "mcp(whitemagic-agy-kit_fast/batch_search)",
+    "mcp(whitemagic-agy-kit_fast/read_slices)",
+    "mcp(whitemagic-agy-kit_fast/code_graph)",
     "mcp(whitemagic-agy-kit_codegraph/*)",
     "mcp(whitemagic-agy-kit_tricameral/*)",
     "command(wm-models)",
@@ -290,6 +334,10 @@ base_allow = [
     "command(wm-local-digest)",
     "command(wm-dream)",
     "command(wm-preflight-brief)",
+    "command(wm-grok-swarm)",
+    "command(wm-vps)",
+    "command(wm-triage)",
+    "mcp(grok/grok_dispatch)",
     "command(agy-bench)",
     "command(agy-mode)",
     "command(agy --version)",
@@ -315,6 +363,28 @@ cur["permissions"] = perms
 p.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
 p.chmod(0o600)
 print(f"Updated {p} ({len(merged_allow)} allow, {len(existing_deny)} deny, statusLine enabled, model preserved={cur.get('model')!r})")
+
+# Also add safe read-only MCP grants to ~/.gemini/config/config.json for Antigravity 2.0 Desktop App parity
+cfg_path = Path.home() / ".gemini" / "config" / "config.json"
+if cfg_path.is_file():
+    try:
+        shutil.copy2(cfg_path, cfg_path.with_name(f"config.json.bak-{datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        us = cfg.setdefault("userSettings", {})
+        gpg = us.setdefault("globalPermissionGrants", {})
+        gallow = gpg.setdefault("allow", [])
+        for pat in (
+            "mcp(whitemagic-agy-kit_fast/batch_search)",
+            "mcp(whitemagic-agy-kit_fast/read_slices)",
+            "mcp(whitemagic-agy-kit_fast/code_graph)",
+            "mcp(tricameral/*)",
+        ):
+            if pat not in gallow:
+                gallow.append(pat)
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        print(f"Updated {cfg_path} globalPermissionGrants.allow")
+    except Exception as e:
+        print(f"[warn] could not update {cfg_path}: {e}")
 PY
 
 echo "=== 7. Auto-wiring selective eager MCP tools for locally present servers ==="
@@ -347,8 +417,18 @@ wm3 = shutil.which("wm3") or (str(home / ".local" / "bin" / "wm3") if (home / ".
 if wm3:
     entry = servers.setdefault("whitemagic", {"command": wm3, "args": ["serve", "--store", str(home / ".local" / "share" / "whitemagic" / "gen3")]})
     tools = entry.setdefault("tools", {})
-    for t in ("memory_recall", "session_continuity", "session_checkpoint"):
+    for t in ("memory_recall", "memory_get", "session_continuity", "session_checkpoint"):
         tools.setdefault(t, {"eager": True})
+    changed = True
+
+grok_mcp = shutil.which("wm-grok-mcp") or (str(home / ".local" / "bin" / "wm-grok-mcp") if (home / ".local" / "bin" / "wm-grok-mcp").exists() else None)
+ca_bin = shutil.which("cursor-agent") or (str(home / ".local" / "bin" / "cursor-agent") if (home / ".local" / "bin" / "cursor-agent").exists() else None)
+if grok_mcp and ca_bin:
+    servers["grok"] = {
+        "command": str(grok_mcp),
+        "args": [],
+        "tools": {"grok_dispatch": {"eager": True}},
+    }
     changed = True
 
 fc = shutil.which("firecrawl-local-mcp") or (str(home / ".local" / "bin" / "firecrawl-local-mcp") if (home / ".local" / "bin" / "firecrawl-local-mcp").exists() else None)

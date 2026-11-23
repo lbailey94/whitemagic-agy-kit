@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""
+wm-grok-swarm — Parallel Grok 4.7 Subagent Runner via `cursor-agent` (Tier 1 Leaf Swarm).
+
+- Strictly isolates workers from local `wm3 serve` Gen3 store (never passes `--approve-mcps`).
+- Supports `status`, `ask` (read-only), `plan` (read-only), `worktree` (isolated `-w` git worktrees),
+  and `resume` (`--resume <session_id>`).
+- Logs telemetry to ~/.local/share/whitemagic/grok_swarm_telemetry.jsonl.
+"""
+
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+MODEL_MAP = {
+    "low": "grok-4.7-low-fast",
+    "medium": "grok-4.7-medium-fast",
+    "high": "grok-4.7-high-fast",
+    "xhigh": "grok-4.7-xhigh-fast",
+}
+VALID_EXPLICIT_RE = re.compile(r"^grok-4\.7(?:-(?:low|medium|high|xhigh)(?:-fast)?)?$")
+SAFE_WT_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+TELEM_PATH = Path(
+    os.environ.get(
+        "WM_GROK_TELEMETRY",
+        str(Path.home() / ".local" / "share" / "whitemagic" / "grok_swarm_telemetry.jsonl"),
+    )
+)
+
+
+def find_cursor_agent() -> str | None:
+    hit = shutil.which("cursor-agent")
+    if hit:
+        return hit
+    cand = Path.home() / ".local" / "bin" / "cursor-agent"
+    if cand.is_file() and os.access(cand, os.X_OK):
+        return str(cand)
+    return None
+
+
+def find_bwrap() -> str | None:
+    if "WM_BWRAP_BIN" in os.environ:
+        cand = os.environ["WM_BWRAP_BIN"].strip()
+        if not cand:
+            return None
+        p = Path(cand)
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+        return None
+    return shutil.which("bwrap")
+
+
+def _compute_worktree_diff_sha256(wt_path: Path) -> str:
+    h = hashlib.sha256()
+    diff_proc = subprocess.run(
+        ["git", "-C", str(wt_path), "diff", "HEAD"],
+        capture_output=True,
+    )
+    status_proc = subprocess.run(
+        ["git", "-C", str(wt_path), "status", "--porcelain"],
+        capture_output=True,
+    )
+    if diff_proc.returncode == 0 and status_proc.returncode == 0:
+        h.update(diff_proc.stdout)
+        h.update(b"\n---\n")
+        h.update(status_proc.stdout)
+        return h.hexdigest()
+
+    for p in sorted(wt_path.rglob("*")):
+        rel = str(p.relative_to(wt_path))
+        if rel.startswith(".git"):
+            continue
+        if p.is_file():
+            try:
+                st = p.stat()
+                h.update(f"{rel}:{st.st_size}\n".encode("utf-8"))
+                h.update(p.read_bytes()[:65536])
+            except OSError:
+                h.update(f"{rel}:err\n".encode("utf-8"))
+    return h.hexdigest()
+
+
+def run_confined_verify(wt_path: Path, verify_cmd: str, timeout_sec: int) -> dict:
+    bwrap = find_bwrap()
+    if bwrap is None:
+        return {
+            "ok": False,
+            "error": "bwrap binary not found (fail-closed confinement)",
+            "confinement_receipt": {
+                "bwrap_bin": None,
+                "network_isolated": False,
+                "worktree_path": str(wt_path),
+                "worktree_diff_sha256": None,
+                "verify_exit_code": None,
+                "scope_confined": False,
+            },
+        }
+
+    resolved_wt = wt_path.resolve()
+    diff_sha = _compute_worktree_diff_sha256(resolved_wt)
+    bwrap_cmd = [
+        bwrap,
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--bind",
+        str(resolved_wt),
+        str(resolved_wt),
+        "--chdir",
+        str(resolved_wt),
+        "--unshare-net",
+        "--die-with-parent",
+        "--",
+        "sh",
+        "-c",
+        verify_cmd,
+    ]
+    eff_timeout = max(1, min(int(timeout_sec), 90))
+    try:
+        proc = subprocess.run(
+            bwrap_cmd,
+            capture_output=True,
+            text=True,
+            timeout=eff_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout_s = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr_s = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return {
+            "ok": False,
+            "error": f"confined verify timed out after {eff_timeout}s",
+            "confinement_receipt": {
+                "bwrap_bin": bwrap,
+                "network_isolated": True,
+                "worktree_path": str(resolved_wt),
+                "worktree_diff_sha256": diff_sha,
+                "verify_exit_code": None,
+                "scope_confined": True,
+                "verify_stdout_tail": stdout_s[-800:],
+                "verify_stderr_tail": stderr_s[-800:],
+            },
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": f"bwrap execution failed: {exc}",
+            "confinement_receipt": {
+                "bwrap_bin": bwrap,
+                "network_isolated": False,
+                "worktree_path": str(resolved_wt),
+                "worktree_diff_sha256": diff_sha,
+                "verify_exit_code": None,
+                "scope_confined": False,
+            },
+        }
+
+    return {
+        "ok": proc.returncode == 0,
+        "confinement_receipt": {
+            "bwrap_bin": bwrap,
+            "network_isolated": True,
+            "worktree_path": str(resolved_wt),
+            "worktree_diff_sha256": diff_sha,
+            "verify_exit_code": proc.returncode,
+            "scope_confined": True,
+            "verify_stdout_tail": (proc.stdout or "")[-800:],
+            "verify_stderr_tail": (proc.stderr or "")[-800:],
+        },
+    }
+
+
+def resolve_model(raw: str | None) -> str:
+    m = (raw or "high").strip().lower()
+    if m in MODEL_MAP:
+        return MODEL_MAP[m]
+    if VALID_EXPLICIT_RE.match(m):
+        return m
+    raise ValueError(f"Unsupported Grok 4.7 model '{raw}'. Use low|medium|high|xhigh or grok-4.7-*")
+
+
+def cmd_status() -> int:
+    ca = find_cursor_agent()
+    if not ca:
+        print(json.dumps({"ok": False, "error": "cursor-agent not found"}))
+        return 1
+    st = subprocess.run([ca, "status"], capture_output=True, text=True, timeout=10)
+    wt_root = Path.home() / ".cursor" / "worktrees"
+    worktrees = []
+    if wt_root.is_dir():
+        for p in sorted(wt_root.glob("*/*"))[:12]:
+            if p.is_dir():
+                worktrees.append(str(p.relative_to(wt_root)))
+    out = {
+        "ok": st.returncode == 0,
+        "cursor_agent": ca,
+        "auth": (st.stdout or st.stderr).strip().splitlines()[-1] if (st.stdout or st.stderr).strip() else "unknown",
+        "models": list(MODEL_MAP.values()),
+        "worktrees": worktrees,
+    }
+    print(json.dumps(out, indent=2))
+    return 0 if st.returncode == 0 else 1
+
+
+def _run_one(
+    ca: str,
+    action: str,
+    model: str,
+    task: dict,
+    timeout_sec: int,
+    idx: int,
+    payload_confined: bool = False,
+    payload_verify_cmd: str | None = None,
+) -> dict:
+    name = str(task.get("name") or f"grok-{idx + 1}")
+    prompt = str(task.get("prompt") or "").strip()
+    if not prompt:
+        return {"name": name, "ok": False, "error": "empty prompt"}
+
+    cwd = str(task.get("cwd") or os.getcwd())
+    if not Path(cwd).is_dir():
+        return {"name": name, "ok": False, "error": f"cwd does not exist: {cwd}"}
+
+    confined = bool(task.get("confined", payload_confined))
+    verify_cmd = task.get("verify_cmd", payload_verify_cmd)
+    if confined and find_bwrap() is None:
+        return {
+            "name": name,
+            "ok": False,
+            "error": "bwrap binary not found (fail-closed confinement)",
+            "confinement_receipt": {
+                "bwrap_bin": None,
+                "network_isolated": False,
+                "worktree_path": cwd,
+                "worktree_diff_sha256": None,
+                "verify_exit_code": None,
+                "scope_confined": False,
+            },
+        }
+
+    cmd = [ca, "-p", "--output-format", "json", "--model", model]
+    wt_name = ""
+    if action == "ask":
+        cmd.extend(["--mode=ask", "--trust"])
+    elif action == "plan":
+        cmd.extend(["--mode=plan", "--trust"])
+    elif action == "worktree":
+        git_chk = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        if git_chk.returncode != 0:
+            return {"name": name, "ok": False, "error": f"worktree action requires a git repo cwd (got {cwd})"}
+        raw_wt = str(task.get("worktree_name") or f"grok-{name}-{int(time.time()) % 10000}")
+        wt_name = SAFE_WT_RE.sub("-", raw_wt).strip("-")[:40] or f"grok-{idx + 1}"
+        cmd.extend(["-w", wt_name, "--force", "--trust"])
+    elif action == "resume":
+        sid = str(task.get("session_id") or "").strip()
+        if not sid:
+            return {"name": name, "ok": False, "error": "resume action requires session_id"}
+        cmd.extend(["--resume", sid, "--trust"])
+        if task.get("allow_write"):
+            cmd.append("--force")
+        else:
+            cmd.append("--mode=ask")
+    else:
+        return {"name": name, "ok": False, "error": f"unknown action: {action}"}
+
+    cmd.append(prompt)
+    t0 = time.perf_counter()
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        return {"name": name, "ok": False, "wall_s": round(time.perf_counter() - t0, 2), "error": f"timed out after {timeout_sec}s"}
+    except Exception as exc:
+        return {"name": name, "ok": False, "wall_s": round(time.perf_counter() - t0, 2), "error": str(exc)}
+
+    wall_s = round(time.perf_counter() - t0, 2)
+    raw_out = (proc.stdout or "").strip()
+    parsed = None
+    for line in reversed(raw_out.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                parsed = json.loads(line)
+                break
+            except Exception:
+                pass
+
+    if proc.returncode != 0 and not parsed:
+        return {
+            "name": name,
+            "ok": False,
+            "wall_s": wall_s,
+            "error": ((proc.stderr or raw_out) or f"exit {proc.returncode}")[:300],
+        }
+
+    result_text = str((parsed or {}).get("result") or raw_out)
+    usage = (parsed or {}).get("usage") or {}
+    rec = {
+        "name": name,
+        "ok": proc.returncode == 0 and not bool((parsed or {}).get("is_error")),
+        "wall_s": wall_s,
+        "api_ms": (parsed or {}).get("duration_api_ms"),
+        "session_id": (parsed or {}).get("session_id"),
+        "usage": {
+            "in": usage.get("inputTokens", 0),
+            "cache_read": usage.get("cacheReadTokens", 0),
+            "out": usage.get("outputTokens", 0),
+            "reason": usage.get("reasoningTokens", 0),
+        },
+        "result": result_text,
+    }
+
+    if action == "worktree" and wt_name:
+        repo_name = Path(git_chk.stdout.strip()).name
+        wt_path = Path.home() / ".cursor" / "worktrees" / repo_name / wt_name
+        if wt_path.is_dir():
+            st = subprocess.run(["git", "-C", str(wt_path), "status", "--short"], capture_output=True, text=True)
+            ds = subprocess.run(["git", "-C", str(wt_path), "diff", "--stat"], capture_output=True, text=True)
+            rec["worktree_path"] = str(wt_path)
+            rec["git_status"] = st.stdout.strip()[:400]
+            rec["diff_stat"] = ds.stdout.strip()[:400]
+            if confined:
+                vres = run_confined_verify(wt_path, str(verify_cmd or "git status --short"), timeout_sec)
+                rec["confinement_receipt"] = vres["confinement_receipt"]
+                if not vres["ok"]:
+                    rec["ok"] = False
+                    rec.setdefault(
+                        "error",
+                        vres.get("error")
+                        or f"confined verify failed (exit {vres['confinement_receipt'].get('verify_exit_code')})",
+                    )
+        elif confined:
+            rec["ok"] = False
+            rec.setdefault("error", f"worktree path not created for confined verify: {wt_path}")
+            rec["confinement_receipt"] = {
+                "bwrap_bin": find_bwrap(),
+                "network_isolated": False,
+                "worktree_path": str(wt_path),
+                "worktree_diff_sha256": None,
+                "verify_exit_code": None,
+                "scope_confined": False,
+            }
+    elif confined and verify_cmd:
+        vres = run_confined_verify(Path(cwd), str(verify_cmd), timeout_sec)
+        rec["confinement_receipt"] = vres["confinement_receipt"]
+        if not vres["ok"]:
+            rec["ok"] = False
+            rec.setdefault(
+                "error",
+                vres.get("error")
+                or f"confined verify failed (exit {vres['confinement_receipt'].get('verify_exit_code')})",
+            )
+
+    return rec
+
+
+def run_swarm(payload: dict) -> dict:
+    action = str(payload.get("action") or "ask").strip().lower()
+    if action not in ("ask", "plan", "worktree", "resume"):
+        return {"ok": False, "error": f"Invalid action '{action}' (expected ask|plan|worktree|resume)"}
+    try:
+        model = resolve_model(payload.get("model"))
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return {"ok": False, "error": "'tasks' must be a non-empty array of {name, prompt, ...}"}
+    tasks = tasks[:6]
+
+    payload_confined = bool(payload.get("confined", False))
+    payload_verify_cmd = payload.get("verify_cmd")
+    any_confined = any(
+        bool(t.get("confined", payload_confined)) if isinstance(t, dict) else payload_confined
+        for t in tasks
+    )
+    if any_confined and find_bwrap() is None:
+        fail_workers = [
+            {
+                "name": str((t if isinstance(t, dict) else {}).get("name") or f"grok-{i + 1}"),
+                "ok": False,
+                "error": "bwrap binary not found (fail-closed confinement)",
+                "confinement_receipt": {
+                    "bwrap_bin": None,
+                    "network_isolated": False,
+                    "worktree_path": str((t if isinstance(t, dict) else {}).get("cwd") or os.getcwd()),
+                    "worktree_diff_sha256": None,
+                    "verify_exit_code": None,
+                    "scope_confined": False,
+                },
+            }
+            for i, t in enumerate(tasks)
+        ]
+        return {
+            "ok": False,
+            "action": action,
+            "model": model,
+            "error": "bwrap binary not found (fail-closed confinement)",
+            "workers": fail_workers,
+        }
+
+    ca = find_cursor_agent()
+    if not ca:
+        return {"ok": False, "error": "cursor-agent binary not found"}
+
+    concurrency = max(1, min(6, int(payload.get("concurrency") or 4)))
+    timeout_sec = max(15, min(155, int(payload.get("timeout_sec") or 120)))
+    max_chars = max(500, min(8400, int(payload.get("max_chars") or 7800)))
+
+    t_wall0 = time.perf_counter()
+    results = [None] * len(tasks)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(concurrency, len(tasks))) as pool:
+        futs = {
+            pool.submit(
+                _run_one,
+                ca,
+                action,
+                model,
+                t if isinstance(t, dict) else {"prompt": str(t)},
+                timeout_sec,
+                i,
+                payload_confined,
+                payload_verify_cmd,
+            ): i
+            for i, t in enumerate(tasks)
+        }
+        for fut in concurrent.futures.as_completed(futs):
+            idx = futs[fut]
+            try:
+                results[idx] = fut.result()
+            except Exception as exc:
+                results[idx] = {"name": f"grok-{idx + 1}", "ok": False, "error": str(exc)}
+
+    wall_s = round(time.perf_counter() - t_wall0, 2)
+    sum_worker_s = round(sum(float(r.get("wall_s") or 0) for r in results if r), 2)
+    speedup = round(sum_worker_s / max(wall_s, 0.01), 2)
+
+    try:
+        TELEM_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(TELEM_PATH, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "action": action,
+                        "model": model,
+                        "workers": len(tasks),
+                        "wall_s": wall_s,
+                        "sum_worker_s": sum_worker_s,
+                        "speedup_x": speedup,
+                        "ok_count": sum(1 for r in results if r and r.get("ok")),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
+    per_worker_budget = max(350, (max_chars - 500) // max(len(results), 1))
+    for r in results:
+        if r and isinstance(r.get("result"), str) and len(r["result"]) > per_worker_budget:
+            r["result"] = r["result"][: per_worker_budget - 20] + "\n... [truncated]"
+
+    out = {
+        "ok": all(r and r.get("ok") for r in results),
+        "action": action,
+        "model": model,
+        "wall_s": wall_s,
+        "sum_worker_s": sum_worker_s,
+        "speedup_x": speedup,
+        "workers": results,
+    }
+    encoded = json.dumps(out, ensure_ascii=False, indent=2)
+    if len(encoded) > max_chars:
+        for r in results:
+            if r and isinstance(r.get("result"), str):
+                r["result"] = r["result"][: max(120, per_worker_budget // 2)] + "..."
+        encoded = json.dumps(out, ensure_ascii=False, indent=2)[:max_chars]
+    return {"_raw_text": encoded, **out}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Parallel Grok 4.7 Swarm Runner via cursor-agent")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("status", help="Check cursor-agent auth, Grok 4.7 models, and worktrees")
+    run_p = sub.add_parser("run", help="Run parallel swarm from --json-stdin")
+    run_p.add_argument("--json-stdin", action="store_true", required=True)
+    run_p.add_argument("--confined", action="store_true", help="Enable bwrap read-only/network-isolated verification")
+    run_p.add_argument("--verify-cmd", default=None, help="Verification command executed inside bwrap confinement")
+
+    wt_p = sub.add_parser("worktree", help="Run an isolated git-worktree Grok worker (optionally bwrap-confined)")
+    wt_p.add_argument("--prompt", required=True, help="Worker prompt")
+    wt_p.add_argument("--cwd", default=os.getcwd(), help="Repository cwd")
+    wt_p.add_argument("--worktree-name", default=None, help="Explicit worktree name")
+    wt_p.add_argument("--model", default="high", help="Grok 4.7 tier or explicit model")
+    wt_p.add_argument("--timeout-sec", type=int, default=120, help="Worker timeout seconds")
+    wt_p.add_argument("--confined", action="store_true", help="Enable bwrap read-only/network-isolated verification")
+    wt_p.add_argument("--verify-cmd", default=None, help="Verification command executed inside bwrap confinement")
+
+    args = parser.parse_args()
+    if args.cmd == "status":
+        return cmd_status()
+    if args.cmd == "run":
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": f"invalid JSON stdin: {exc}"}))
+            return 1
+        if args.confined:
+            payload["confined"] = True
+        if args.verify_cmd is not None:
+            payload["verify_cmd"] = args.verify_cmd
+        res = run_swarm(payload)
+        print(res.pop("_raw_text", json.dumps(res, indent=2)))
+        return 0 if res.get("ok") else 1
+    if args.cmd == "worktree":
+        task = {"name": "grok-1", "prompt": args.prompt, "cwd": args.cwd}
+        if args.worktree_name:
+            task["worktree_name"] = args.worktree_name
+        payload = {
+            "action": "worktree",
+            "model": args.model,
+            "timeout_sec": args.timeout_sec,
+            "confined": bool(args.confined),
+            "tasks": [task],
+        }
+        if args.verify_cmd is not None:
+            payload["verify_cmd"] = args.verify_cmd
+        res = run_swarm(payload)
+        print(res.pop("_raw_text", json.dumps(res, indent=2)))
+        return 0 if res.get("ok") else 1
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

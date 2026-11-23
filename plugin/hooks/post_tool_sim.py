@@ -34,6 +34,30 @@ def main():
         args = tool_call.get("args") or {}
         if tool_name == "run_command":
             preview = redact(str(args.get("CommandLine") or ""))[:180]
+        elif tool_name.endswith("_apply_edits"):
+            edits = args.get("edits")
+            if isinstance(edits, str):
+                try:
+                    edits = json.loads(edits)
+                except Exception:
+                    edits = []
+            if isinstance(edits, list) and edits:
+                paths = [str(e.get("path", "?")) for e in edits[:4] if isinstance(e, dict)]
+                preview = redact(f"apply_edits: {', '.join(paths)}")[:180]
+            else:
+                preview = "apply_edits"
+        elif tool_name.endswith("_run_checks"):
+            cmds = args.get("commands")
+            first = cmds[0] if isinstance(cmds, list) and cmds else ""
+            if isinstance(first, dict):
+                first = first.get("command", "")
+            preview = redact(f"run_checks: {first}")[:180]
+        elif tool_name.endswith("_batch_search"):
+            qs = args.get("queries")
+            qtypes = [str(q.get("type", "?")) for q in qs[:4] if isinstance(q, dict)] if isinstance(qs, list) else []
+            preview = redact(f"batch_search: {','.join(qtypes)}")[:180]
+        elif tool_name.endswith("_code_graph"):
+            preview = redact(f"code_graph: {args.get('mode', '')}:{args.get('target', '')}")[:180]
         else:
             preview = redact(f"{args.get('ServerName', '')}/{args.get('ToolName', '')}")[:180]
 

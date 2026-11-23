@@ -572,13 +572,26 @@ fn validate_safe(cmd: &str, args: &[String]) -> Result<(Kind, bool), String> {
         }
         "go" => {
             let sub = args.first().map(|s| s.as_str()).unwrap_or("");
-            if matches!(sub, "test" | "vet" | "list") {
-                Ok((Kind::GoTest, true))
+            if matches!(sub, "test" | "vet" | "list" | "build") {
+                Ok((Kind::GoTest, matches!(sub, "test" | "vet")))
             } else {
                 Err(format!("disallowed go subcommand: {}", sub))
             }
         }
         "pytest" => Ok((Kind::Pytest, true)),
+        "python3" | "python" => {
+            let f0 = args.first().map(|s| s.as_str()).unwrap_or("");
+            let mod_name = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            if f0 == "-m" {
+                match mod_name {
+                    "pytest" | "unittest" => Ok((Kind::Pytest, true)),
+                    "mypy" | "ruff" => Ok((Kind::Linter, true)),
+                    _ => Err(format!("disallowed {} -m module: {}", base, mod_name)),
+                }
+            } else {
+                Err(format!("disallowed {} invocation (only -m pytest|unittest|mypy|ruff allowed)", base))
+            }
+        }
         "npm" | "pnpm" | "yarn" => {
             let s0 = args.first().map(|s| s.as_str()).unwrap_or("");
             let s1 = args.get(1).map(|s| s.as_str()).unwrap_or("");

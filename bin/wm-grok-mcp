@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""wm-grok-mcp — 1-Tool Eager Stdio MCP Server for Parallel Grok 4.7 Swarms via Cursor CLI.
+
+Exposes a single compact MCP tool (`grok_dispatch`) over newline-delimited JSON-RPC 2.0
+(protocol 2024-11-05) so Neon / Hydrogen can fan out read-only audits, plans, or isolated
+git-worktree edits across Grok 4.7 workers without contending on local wm3 Gen3 stores.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict
+
+LOCAL_BIN = Path.home() / ".local" / "bin"
+
+
+def _find_cli(name: str) -> str:
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    cand = LOCAL_BIN / name
+    if cand.is_file():
+        return str(cand)
+    return str(Path(__file__).resolve().parent / name)
+
+
+def dispatch_tool(args: Dict[str, Any]) -> Dict[str, Any]:
+    action = str(args.get("action") or "status").strip().lower()
+    cli = _find_cli("wm-grok-swarm")
+
+    try:
+        if action == "status":
+            proc = subprocess.run([cli, "status"], capture_output=True, text=True, timeout=20)
+        else:
+            proc = subprocess.run(
+                [cli, "run", "--json-stdin"],
+                input=json.dumps(args),
+                capture_output=True,
+                text=True,
+                timeout=165,
+            )
+        text = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode != 0 and not text:
+            text = json.dumps({"ok": False, "error": f"wm-grok-swarm exited {proc.returncode}"})
+        return {"isError": proc.returncode != 0, "text": text}
+    except Exception as exc:
+        return {"isError": True, "text": json.dumps({"ok": False, "error": str(exc), "action": action})}
+
+
+TOOL_SCHEMA = {
+    "name": "grok_dispatch",
+    "description": (
+        "Dispatch 1-6 parallel Grok 4.7 (500K) workers via Cursor CLI (`ask`/`plan` read-only, "
+        "`worktree` isolated git-worktree edits, `resume` by session_id, or `status`). "
+        "Isolated from local wm3 Gen3 store."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["status", "ask", "plan", "worktree", "resume"],
+                "description": "Swarm mode: status | ask | plan | worktree | resume",
+            },
+            "tasks": {
+                "type": "array",
+                "maxItems": 6,
+                "description": "1-6 worker tasks to run concurrently",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "cwd": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "worktree_name": {"type": "string"},
+                        "allow_write": {"type": "boolean"},
+                        "confined": {"type": "boolean"},
+                        "verify_cmd": {"type": "string"},
+                    },
+                    "required": ["prompt"],
+                },
+            },
+            "model": {
+                "type": "string",
+                "description": "Grok 4.7 tier: low | medium | high (default) | xhigh, or explicit grok-4.7-*",
+            },
+            "concurrency": {"type": "integer", "minimum": 1, "maximum": 6},
+            "timeout_sec": {"type": "integer", "minimum": 15, "maximum": 150},
+            "max_chars": {"type": "integer", "minimum": 500, "maximum": 8400},
+            "confined": {
+                "type": "boolean",
+                "description": "Enforce bwrap read-only/network-isolated verification on worktree",
+            },
+            "verify_cmd": {
+                "type": "string",
+                "description": "Shell command executed inside bwrap confinement",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+
+def main() -> None:
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+        method = str(req.get("method") or "")
+        req_id = req.get("id")
+        if method.startswith("notifications/"):
+            continue
+
+        if method == "initialize":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "wm-grok-mcp", "version": "1.0.0"},
+                },
+            }
+        elif method == "tools/list":
+            resp = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": [TOOL_SCHEMA]}}
+        elif method == "tools/call":
+            params = req.get("params") or {}
+            args = params.get("arguments") or {}
+            res = dispatch_tool(args if isinstance(args, dict) else {})
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": res["text"]}],
+                    "isError": bool(res["isError"]),
+                },
+            }
+        else:
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+            }
+        sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

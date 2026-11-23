@@ -1,6 +1,9 @@
-# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v3.1.0 — Portable Tricameral Edition)
+# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v4.0.0 — Fused Turbo+Fast Edition)
 
-Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity CLI (`agy 1.5.14+`), Desktop 2.0, and IDE optimization suite focused on **KV/prefix-cache preservation, birth-time token compression, structural code-graph navigation, $0 local Tricameral CyberBrain micro-organs, latency reduction, and credit longevity**.
+Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity CLI (`agy 1.5.14+`), Desktop 2.0, and IDE optimization suite fusing `whitemagic-agy-kit` and `INK-Q/agy-fast` (MIT) into a single unified plugin:
+- **5-Tool Eager Stdio MCP (`whitemagic-agy-kit_fast`):** `batch_search` (auto-collapses lockfile diffs), `apply_edits` (safe unique line-drift auto-relocate + trailing-whitespace unique fallback + `wm-squeeze` inline `verify`), `read_slices`, `run_checks` (CoACT `wm-squeeze` compression + 300s git-aware cache in `compact` mode), and `code_graph` (`wm-codegraph` AST/call-graph).
+- **Unified Zero-Jitter `SessionStart` (`session_start_brief.py`):** Single `<2.6 KB` Turn-0 digest combining cached preflight brief + SIM ledger + Dream digest + compact workspace snapshot (suppressing `$HOME` noise).
+- **Deterministic `PreToolUse` Guards, `wm-squeeze v3`, `wm-handoff`, `Tricameral CyberBrain`, & SIM Memory.**
 
 Built from empirical offline forensics across `50` real sessions (`12,740` turns, `2.27B` input tokens) plus controlled 4-level live `agy -p` A/B benchmarks ([`benchmarks/RESULTS_2026-11-21.md`](./benchmarks/RESULTS_2026-11-21.md)) and designed strictly within Antigravity's documented extension interfaces (`plugin.json`, `hooks.json`, `mcp_config.json`, `rules/AGENTS.md`, `statusLine`, and `--model` / `--settings`).
 

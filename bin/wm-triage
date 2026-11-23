@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""
+wm-triage — 1-Shot Parallel Estate & Comms Triage (<5s, <=4500 bytes).
+
+Concurrently gathers:
+  1. Cached preflight & local watch state (PREFLIGHT_BRIEF.md, hosted-watch.state, inbox-cache, x402)
+  2. Live GitHub notifications & open PRs (`gh`, fail-open)
+  3. Newest 5 Sangha Whiteboard posts (`~/SharedWorkspace/board/*.md`)
+  4. WhiteMagic Gen3 session continuity (`wm3 session continuity --limit 3`, fail-open)
+"""
+
+import argparse
+import concurrent.futures
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+MAX_BYTES = 4500
+
+
+def _lane_cache(home: Path) -> str:
+    brief = home / "SharedWorkspace" / "PREFLIGHT_BRIEF.md"
+    lines = []
+    if brief.is_file():
+        age_m = (time.time() - brief.stat().st_mtime) / 60.0
+        stale = "STALE " if age_m >= 120.0 else ""
+        lines.append(f"Brief: {stale}{age_m:.0f}m old")
+        for ln in brief.read_text(encoding="utf-8", errors="replace").splitlines()[:6]:
+            s = ln.strip()
+            if s.startswith("> **Hosted") or s.startswith("> **Observed"):
+                lines.append(s.lstrip("> ").strip()[:160])
+    else:
+        lines.append("Brief: missing")
+
+    inbox_p = home / ".local" / "state" / "whitemagic" / "inbox-cache.json"
+    if inbox_p.is_file():
+        try:
+            ib = json.loads(inbox_p.read_text(encoding="utf-8"))
+            msgs = ib.get("messages") or ib.get("items") or []
+            lines.append(f"Inbox(cached): {len(msgs)} item(s)")
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
+def _lane_gh() -> str:
+    if not shutil.which("gh"):
+        return "gh: not installed"
+    out_parts = []
+    try:
+        p1 = subprocess.run(
+            ["gh", "api", "notifications?per_page=5", "--jq", '.[] | "\\(.reason) | \\(.repository.full_name) | \\(.subject.title[0:55])"'],
+            capture_output=True,
+            text=True,
+            timeout=3.5,
+        )
+        if p1.returncode == 0:
+            rows = [r.strip() for r in p1.stdout.splitlines() if r.strip()][:5]
+            out_parts.append("GH Notifs: " + (f"{len(rows)}" if rows else "0"))
+            out_parts.extend(f"  - {r}" for r in rows)
+        else:
+            out_parts.append(f"GH Notifs: err({p1.returncode})")
+    except Exception as exc:
+        out_parts.append(f"GH Notifs: {exc}")
+    return "\n".join(out_parts)
+
+
+def _lane_board(home: Path) -> str:
+    bdir = home / "SharedWorkspace" / "board"
+    if not bdir.is_dir():
+        return "Board: missing"
+    files = sorted(glob.glob(str(bdir / "*.md")), key=os.path.getmtime, reverse=True)[:5]
+    if not files:
+        return "Board: empty"
+    now = time.time()
+    rows = ["Board (newest 5):"]
+    for fp in files:
+        p = Path(fp)
+        age_h = (now - p.stat().st_mtime) / 3600.0
+        h1 = ""
+        try:
+            for ln in p.read_text(encoding="utf-8", errors="replace").splitlines()[:6]:
+                if ln.startswith("# "):
+                    h1 = ln[2:].strip()[:75]
+                    break
+        except Exception:
+            pass
+        rows.append(f"  - [{age_h:.1f}h] {p.stem[:42]}" + (f": {h1}" if h1 else ""))
+    return "\n".join(rows)
+
+
+def _lane_wm3(home: Path) -> str:
+    wm3 = shutil.which("wm3") or str(home / ".local" / "bin" / "wm3")
+    store = home / ".local" / "share" / "whitemagic" / "gen3"
+    if not Path(wm3).is_file() or not store.is_dir():
+        return "Continuity: wm3/store unavailable"
+    try:
+        p = subprocess.run(
+            [wm3, "--store", str(store), "session", "continuity", "--limit", "3"],
+            capture_output=True,
+            text=True,
+            timeout=3.8,
+        )
+        if p.returncode != 0:
+            return f"Continuity: exit {p.returncode}"
+        lines = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+        compact = []
+        for ln in lines:
+            if any(k in ln for k in ("Session Continuity", "Session ID:", "Title:", "Summary:", "Next Queue:")):
+                compact.append(ln[:140])
+        return "Continuity:\n  " + "\n  ".join(compact[:9]) if compact else "Continuity: (empty)"
+    except Exception as exc:
+        return f"Continuity: {exc}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="1-shot parallel estate & comms triage (<5s, <=4.5KB)")
+    parser.add_argument("--dry-run", action="store_true", help="Skip live gh/wm3 subprocesses")
+    args = parser.parse_args()
+
+    home = Path.home()
+    t0 = time.perf_counter()
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {
+            "cache": pool.submit(_lane_cache, home),
+            "board": pool.submit(_lane_board, home),
+        }
+        if not args.dry_run:
+            futs["gh"] = pool.submit(_lane_gh)
+            futs["wm3"] = pool.submit(_lane_wm3, home)
+        for k, fut in futs.items():
+            try:
+                results[k] = fut.result(timeout=4.5)
+            except Exception as exc:
+                results[k] = f"{k}: timeout/err ({exc})"
+
+    ms = int((time.perf_counter() - t0) * 1000)
+    header = f"=== WhiteMagic Estate Triage ({now_iso} | {ms}ms) ==="
+    sections = [
+        header,
+        results.get("cache", ""),
+        results.get("gh", "GH Notifs: (dry-run)"),
+        results.get("board", ""),
+        results.get("wm3", "Continuity: (dry-run)"),
+    ]
+    out = "\n\n".join(s for s in sections if s)
+    raw = out.encode("utf-8", errors="replace")
+    if len(raw) > MAX_BYTES:
+        out = raw[: MAX_BYTES - 16].decode("utf-8", errors="ignore") + "\n... [capped]"
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -19,8 +19,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
-BENCH_JS = HOME / ".gemini" / "config" / "plugins" / "agy-fast" / "dist" / "benchmark.mjs"
-BRAIN_DIR = HOME / ".gemini" / "antigravity-cli" / "brain"
+BENCH_JS = HOME / ".gemini" / "config" / "plugins" / "whitemagic-agy-kit" / "dist" / "benchmark.mjs"
+if not BENCH_JS.exists():
+    BENCH_JS = HOME / ".gemini" / "config" / "plugins" / "agy-fast" / "dist" / "benchmark.mjs"
+BRAIN_DIRS = [
+    HOME / ".gemini" / "antigravity-cli" / "brain",
+    HOME / ".gemini" / "antigravity" / "brain",
+]
 OUT_DIR = HOME / ".local" / "share" / "whitemagic" / "agy_benchmarks"
 SQUEEZE_STATS = HOME / ".local" / "share" / "whitemagic" / "wm_squeeze_stats.jsonl"
 CFG_JSON = HOME / ".gemini" / "config" / "config.json"
@@ -46,8 +51,12 @@ def parse_ts(v):
 
 
 def measure_extended_and_credits(recent=30, since=None):
+    all_logs = []
+    for bdir in BRAIN_DIRS:
+        if bdir.is_dir():
+            all_logs.extend(glob.glob(str(bdir / "*" / ".system_generated" / "logs" / "transcript.jsonl")))
     logs = sorted(
-        glob.glob(str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")),
+        all_logs,
         key=os.path.getmtime,
         reverse=True,
     )
@@ -132,7 +141,7 @@ def measure_extended_and_credits(recent=30, since=None):
                         seen_reads.add(rkey)
                     elif name == "run_command":
                         total_cmds += 1
-                    elif name in ("edit_file", "write_file", "mcp_agy-fast_fast_apply_edits") and not first_edit:
+                    elif name in ("edit_file", "write_file", "mcp_agy-fast_fast_apply_edits", "mcp_whitemagic-agy-kit_fast_apply_edits") and not first_edit:
                         first_edit = True
                         pre_edit_kbs.append(cum_bytes / 1024.0)
                 if rf_turn >= 4:

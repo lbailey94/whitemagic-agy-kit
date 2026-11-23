@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""
+wm-vps — Strictly Read-Only Bounded VPS Diagnostic CLI over Multiplexed SSH.
+
+Runs fixed, non-interactive read-only commands on `Host whitemagic` (`ssh -n -o BatchMode=yes`)
+using SSH ControlMaster multiplexing (~15ms/hop) and caps output <= 4096 bytes to eliminate
+heredoc disk spills (`output.txt`). Zero remote mutations, zero sudo, zero user-supplied shell args.
+"""
+
+import argparse
+import subprocess
+import sys
+
+MAX_BYTES = 4096
+
+FIXED_COMMANDS = {
+    "health": (
+        "hostname -s; uptime -p; cut -d' ' -f1-3 /proc/loadavg; "
+        "awk '/^MemTotal:|^MemAvailable:/{print}' /proc/meminfo"
+    ),
+    "services": (
+        "systemctl list-units --type=service --state=running --no-pager --no-legend "
+        "| awk '{print $1,$3,$4}' | head -n 40"
+    ),
+    "logs": "journalctl -n 25 --no-pager -o short-iso | head -c 3500",
+    "disk": "df -P -h / /var /home",
+    "all": (
+        "{ printf '==health\\n'; hostname -s; uptime -p; cut -d' ' -f1-3 /proc/loadavg; "
+        "awk '/^MemTotal:|^MemAvailable:/{print}' /proc/meminfo; "
+        "printf '==services\\n'; systemctl list-units --type=service --state=running --no-pager --no-legend "
+        "| awk '{print $1,$3,$4}' | head -n 25; "
+        "printf '==disk\\n'; df -P -h / /var /home; "
+        "printf '==logs\\n'; journalctl -n 12 --no-pager -o short-iso; } | head -c 3500"
+    ),
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Strictly read-only bounded VPS probe over multiplexed SSH (Host whitemagic)"
+    )
+    parser.add_argument(
+        "subcommand",
+        nargs="?",
+        default="health",
+        choices=sorted(FIXED_COMMANDS.keys()),
+        help="Fixed read-only probe to run (default: health)",
+    )
+    parser.add_argument("--host", default="whitemagic", choices=["whitemagic"], help="Target SSH host alias")
+    parser.add_argument("--timeout", type=int, default=10, help="SSH timeout in seconds (1-25, default 10)")
+    args = parser.parse_args()
+
+    timeout_s = max(1, min(25, args.timeout))
+    remote_cmd = FIXED_COMMANDS[args.subcommand]
+    ssh_cmd = [
+        "ssh",
+        "-n",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={min(timeout_s, 6)}",
+        args.host,
+        remote_cmd,
+    ]
+    try:
+        proc = subprocess.run(
+            ssh_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_s,
+        )
+        raw = proc.stdout or b""
+        if len(raw) > MAX_BYTES:
+            raw = raw[: MAX_BYTES - 7] + b"\n[cut]\n"
+        sys.stdout.write(raw.decode("utf-8", errors="replace"))
+        if raw and not raw.endswith(b"\n"):
+            sys.stdout.write("\n")
+        return proc.returncode
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"wm-vps: ssh {args.host} ({args.subcommand}) timed out after {timeout_s}s\n")
+        return 124
+    except Exception as exc:
+        sys.stderr.write(f"wm-vps: error: {exc}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

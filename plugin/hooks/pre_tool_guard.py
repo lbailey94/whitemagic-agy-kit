@@ -187,6 +187,12 @@ def is_safe_squeezable(cmd_base, cmd_args):
     if cmd_base == "pytest":
         return True
 
+    if cmd_base == "go":
+        return (cmd_args[0] if cmd_args else "") in ("test", "vet", "list", "build")
+
+    if cmd_base in ("python3", "python"):
+        return len(cmd_args) >= 2 and cmd_args[0] == "-m" and cmd_args[1] in ("pytest", "unittest", "mypy", "ruff")
+
     if cmd_base in ("npm", "pnpm", "yarn"):
         s0 = cmd_args[0] if cmd_args else ""
         s1 = cmd_args[1] if len(cmd_args) > 1 else ""
@@ -233,6 +239,10 @@ def maybe_squeeze_command(cmd_line):
         return None
     s = (cmd_line or "").strip()
     if not s or "wm-squeeze" in s:
+        return None
+    # Strip harmless trailing 2>&1 (wm-squeeze already merges stdout + stderr)
+    s = re.sub(r"\s+2>&1\s*$", "", s).strip()
+    if not s:
         return None
 
     cwd_arg = None
@@ -432,6 +442,50 @@ def handle_whitemagic_mcp(tool_name, args):
     return {"decision": "allow"}
 
 
+def handle_manage_task(args, payload):
+    """Anti-poll guard: deny >=3 consecutive manage_task(status) polls on the same TaskId within 12 steps."""
+    if os.environ.get("WM_POLL_GUARD_OFF") == "1":
+        return {"decision": "allow"}
+    action = str(args.get("Action") or "").strip().lower()
+    task_id = str(args.get("TaskId") or "").strip()
+    conv_id = str(payload.get("conversationId") or "")
+    step_idx = int(payload.get("stepIdx") or 0)
+    if action != "status" or not task_id or not conv_id:
+        return {"decision": "allow"}
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        pf = STATE_DIR / f"poll_{re.sub(r'[^a-zA-Z0-9_-]', '', conv_id)[:20]}.json"
+        state = {}
+        if pf.is_file():
+            try:
+                state = json.loads(pf.read_text(encoding="utf-8"))
+            except Exception:
+                state = {}
+        entry = state.get(task_id) or {"count": 0, "last_step": -999}
+        prev_step = int(entry.get("last_step", -999))
+        cnt = int(entry.get("count", 0))
+        if step_idx > 0 and (step_idx - prev_step) <= 12 and step_idx > prev_step:
+            cnt += 1
+        else:
+            cnt = 1
+        state[task_id] = {"count": cnt, "last_step": step_idx}
+        if len(state) > 32:
+            items = sorted(state.items(), key=lambda kv: kv[1].get("last_step", 0))[-24:]
+            state = dict(items)
+        pf.write_text(json.dumps(state), encoding="utf-8")
+        if cnt >= 3:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"[Anti-Poll Guard] Checked status of {task_id} {cnt} times within 12 steps. "
+                    "Stop polling in a loop — end your turn or do other work; background tasks notify you automatically on completion."
+                ),
+            }
+    except Exception:
+        pass
+    return {"decision": "allow"}
+
+
 def main():
     if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
         emit({"decision": "allow"})
@@ -478,6 +532,11 @@ def main():
     # 3. read_file anti-bloat & cache-cliff guard
     if tool_name == "read_file":
         emit(handle_read_file(args, payload))
+        return
+
+    # 3b. manage_task(status) anti-poll loop breaker
+    if tool_name == "manage_task":
+        emit(handle_manage_task(args, payload))
         return
 
     # 4. WhiteMagic MCP auto-budget enforcement
