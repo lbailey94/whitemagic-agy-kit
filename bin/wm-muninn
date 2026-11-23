@@ -177,8 +177,8 @@ def main() -> None:
     try:
         engine = resolve_engine_bin()
         m_w = resolve_spore(
-            ["muninn4_school_v2_s3.tm7b", "muninn4_gpu_school_s3.tm7b", "muninn4_wso_school_grad.tm7b", "muninn4_wso_plateau.tm7b"],
-            "Muninn-4",
+            ["muninn5_clean_school_v3_s3.tm7b", "muninn5_clean_school_s3.tm7b", "muninn4_school_v2_s3.tm7b", "muninn4_gpu_school_s3.tm7b", "muninn4_wso_school_grad.tm7b", "muninn4_wso_plateau.tm7b"],
+            "Muninn-5 / Muninn-4",
             "ravens",
         )
     except FileNotFoundError as exc:
@@ -187,8 +187,8 @@ def main() -> None:
 
     try:
         h_w: Path | None = resolve_spore(
-            ["huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"],
-            "Huginn-1",
+            ["huginn2_clean_school_s3.tm7b", "huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"],
+            "Huginn-2 / Huginn-1",
             "huginn",
         )
     except FileNotFoundError:

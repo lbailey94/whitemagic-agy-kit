@@ -70,7 +70,7 @@ TOOL_SCHEMA = {
     "name": "tricameral_dispatch",
     "description": (
         "Dispatch $0 local Safe-Rust Tricameral CyberBrain micro-organs "
-        "(Huginn-1 S0, Muninn-4 S1, Valkyrie-M3 S2) for routing, 6D recall reranking, "
+        "(Huginn-2 S0, Muninn-5 S1, Valkyrie-M3 S2) for routing, 6D recall reranking, "
         "Sutra glyphing, Kekkai security vetoes, neural state compression, and .hms session holograms."
     ),
     "inputSchema": {

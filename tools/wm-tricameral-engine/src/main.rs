@@ -3313,12 +3313,15 @@ fn main() {
     let spec_k: usize = find_arg(&args, "--spec-k")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let spec_draft_shells: usize = find_arg(&args, "--spec-draft-shells")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    let draft_weights_path = find_arg(&args, "--draft-weights");
+    let spec_draft_shells_opt: Option<usize> = find_arg(&args, "--spec-draft-shells")
+        .and_then(|s| s.parse().ok());
     let spec_draft_r: usize = find_arg(&args, "--spec-draft-r")
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
+    let spec_margin_thresh: f32 = find_arg(&args, "--spec-margin-thresh")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if draft_weights_path.is_some() { 1.2 } else { 2.5 });
     let prefill_chunk: usize = find_arg(&args, "--prefill-chunk")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1)
@@ -3455,7 +3458,24 @@ fn main() {
     let active_shells: usize = requested_shells
         .unwrap_or(bundle.cfg.n_shells)
         .clamp(1, bundle.cfg.n_shells);
-    let i8_prep_ms = if spec_k > 0 {
+    let draft_bundle_opt: Option<MuninnBundle> = if spec_k > 0 {
+        draft_weights_path.map(|dp| {
+            let db = load_tm7b_v3(dp, spec_draft_shells_opt);
+            assert_eq!(
+                db.cfg.vocab_size, bundle.cfg.vocab_size,
+                "Cross-organ --draft-weights vocab_size mismatch ({} vs {})",
+                db.cfg.vocab_size, bundle.cfg.vocab_size
+            );
+            assert_eq!(
+                db.tok.id_to_piece, bundle.tok.id_to_piece,
+                "Cross-organ --draft-weights tokenizer mismatch! Both organs must share the exact same tokenizer."
+            );
+            db
+        })
+    } else {
+        None
+    };
+    let i8_prep_ms = if spec_k > 0 && draft_bundle_opt.is_none() {
         let t_i8 = Instant::now();
         build_draft_tmac_mirrors(&mut bundle);
         t_i8.elapsed().as_secs_f64() * 1000.0
@@ -4045,18 +4065,26 @@ fn main() {
     let mut dummy_diff = 0i32;
     let mut last_logits = Vec::new();
     let use_spec = spec_k > 0 && temperature <= 0.0 && rep_penalty <= 1.0 && n_gen > 0;
-    let draft_shells = spec_draft_shells.clamp(1, active_shells);
-    let draft_r = spec_draft_r.clamp(1, r_loops_gen);
-    let draft_core_slots = draft_r * bundle.cfg.n_core_blocks;
+    let draft_bundle_ref: &MuninnBundle = draft_bundle_opt.as_ref().unwrap_or(&bundle);
+    let use_draft_mirror = draft_bundle_opt.is_none();
+    let draft_shells = spec_draft_shells_opt
+        .unwrap_or(if draft_bundle_opt.is_some() { draft_bundle_ref.cfg.n_shells } else { 1 })
+        .clamp(1, draft_bundle_ref.cfg.n_shells);
+    let draft_r = if draft_bundle_opt.is_some() {
+        spec_draft_r.clamp(1, 8)
+    } else {
+        spec_draft_r.clamp(1, r_loops_gen)
+    };
+    let draft_core_slots = draft_r * draft_bundle_ref.cfg.n_core_blocks;
     let mut rt_draft_opt = if use_spec {
         let mut rtd = MuninnRuntimeState::new(
-            &bundle.cfg,
+            &draft_bundle_ref.cfg,
             draft_r,
             gen_ids.len() + soft_prompt_vecs.len() + n_gen + spec_k + 4,
         );
         if let Some(p) = load_state_path {
-            if draft_r == r_loops_gen {
-                let _ = rtd.load_hologram(p, &bundle.cfg);
+            if draft_bundle_opt.is_none() && draft_r == r_loops_gen {
+                let _ = rtd.load_hologram(p, &draft_bundle_ref.cfg);
             }
         }
         Some(rtd)
@@ -4072,8 +4100,8 @@ fn main() {
         );
         if let Some(ref mut rtd) = rt_draft_opt {
             let _ = forward_batch_k(
-                arch, &bundle, &[gen_ids[0]], &[0], mac_opt.as_deref(),
-                rtd, draft_shells, true, true, false, LogitsMode::None,
+                arch, draft_bundle_ref, &[gen_ids[0]], &[0], mac_opt.as_deref(),
+                rtd, draft_shells, true, use_draft_mirror, false, LogitsMode::None,
             );
         }
         let mut sp_i = 0usize;
@@ -4084,10 +4112,12 @@ fn main() {
                 None, &mut rt, active_shells, true, false, false, LogitsMode::None,
             );
             if let Some(ref mut rtd) = rt_draft_opt {
-                let _ = forward_batch_k_ext(
-                    arch, &bundle, &[], &[], Some(&soft_prompt_vecs[sp_i..sp_end]),
-                    None, rtd, draft_shells, true, true, false, LogitsMode::None,
-                );
+                if draft_bundle_ref.cfg.d_model == bundle.cfg.d_model {
+                    let _ = forward_batch_k_ext(
+                        arch, draft_bundle_ref, &[], &[], Some(&soft_prompt_vecs[sp_i..sp_end]),
+                        None, rtd, draft_shells, true, use_draft_mirror, false, LogitsMode::None,
+                    );
+                }
             }
             sp_i = sp_end;
         }
@@ -4112,8 +4142,8 @@ fn main() {
             if total > 1 {
                 let all_prev: Vec<u32> = (1..total).map(|idx| gen_ids[idx - 1]).collect();
                 let _ = forward_batch_k(
-                    arch, &bundle, &gen_ids[1..total], &all_prev, None,
-                    rtd, draft_shells, true, true, false, LogitsMode::None,
+                    arch, draft_bundle_ref, &gen_ids[1..total], &all_prev, None,
+                    rtd, draft_shells, true, use_draft_mirror, false, LogitsMode::None,
                 );
             }
         }
@@ -4148,14 +4178,14 @@ fn main() {
                 let all_prev: Vec<u32> = (0..total).map(|idx| if idx > 0 { gen_ids[idx - 1] } else { 0 }).collect();
                 let _ = forward_batch_k(
                     arch,
-                    &bundle,
+                    draft_bundle_ref,
                     &gen_ids,
                     &all_prev,
                     mac_opt.as_deref(),
                     rtd,
                     draft_shells,
                     true,
-                    true,
+                    use_draft_mirror,
                     false,
                     LogitsMode::None,
                 );
@@ -4186,14 +4216,14 @@ fn main() {
                 let all_prev: Vec<u32> = (0..total).map(|idx| if idx > 0 { gen_ids[idx - 1] } else { 0 }).collect();
                 let _ = forward_batch_k(
                     arch,
-                    &bundle,
+                    draft_bundle_ref,
                     &gen_ids,
                     &all_prev,
                     mac_opt.as_deref(),
                     rtd,
                     draft_shells,
                     true,
-                    true,
+                    use_draft_mirror,
                     false,
                     LogitsMode::None,
                 );
@@ -4254,13 +4284,14 @@ fn main() {
 
             if let Some((ptok, pprev)) = pending_draft_tok.take() {
                 let _ = forward_batch_k(
-                    arch, &bundle, &[ptok], &[pprev], None, rtd,
-                    draft_shells, true, true, false, LogitsMode::None,
+                    arch, draft_bundle_ref, &[ptok], &[pprev], None, rtd,
+                    draft_shells, true, use_draft_mirror, false, LogitsMode::None,
                 );
             }
 
-            // 1. Draft up to `cur_k` speculative tokens on `rtd` with Margin-Gated Early Stop (`d_margin < 2.5`)
+            // 1. Draft up to `cur_k` speculative tokens on `rtd` with Margin-Gated Early Stop
             let base_pos = rt.pos;
+            let draft_base_pos = rtd.pos;
             let mut verify_toks: Vec<u32> = Vec::with_capacity(cur_k + 1);
             let mut verify_prevs: Vec<u32> = Vec::with_capacity(cur_k + 1);
             verify_toks.push(t0_tok);
@@ -4285,8 +4316,8 @@ fn main() {
                 let mut cur_prev = prev_before_t0;
                 for _ in 0..cur_k {
                     let (mut dlgs, _) = forward_batch_k(
-                        arch, &bundle, &[cur_tok], &[cur_prev], None, rtd,
-                        draft_shells, true, true, false, LogitsMode::LastOnly,
+                        arch, draft_bundle_ref, &[cur_tok], &[cur_prev], None, rtd,
+                        draft_shells, true, use_draft_mirror, false, LogitsMode::LastOnly,
                     );
                     draft_snaps.push(rtd.snapshot_deltas_slots(draft_core_slots));
                     let (d_next, d_margin) = argmax_and_margin(&dlgs.pop().flatten().unwrap_or_default());
@@ -4294,7 +4325,7 @@ fn main() {
                     verify_prevs.push(cur_tok);
                     cur_prev = cur_tok;
                     cur_tok = d_next;
-                    if (stop_on_eos && eos_id == Some(d_next)) || d_margin < 2.5 {
+                    if (stop_on_eos && eos_id == Some(d_next)) || d_margin < spec_margin_thresh {
                         break;
                     }
                 }
@@ -4364,22 +4395,22 @@ fn main() {
             if used_ngram {
                 let _ = forward_batch_k(
                     arch,
-                    &bundle,
+                    draft_bundle_ref,
                     &verify_toks[..emit_count],
                     &verify_prevs[..emit_count],
                     None,
                     rtd,
                     draft_shells,
                     true,
-                    true,
+                    use_draft_mirror,
                     false,
                     LogitsMode::None,
                 );
             } else if accepted_drafts < n_drafted {
                 rtd.restore_to_pos(
-                    base_pos + emit_count,
+                    draft_base_pos + emit_count,
                     &draft_snaps[emit_count - 1],
-                    bundle.cfg.d_model,
+                    draft_bundle_ref.cfg.d_model,
                 );
             } else {
                 let last_idx = n_drafted;
@@ -4478,6 +4509,7 @@ fn main() {
         "prefill_chunk": prefill_chunk,
         "soft_prompt_tokens": soft_prompt_vecs.len(),
         "spec_k": if use_spec { spec_k } else { 0 },
+        "draft_weights": draft_weights_path.unwrap_or(""),
         "spec_draft_shells": draft_shells,
         "spec_draft_r": draft_r,
         "spec_rounds": spec_rounds,

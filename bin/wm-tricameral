@@ -156,9 +156,9 @@ def main() -> None:
         sys.stderr.write(f"wm-tricameral: {exc}\n")
         sys.exit(2)
 
-    h_w = find_optional_spore(["huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"])
-    m_w = find_optional_spore(["muninn4_school_v2_s3.tm7b", "muninn4_gpu_school_s3.tm7b", "muninn4_wso_school_grad.tm7b", "muninn4_wso_plateau.tm7b"])
-    v_w = find_optional_spore(["valkyrie_m3_leg2_school_s3.tm7b", "valkyrie_m3_leg2_wsd_final.tm7b", "valkyrie_m3_full_wsd_final.tm7b"])
+    h_w = find_optional_spore(["huginn2_clean_school_s3.tm7b", "huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"])
+    m_w = find_optional_spore(["muninn5_clean_school_v3_s3.tm7b", "muninn5_clean_school_s3.tm7b", "muninn4_school_v2_s3.tm7b", "muninn4_gpu_school_s3.tm7b", "muninn4_wso_school_grad.tm7b", "muninn4_wso_plateau.tm7b"])
+    v_w = find_optional_spore(["valkyrie_m3_1B_school_v40_s3.tm7b", "valkyrie_m3_1B_fullcore_rlvr_s3.tm7b", "valkyrie_m3_1B_school_v35_s3.tm7b", "valkyrie_m3_leg2b_wsd_final.tm7b", "valkyrie_m3_leg2_school_s3.tm7b", "valkyrie_m3_leg2_wsd_final.tm7b"])
 
     if h_w is None:
         sys.stderr.write(f"wm-tricameral: Huginn-1 spore missing in {MODELS_DIR}. Run: wm-models pull huginn\n")
@@ -191,14 +191,14 @@ def main() -> None:
 
     task_prompt = args.query if ("[AST]" in args.query) else f"[USR] {args.query}\n[AST]"
     if tier == "S2" and v_w is not None:
-        e_row = run_one(engine, v_w, task_prompt, r_loops=2, shells=2, max_new=args.max_new)
+        e_row = run_one(engine, v_w, task_prompt, r_loops=4, shells=3, max_new=args.max_new)
         organ = f"Valkyrie-M3 ({v_w.name})"
     elif tier in ("S1", "S2") and m_w is not None:
         e_row = run_one(engine, m_w, task_prompt, r_loops=2, shells=3, max_new=args.max_new, sock_path=MUNINN_SOCK)
-        organ = f"Muninn-4 ({m_w.name})"
+        organ = f"Muninn ({m_w.name})"
     else:
         e_row = run_one(engine, h_w, task_prompt, r_loops=2, shells=3, max_new=args.max_new, sock_path=HUGINN_SOCK)
-        organ = f"Huginn-1 ({h_w.name})"
+        organ = f"Huginn ({h_w.name})"
 
     print(json.dumps({
         "routed_tier": tier,

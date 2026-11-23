@@ -58,7 +58,7 @@ def _model_search_dirs() -> List[Path]:
 
 
 def resolve_default_huginn_spore() -> Path:
-    names = ["huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"]
+    names = ["huginn2_clean_school_s3.tm7b", "huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"]
     for d in _model_search_dirs():
         for nm in names:
             p = d / nm
