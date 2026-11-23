@@ -81,6 +81,8 @@ TOOL_SCHEMA = {
                         "allow_write": {"type": "boolean"},
                         "confined": {"type": "boolean"},
                         "verify_cmd": {"type": "string"},
+                        "sign_receipt": {"type": "boolean"},
+                        "sign_alg": {"type": "string", "enum": ["auto", "hmac-sha256", "ed25519"]},
                     },
                     "required": ["prompt"],
                 },
@@ -99,6 +101,19 @@ TOOL_SCHEMA = {
             "verify_cmd": {
                 "type": "string",
                 "description": "Shell command executed inside bwrap confinement",
+            },
+            "sign_receipt": {
+                "type": "boolean",
+                "description": "Sign confinement_receipt (fail-closed if signing key missing/invalid)",
+            },
+            "sign_alg": {
+                "type": "string",
+                "enum": ["auto", "hmac-sha256", "ed25519"],
+                "description": "Cryptographic signature algorithm for confinement_receipt",
+            },
+            "receipt_log": {
+                "type": "string",
+                "description": "Optional append-only JSONL ledger path for signed confinement receipts",
             },
         },
         "required": ["action"],

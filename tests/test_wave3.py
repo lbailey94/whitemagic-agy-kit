@@ -606,6 +606,309 @@ def test_bwrap_confinement():
             finally:
                 srv.close()
 
+            # 2d) External worktree backed by a /tmp repo ro-binds /tmp/.git safely
+            tmp_repo = Path(tempfile.mkdtemp(prefix="wm-bwrap-tmp-git-", dir="/tmp")).resolve()
+            ext_parent = Path(tempfile.mkdtemp(prefix="wm-bwrap-ext-wt-", dir=str(cache_dir)))
+            ext_wt = ext_parent / "wt1"
+            try:
+                subprocess.run(["git", "init", "-q"], cwd=str(tmp_repo), check=True)
+                subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=str(tmp_repo), check=True)
+                subprocess.run(["git", "config", "user.name", "Test"], cwd=str(tmp_repo), check=True)
+                (tmp_repo / "README.md").write_text("tmp-repo\n", encoding="utf-8")
+                subprocess.run(["git", "add", "README.md"], cwd=str(tmp_repo), check=True)
+                subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(tmp_repo), check=True)
+                subprocess.run(["git", "-C", str(tmp_repo), "worktree", "add", "-q", str(ext_wt)], check=True)
+
+                res_tmp_git = swarm_mod.run_confined_verify(
+                    ext_wt,
+                    "git status --short && git rev-parse --is-inside-work-tree",
+                    30,
+                )
+                rcpt_tmp = res_tmp_git.get("confinement_receipt", {})
+                tmp_git_dir = str((tmp_repo / ".git").resolve())
+                bflags = rcpt_tmp.get("bwrap_flags", [])
+                has_ro_bind = any(
+                    bflags[i] == "--ro-bind" and bflags[i + 1] == tmp_git_dir
+                    for i in range(len(bflags) - 1)
+                )
+                check(
+                    "bwrap ro-binds external /tmp parent .git for git status in worktree",
+                    res_tmp_git.get("ok") is True
+                    and rcpt_tmp.get("verify_exit_code") == 0
+                    and "true" in (rcpt_tmp.get("verify_stdout_tail") or "")
+                    and has_ro_bind,
+                    detail=rcpt_tmp.get("verify_stderr_tail", ""),
+                )
+
+                probe_escape = Path(tmp_git_dir) / "ro_escape_probe"
+                res_ro_probe = swarm_mod.run_confined_verify(
+                    ext_wt,
+                    f"touch '{probe_escape}'",
+                    30,
+                )
+                check(
+                    "bwrap blocks writes to ro-bound /tmp parent .git directory",
+                    res_ro_probe.get("ok") is False
+                    and res_ro_probe.get("confinement_receipt", {}).get("verify_exit_code", 0) != 0
+                    and not probe_escape.exists(),
+                )
+            finally:
+                subprocess.run(
+                    ["git", "-C", str(tmp_repo), "worktree", "remove", "--force", str(ext_wt)],
+                    capture_output=True,
+                )
+                shutil.rmtree(ext_parent, ignore_errors=True)
+                shutil.rmtree(tmp_repo, ignore_errors=True)
+
+
+def test_signed_confinement_receipts():
+    print("\n7. Signed Causal Provenance Receipts (wm-confinement-receipt/1.1):")
+    import base64
+    import importlib.machinery
+    import importlib.util
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    # 7a) wm-grok-mcp schema exposes sign_receipt, sign_alg, receipt_log
+    gmcp_in = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
+    p_gmcp = subprocess.run([str(LOCAL_BIN / "wm-grok-mcp")], input=gmcp_in, capture_output=True, text=True)
+    glines = [json.loads(ln) for ln in p_gmcp.stdout.splitlines() if ln.strip()]
+    schema = glines[0]["result"]["tools"][0]["inputSchema"]
+    top_props = schema.get("properties", {})
+    task_props = top_props.get("tasks", {}).get("items", {}).get("properties", {})
+    check(
+        "wm-grok-mcp schema exposes sign_receipt, sign_alg, receipt_log",
+        p_gmcp.returncode == 0
+        and {"sign_receipt", "sign_alg", "receipt_log"}.issubset(top_props.keys())
+        and top_props["sign_alg"].get("enum") == ["auto", "hmac-sha256", "ed25519"]
+        and {"sign_receipt", "sign_alg"}.issubset(task_props.keys()),
+    )
+
+    swarm_path = str(KIT / "bin" / "wm-grok-swarm")
+    loader = importlib.machinery.SourceFileLoader("wm_grok_swarm_signed_mod", swarm_path)
+    spec = importlib.util.spec_from_loader("wm_grok_swarm_signed_mod", loader)
+    swarm_mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(swarm_mod)
+
+    env_keys = (
+        "WM_CONFINEMENT_HMAC_KEY",
+        "WM_CONFINEMENT_HMAC_KEY_FILE",
+        "WM_CONFINEMENT_ED25519_KEY_FILE",
+        "WM_CONFINEMENT_ED25519_PUBKEY_FILE",
+        "WM_CONFINEMENT_SIGN",
+        "WM_CONFINEMENT_RECEIPT_LOG",
+    )
+    saved_env = {k: os.environ.get(k) for k in env_keys}
+
+    def _clear_receipt_env():
+        for k in env_keys:
+            os.environ.pop(k, None)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            wt = td_path / "wt"
+            wt.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=str(wt), check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(wt), check=True)
+            (wt / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=str(wt), check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(wt), check=True)
+
+            # 7b) Fail-closed when signing requested without key (run_confined_verify & run_swarm & ed25519)
+            _clear_receipt_env()
+            fc_no_key = swarm_mod.run_confined_verify(wt, "echo nope", 15, sign_receipt=True)
+            os.environ["WM_CONFINEMENT_SIGN"] = "1"
+            fc_env_no_key = swarm_mod.run_confined_verify(wt, "echo nope", 15)
+            fc_swarm_no_key = swarm_mod.run_swarm(
+                {
+                    "action": "worktree",
+                    "confined": True,
+                    "sign_receipt": True,
+                    "verify_cmd": "echo nope",
+                    "tasks": [{"name": "w1", "prompt": "noop", "cwd": str(wt)}],
+                }
+            )
+            _clear_receipt_env()
+            os.environ["WM_CONFINEMENT_HMAC_KEY"] = "hmac-only-key"
+            fc_ed_no_key = swarm_mod.run_confined_verify(wt, "echo nope", 15, sign_alg="ed25519")
+            _clear_receipt_env()
+            os.environ["WM_CONFINEMENT_HMAC_KEY_FILE"] = str(td_path / "missing.key")
+            fc_bad_file = swarm_mod.run_confined_verify(wt, "echo nope", 15)
+            check(
+                "fail-closed when signing requested without key or invalid key file",
+                not fc_no_key.get("ok")
+                and fc_no_key.get("confinement_receipt", {}).get("receipt_version") == "wm-confinement-receipt/1.1"
+                and fc_no_key.get("confinement_receipt", {}).get("signature_alg") is None
+                and fc_no_key.get("confinement_receipt", {}).get("signature_b64") is None
+                and not fc_env_no_key.get("ok")
+                and not fc_swarm_no_key.get("ok")
+                and fc_swarm_no_key.get("workers", [{}])[0].get("confinement_receipt", {}).get("signature_b64") is None
+                and not fc_ed_no_key.get("ok")
+                and not fc_bad_file.get("ok"),
+            )
+
+            # 7c) Canonical HMAC-SHA256 signing & tamper detection (raw, hex:, base64:)
+            _clear_receipt_env()
+            raw_secret = b"\x11\x22\x33\x44hmac-test-secret-key-32bytes!!"
+            for label, env_val in (
+                ("utf8", "test-utf8-hmac-secret"),
+                ("hex", "hex:" + raw_secret.hex()),
+                ("base64", "base64:" + base64.b64encode(raw_secret).decode("ascii")),
+            ):
+                os.environ["WM_CONFINEMENT_HMAC_KEY"] = env_val
+                res_hmac = swarm_mod.run_confined_verify(wt, "echo signed-ok", 20)
+                rcpt = res_hmac.get("confinement_receipt", {})
+                v_ok, v_msg = swarm_mod.verify_confinement_receipt(rcpt)
+                check(
+                    f"HMAC-SHA256 sign + verify ({label}) with full v1.1 fields",
+                    res_hmac.get("ok") is True
+                    and v_ok is True
+                    and rcpt.get("receipt_version") == "wm-confinement-receipt/1.1"
+                    and str(rcpt.get("issued_at_utc") or "").endswith("Z")
+                    and len(str(rcpt.get("verify_cmd_sha256") or "")) == 64
+                    and isinstance(rcpt.get("bwrap_flags"), list)
+                    and "--unshare-net" in rcpt.get("bwrap_flags", [])
+                    and rcpt.get("signature_alg") == "hmac-sha256"
+                    and bool(rcpt.get("signature_b64")),
+                    detail=v_msg,
+                )
+
+            # Tamper detection across critical fields + algorithm downgrade
+            os.environ["WM_CONFINEMENT_HMAC_KEY"] = "tamper-test-secret"
+            res_t = swarm_mod.run_confined_verify(wt, "echo tamper-check", 20)
+            base_rcpt = res_t["confinement_receipt"]
+            tamper_cases = {
+                "worktree_diff_sha256": "0" * 64,
+                "verify_cmd_sha256": "f" * 64,
+                "verify_exit_code": 99,
+                "bwrap_flags": ["--ro-bind", "/", "/"],
+                "network_isolated": False,
+                "signature_alg": "ed25519",
+            }
+            all_tamper_rejected = True
+            failed_field = ""
+            for field, bad_val in tamper_cases.items():
+                mut = dict(base_rcpt)
+                mut[field] = bad_val
+                tok, _ = swarm_mod.verify_confinement_receipt(mut, hmac_key="tamper-test-secret")
+                if tok:
+                    all_tamper_rejected = False
+                    failed_field = field
+                    break
+            check("HMAC tamper detection rejects all mutated provenance fields", all_tamper_rejected, detail=failed_field)
+
+            # 7d) Ed25519 signing (PEM PKCS8 + raw 32-byte), CLI verify-receipt & tamper detection
+            _clear_receipt_env()
+            priv = ed25519.Ed25519PrivateKey.generate()
+            pub = priv.public_key()
+            pem_priv_path = td_path / "ed25519_priv.pem"
+            pem_pub_path = td_path / "ed25519_pub.pem"
+            raw_priv_path = td_path / "ed25519_priv.bin"
+            pem_priv_path.write_bytes(
+                priv.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+            )
+            pem_pub_path.write_bytes(
+                pub.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+            )
+            raw_priv_path.write_bytes(
+                priv.private_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PrivateFormat.Raw,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+            )
+
+            os.environ["WM_CONFINEMENT_ED25519_KEY_FILE"] = str(pem_priv_path)
+            res_ed = swarm_mod.run_confined_verify(wt, "echo ed25519-pem", 20, sign_alg="ed25519")
+            ed_rcpt = res_ed.get("confinement_receipt", {})
+            ed_ok, ed_msg = swarm_mod.verify_confinement_receipt(ed_rcpt, ed25519_public_key=pem_pub_path)
+            tampered_ed = dict(ed_rcpt)
+            tampered_ed["verify_exit_code"] = 42
+            ed_tamper_ok, _ = swarm_mod.verify_confinement_receipt(tampered_ed, ed25519_public_key=pem_pub_path)
+
+            p_vr = subprocess.run(
+                [str(LOCAL_BIN / "wm-grok-swarm"), "verify-receipt", "--file", "-", "--pubkey-file", str(pem_pub_path)],
+                input=json.dumps(ed_rcpt),
+                capture_output=True,
+                text=True,
+            )
+            p_vr_bad = subprocess.run(
+                [str(LOCAL_BIN / "wm-grok-swarm"), "verify-receipt", "--file", "-", "--pubkey-file", str(pem_pub_path)],
+                input=json.dumps(tampered_ed),
+                capture_output=True,
+                text=True,
+            )
+
+            os.environ["WM_CONFINEMENT_ED25519_KEY_FILE"] = str(raw_priv_path)
+            res_ed_raw = swarm_mod.run_confined_verify(wt, "echo ed25519-raw", 20)
+            ed_raw_ok, _ = swarm_mod.verify_confinement_receipt(
+                res_ed_raw.get("confinement_receipt", {}),
+                ed25519_public_key=pub,
+            )
+            check(
+                "Ed25519 PEM + raw-32B sign, verify-receipt CLI, and tamper rejection",
+                res_ed.get("ok") is True
+                and ed_rcpt.get("signature_alg") == "ed25519"
+                and ed_ok is True
+                and not ed_tamper_ok
+                and p_vr.returncode == 0
+                and json.loads(p_vr.stdout).get("ok") is True
+                and p_vr_bad.returncode != 0
+                and res_ed_raw.get("ok") is True
+                and ed_raw_ok is True,
+                detail=ed_msg,
+            )
+
+            # 7e) Append-only WM_CONFINEMENT_RECEIPT_LOG ledger writes & line-by-line verification
+            _clear_receipt_env()
+            ledger_file = td_path / "logs" / "receipts.jsonl"
+            os.environ["WM_CONFINEMENT_HMAC_KEY"] = "ledger-hmac-secret"
+            os.environ["WM_CONFINEMENT_RECEIPT_LOG"] = str(ledger_file)
+            swarm_mod.run_confined_verify(wt, "echo entry-1", 20)
+            swarm_mod.run_confined_verify(wt, "echo entry-2", 20)
+            lines = [ln for ln in ledger_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            all_lines_ok = len(lines) == 2 and all(
+                swarm_mod.verify_confinement_receipt(json.loads(ln))[0] for ln in lines
+            )
+            check(
+                "WM_CONFINEMENT_RECEIPT_LOG appends locked JSONL records and verifies line-by-line",
+                all_lines_ok,
+                detail=f"{len(lines)} lines",
+            )
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # 7f) Portability scan: zero /home/lucas literals across git-tracked bin/, plugin/, models/
+    tracked = subprocess.run(
+        ["git", "-C", str(KIT), "ls-files", "bin", "plugin", "models"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    leaked_paths = []
+    for rel in tracked.stdout.splitlines():
+        fp = KIT / rel
+        if fp.is_file():
+            try:
+                if "/home/lucas" in fp.read_text(encoding="utf-8", errors="ignore"):
+                    leaked_paths.append(rel)
+            except OSError:
+                pass
+    check("Zero hardcoded /home/lucas paths in git-tracked bin/, plugin/, models/", not leaked_paths, detail=", ".join(leaked_paths))
+
 
 def main():
     test_wm_squeeze()
@@ -614,6 +917,7 @@ def main():
     test_tricameral_v31()
     test_v4_fusion()
     test_bwrap_confinement()
+    test_signed_confinement_receipts()
     print(f"\n=== Wave 3/4/v4.0 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 

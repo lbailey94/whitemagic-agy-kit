@@ -9,8 +9,11 @@ wm-grok-swarm — Parallel Grok 4.7 Subagent Runner via `cursor-agent` (Tier 1 L
 """
 
 import argparse
+import base64
 import concurrent.futures
+import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -89,24 +92,474 @@ def _compute_worktree_diff_sha256(wt_path: Path) -> str:
     return h.hexdigest()
 
 
-def run_confined_verify(wt_path: Path, verify_cmd: str, timeout_sec: int) -> dict:
+def _discover_tmp_git_ro_binds(resolved_wt: Path) -> list[Path]:
+    """Return external /tmp git dirs needed when an external worktree points into a /tmp repo."""
+    proc = subprocess.run(
+        ["git", "-C", str(resolved_wt), "rev-parse", "--git-common-dir", "--git-dir"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    tmp_root = Path("/tmp").resolve()
+    candidates: set[Path] = set()
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        cand = Path(line)
+        if not cand.is_absolute():
+            cand = resolved_wt / cand
+        try:
+            cand = cand.resolve()
+        except OSError:
+            continue
+        if cand.is_dir() and cand.is_relative_to(tmp_root) and not cand.is_relative_to(resolved_wt):
+            candidates.add(cand)
+    selected: list[Path] = []
+    for cand in sorted(candidates, key=lambda p: (len(p.parts), str(p))):
+        if any(cand.is_relative_to(parent) for parent in selected):
+            continue
+        selected.append(cand)
+    return selected
+
+
+RECEIPT_VERSION = "wm-confinement-receipt/1.1"
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _utc_rfc3339() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _sha256_cmd(verify_cmd: str | None) -> str | None:
+    if isinstance(verify_cmd, str) and verify_cmd:
+        return hashlib.sha256(verify_cmd.encode("utf-8")).hexdigest()
+    return None
+
+
+def _build_confinement_receipt(
+    *,
+    bwrap_bin: str | None,
+    network_isolated: bool,
+    worktree_path: str,
+    worktree_diff_sha256: str | None,
+    verify_exit_code: int | None,
+    scope_confined: bool,
+    verify_cmd: str | None = None,
+    bwrap_flags: list[str] | None = None,
+    verify_stdout_tail: str | None = None,
+    verify_stderr_tail: str | None = None,
+    signature_alg: str | None = None,
+    signature_b64: str | None = None,
+) -> dict:
+    rcpt = {
+        "receipt_version": RECEIPT_VERSION,
+        "issued_at_utc": _utc_rfc3339(),
+        "bwrap_bin": bwrap_bin,
+        "network_isolated": network_isolated,
+        "worktree_path": worktree_path,
+        "worktree_diff_sha256": worktree_diff_sha256,
+        "verify_cmd_sha256": _sha256_cmd(verify_cmd),
+        "bwrap_flags": list(bwrap_flags or []),
+        "verify_exit_code": verify_exit_code,
+        "scope_confined": scope_confined,
+        "signature_alg": signature_alg,
+        "signature_b64": signature_b64,
+    }
+    if verify_stdout_tail is not None:
+        rcpt["verify_stdout_tail"] = verify_stdout_tail
+    if verify_stderr_tail is not None:
+        rcpt["verify_stderr_tail"] = verify_stderr_tail
+    return rcpt
+
+
+def canonical_receipt_bytes(receipt: dict) -> bytes:
+    payload = {k: v for k, v in receipt.items() if k != "signature_b64"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _parse_hmac_secret(raw: str | bytes) -> bytes:
+    if isinstance(raw, bytes):
+        if not raw:
+            raise ValueError("HMAC key must be non-empty")
+        return raw
+    text = str(raw)
+    if text.startswith("hex:"):
+        hex_part = text[4:].strip()
+        try:
+            out = bytes.fromhex(hex_part)
+        except ValueError as exc:
+            raise ValueError(f"invalid hex HMAC key: {exc}") from exc
+        if not out:
+            raise ValueError("HMAC hex key must be non-empty")
+        return out
+    if text.startswith("base64:"):
+        b64_part = text[7:].strip()
+        try:
+            out = base64.b64decode(b64_part, validate=True)
+        except Exception as exc:
+            raise ValueError(f"invalid base64 HMAC key: {exc}") from exc
+        if not out:
+            raise ValueError("HMAC base64 key must be non-empty")
+        return out
+    out = text.encode("utf-8")
+    if not out:
+        raise ValueError("HMAC key must be non-empty")
+    return out
+
+
+def _load_hmac_key_from_env() -> bytes | None:
+    key_file = os.environ.get("WM_CONFINEMENT_HMAC_KEY_FILE", "").strip()
+    file_key: bytes | None = None
+    if key_file:
+        p = Path(key_file)
+        if not p.is_file():
+            raise ValueError(f"WM_CONFINEMENT_HMAC_KEY_FILE not found: {key_file}")
+        try:
+            raw_bytes = p.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"cannot read WM_CONFINEMENT_HMAC_KEY_FILE {key_file}: {exc}") from exc
+        if not raw_bytes:
+            raise ValueError(f"WM_CONFINEMENT_HMAC_KEY_FILE is empty: {key_file}")
+        try:
+            text = raw_bytes.decode("utf-8").rstrip("\r\n")
+            file_key = _parse_hmac_secret(text)
+        except UnicodeDecodeError:
+            file_key = raw_bytes
+
+    key_env = os.environ.get("WM_CONFINEMENT_HMAC_KEY", "")
+    if key_env.strip():
+        return _parse_hmac_secret(key_env)
+    return file_key
+
+
+def _load_ed25519_private_key_from_env():
+    key_file = os.environ.get("WM_CONFINEMENT_ED25519_KEY_FILE", "").strip()
+    if not key_file:
+        return None
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+    except ImportError as exc:
+        raise ValueError("cryptography package required for Ed25519 confinement signing") from exc
+
+    p = Path(key_file)
+    if not p.is_file():
+        raise ValueError(f"WM_CONFINEMENT_ED25519_KEY_FILE not found: {key_file}")
+    try:
+        raw = p.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"cannot read WM_CONFINEMENT_ED25519_KEY_FILE {key_file}: {exc}") from exc
+    if b"-----BEGIN" in raw:
+        try:
+            priv = serialization.load_pem_private_key(raw, password=None)
+        except Exception as exc:
+            raise ValueError(f"invalid PEM private key in {key_file}: {exc}") from exc
+        if not isinstance(priv, ed25519.Ed25519PrivateKey):
+            raise ValueError(f"PEM key in {key_file} is not an Ed25519 private key")
+        return priv
+    if len(raw) == 32:
+        return ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+    raise ValueError(f"WM_CONFINEMENT_ED25519_KEY_FILE must be PEM PKCS8 or raw 32-byte key: {key_file}")
+
+
+def _resolve_signing_plan(
+    sign_receipt: bool | None = None,
+    sign_alg: str | None = None,
+    require_sign: bool = False,
+) -> tuple[bool, str | None, object | None]:
+    raw_alg = (str(sign_alg) if sign_alg is not None else "").strip().lower()
+    if raw_alg and raw_alg not in ("auto", "hmac-sha256", "ed25519"):
+        raise ValueError(f"Unsupported sign_alg '{sign_alg}' (expected auto|hmac-sha256|ed25519)")
+
+    env_sign_raw = os.environ.get("WM_CONFINEMENT_SIGN", "").strip().lower()
+    if env_sign_raw and env_sign_raw not in (_TRUTHY | _FALSY):
+        raise ValueError(f"Invalid WM_CONFINEMENT_SIGN value '{env_sign_raw}'")
+
+    explicit_req = (
+        (sign_receipt is True)
+        or bool(raw_alg)
+        or (env_sign_raw in _TRUTHY)
+        or bool(require_sign)
+    )
+    explicit_disable = (sign_receipt is False) or (
+        env_sign_raw in _FALSY and sign_receipt is not True and not raw_alg and not require_sign
+    )
+
+    has_hmac_env = bool(
+        os.environ.get("WM_CONFINEMENT_HMAC_KEY", "").strip()
+        or os.environ.get("WM_CONFINEMENT_HMAC_KEY_FILE", "").strip()
+    )
+    has_ed_env = bool(os.environ.get("WM_CONFINEMENT_ED25519_KEY_FILE", "").strip())
+
+    # Validate any configured key files/values upfront so invalid configs always fail closed.
+    hmac_key = _load_hmac_key_from_env() if has_hmac_env else None
+    ed_key = _load_ed25519_private_key_from_env() if has_ed_env else None
+
+    should_sign = explicit_req or ((not explicit_disable) and (has_hmac_env or has_ed_env))
+    if not should_sign:
+        return (False, None, None)
+
+    if raw_alg in ("", "auto"):
+        if ed_key is not None:
+            return (True, "ed25519", ed_key)
+        if hmac_key is not None:
+            return (True, "hmac-sha256", hmac_key)
+        raise ValueError(
+            "Confinement receipt signing requested but no key is configured "
+            "(set WM_CONFINEMENT_HMAC_KEY, WM_CONFINEMENT_HMAC_KEY_FILE, or WM_CONFINEMENT_ED25519_KEY_FILE)"
+        )
+
+    if raw_alg == "ed25519":
+        try:
+            from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed_check  # noqa: F401
+        except ImportError as exc:
+            raise ValueError("cryptography package required for Ed25519 confinement signing") from exc
+        if ed_key is None:
+            raise ValueError("Ed25519 signing requested but WM_CONFINEMENT_ED25519_KEY_FILE is not set")
+        return (True, "ed25519", ed_key)
+
+    if hmac_key is None:
+        raise ValueError(
+            "HMAC-SHA256 signing requested but WM_CONFINEMENT_HMAC_KEY / WM_CONFINEMENT_HMAC_KEY_FILE is not set"
+        )
+    return (True, "hmac-sha256", hmac_key)
+
+
+def _sign_with_plan(receipt: dict, active: bool, alg: str | None, key_obj: object | None) -> dict:
+    out = dict(receipt)
+    if not active or not alg:
+        out["signature_alg"] = None
+        out["signature_b64"] = None
+        return out
+    out["signature_alg"] = alg
+    payload = canonical_receipt_bytes(out)
+    if alg == "hmac-sha256":
+        sig = hmac.new(key_obj, payload, hashlib.sha256).digest()  # type: ignore[arg-type]
+    elif alg == "ed25519":
+        sig = key_obj.sign(payload)  # type: ignore[attr-defined]
+    else:
+        raise ValueError(f"Unsupported signature_alg: {alg}")
+    out["signature_b64"] = base64.b64encode(sig).decode("ascii")
+    return out
+
+
+def sign_confinement_receipt(
+    receipt: dict,
+    sign_alg: str | None = None,
+    require_sign: bool = False,
+) -> dict:
+    explicit_req = True if (require_sign or (sign_alg is not None and str(sign_alg).strip())) else None
+    active, alg, key_obj = _resolve_signing_plan(
+        sign_receipt=explicit_req,
+        sign_alg=sign_alg,
+        require_sign=require_sign,
+    )
+    return _sign_with_plan(receipt, active, alg, key_obj)
+
+
+def _load_ed25519_public_key(ed25519_public_key=None):
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+    except ImportError as exc:
+        raise ValueError("cryptography package required for Ed25519 verification") from exc
+
+    if ed25519_public_key is None:
+        pub_env = os.environ.get("WM_CONFINEMENT_ED25519_PUBKEY_FILE", "").strip()
+        if pub_env:
+            ed25519_public_key = Path(pub_env)
+        else:
+            priv = _load_ed25519_private_key_from_env()
+            if priv is None:
+                raise ValueError(
+                    "Ed25519 public key not provided and WM_CONFINEMENT_ED25519_PUBKEY_FILE / "
+                    "WM_CONFINEMENT_ED25519_KEY_FILE not set"
+                )
+            return priv.public_key()
+
+    if isinstance(ed25519_public_key, ed25519.Ed25519PublicKey):
+        return ed25519_public_key
+    if isinstance(ed25519_public_key, ed25519.Ed25519PrivateKey):
+        return ed25519_public_key.public_key()
+
+    if isinstance(ed25519_public_key, Path) or (
+        isinstance(ed25519_public_key, str) and "-----BEGIN" not in ed25519_public_key
+    ):
+        p = Path(ed25519_public_key)
+        if not p.is_file():
+            raise ValueError(f"Ed25519 public key file not found: {p}")
+        raw = p.read_bytes()
+    elif isinstance(ed25519_public_key, str):
+        raw = ed25519_public_key.encode("utf-8")
+    elif isinstance(ed25519_public_key, bytes):
+        raw = ed25519_public_key
+    else:
+        raise ValueError("Unsupported Ed25519 public key type")
+
+    if b"-----BEGIN PUBLIC KEY-----" in raw:
+        pub = serialization.load_pem_public_key(raw)
+        if not isinstance(pub, ed25519.Ed25519PublicKey):
+            raise ValueError("PEM public key is not an Ed25519 public key")
+        return pub
+    if b"-----BEGIN" in raw:
+        priv = serialization.load_pem_private_key(raw, password=None)
+        if not isinstance(priv, ed25519.Ed25519PrivateKey):
+            raise ValueError("PEM private key is not an Ed25519 private key")
+        return priv.public_key()
+    if len(raw) == 32:
+        return ed25519.Ed25519PublicKey.from_public_bytes(raw)
+    raise ValueError("Ed25519 public key must be PEM or raw 32-byte key")
+
+
+def verify_confinement_receipt(
+    receipt: dict,
+    hmac_key: str | bytes | None = None,
+    ed25519_public_key=None,
+) -> tuple[bool, str]:
+    if not isinstance(receipt, dict):
+        return (False, "receipt must be a JSON object")
+    if receipt.get("receipt_version") != RECEIPT_VERSION:
+        return (False, f"unsupported receipt_version: {receipt.get('receipt_version')!r}")
+
+    alg = receipt.get("signature_alg")
+    sig_b64 = receipt.get("signature_b64")
+    if not alg or not isinstance(alg, str):
+        return (False, "receipt missing signature_alg")
+    if not sig_b64 or not isinstance(sig_b64, str):
+        return (False, "receipt missing signature_b64")
+
+    try:
+        sig_bytes = base64.b64decode(sig_b64, validate=True)
+    except Exception as exc:
+        return (False, f"invalid base64 signature_b64: {exc}")
+
+    payload = canonical_receipt_bytes(receipt)
+    if alg == "hmac-sha256":
+        try:
+            key_bytes = _parse_hmac_secret(hmac_key) if hmac_key is not None else _load_hmac_key_from_env()
+        except (ValueError, OSError) as exc:
+            return (False, str(exc))
+        if key_bytes is None:
+            return (False, "HMAC key unavailable (pass hmac_key or set WM_CONFINEMENT_HMAC_KEY)")
+        expected = hmac.new(key_bytes, payload, hashlib.sha256).digest()
+        if hmac.compare_digest(expected, sig_bytes):
+            return (True, "verified hmac-sha256")
+        return (False, "hmac-sha256 signature mismatch")
+
+    if alg == "ed25519":
+        try:
+            from cryptography.exceptions import InvalidSignature
+        except ImportError:
+            return (False, "cryptography package required for Ed25519 verification")
+        try:
+            pub_key = _load_ed25519_public_key(ed25519_public_key)
+        except (ValueError, OSError) as exc:
+            return (False, str(exc))
+        try:
+            pub_key.verify(sig_bytes, payload)
+        except InvalidSignature:
+            return (False, "ed25519 signature mismatch")
+        return (True, "verified ed25519")
+
+    return (False, f"unsupported signature_alg: {alg!r}")
+
+
+def append_receipt_ledger(receipt: dict, ledger_path: str | Path | None = None) -> Path | None:
+    raw_target = ledger_path if ledger_path is not None else os.environ.get("WM_CONFINEMENT_RECEIPT_LOG", "")
+    target = str(raw_target).strip()
+    if not target:
+        return None
+    p = Path(target).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+    with open(p, "a", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.write(line)
+            f.flush()
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    return p
+
+
+def run_confined_verify(
+    wt_path: Path,
+    verify_cmd: str,
+    timeout_sec: int,
+    sign_receipt: bool | None = None,
+    sign_alg: str | None = None,
+    require_sign: bool = False,
+    receipt_log: str | None = None,
+) -> dict:
+    try:
+        sign_active, resolved_alg, sign_key = _resolve_signing_plan(
+            sign_receipt=sign_receipt,
+            sign_alg=sign_alg,
+            require_sign=require_sign,
+        )
+    except (ValueError, OSError) as exc:
+        rcpt = _build_confinement_receipt(
+            bwrap_bin=find_bwrap(),
+            network_isolated=False,
+            worktree_path=str(wt_path),
+            worktree_diff_sha256=None,
+            verify_exit_code=None,
+            scope_confined=False,
+            verify_cmd=verify_cmd,
+            bwrap_flags=[],
+        )
+        append_receipt_ledger(rcpt, ledger_path=receipt_log)
+        return {
+            "ok": False,
+            "error": f"confinement receipt signing failed closed: {exc}",
+            "confinement_receipt": rcpt,
+        }
+
     bwrap = find_bwrap()
     if bwrap is None:
+        rcpt = _build_confinement_receipt(
+            bwrap_bin=None,
+            network_isolated=False,
+            worktree_path=str(wt_path),
+            worktree_diff_sha256=None,
+            verify_exit_code=None,
+            scope_confined=False,
+            verify_cmd=verify_cmd,
+            bwrap_flags=[],
+        )
+        rcpt = _sign_with_plan(rcpt, sign_active, resolved_alg, sign_key)
+        append_receipt_ledger(rcpt, ledger_path=receipt_log)
         return {
             "ok": False,
             "error": "bwrap binary not found (fail-closed confinement)",
-            "confinement_receipt": {
-                "bwrap_bin": None,
-                "network_isolated": False,
-                "worktree_path": str(wt_path),
-                "worktree_diff_sha256": None,
-                "verify_exit_code": None,
-                "scope_confined": False,
-            },
+            "confinement_receipt": rcpt,
+        }
+
+    if not wt_path.is_dir():
+        rcpt = _build_confinement_receipt(
+            bwrap_bin=bwrap,
+            network_isolated=False,
+            worktree_path=str(wt_path),
+            worktree_diff_sha256=None,
+            verify_exit_code=None,
+            scope_confined=False,
+            verify_cmd=verify_cmd,
+            bwrap_flags=[],
+        )
+        rcpt = _sign_with_plan(rcpt, sign_active, resolved_alg, sign_key)
+        append_receipt_ledger(rcpt, ledger_path=receipt_log)
+        return {
+            "ok": False,
+            "error": f"worktree path does not exist: {wt_path}",
+            "confinement_receipt": rcpt,
         }
 
     resolved_wt = wt_path.resolve()
     diff_sha = _compute_worktree_diff_sha256(resolved_wt)
+    tmp_git_ro_binds = _discover_tmp_git_ro_binds(resolved_wt)
     bwrap_cmd = [
         bwrap,
         "--ro-bind",
@@ -118,6 +571,10 @@ def run_confined_verify(wt_path: Path, verify_cmd: str, timeout_sec: int) -> dic
         "/proc",
         "--tmpfs",
         "/tmp",
+    ]
+    for gpath in tmp_git_ro_binds:
+        bwrap_cmd.extend(["--ro-bind", str(gpath), str(gpath)])
+    bwrap_cmd.extend([
         "--bind",
         str(resolved_wt),
         str(resolved_wt),
@@ -129,7 +586,8 @@ def run_confined_verify(wt_path: Path, verify_cmd: str, timeout_sec: int) -> dic
         "sh",
         "-c",
         verify_cmd,
-    ]
+    ])
+    bwrap_flags = bwrap_cmd[1 : bwrap_cmd.index("--")]
     eff_timeout = max(1, min(int(timeout_sec), 90))
     try:
         proc = subprocess.run(
@@ -141,46 +599,61 @@ def run_confined_verify(wt_path: Path, verify_cmd: str, timeout_sec: int) -> dic
     except subprocess.TimeoutExpired as exc:
         stdout_s = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr_s = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        rcpt = _build_confinement_receipt(
+            bwrap_bin=bwrap,
+            network_isolated=True,
+            worktree_path=str(resolved_wt),
+            worktree_diff_sha256=diff_sha,
+            verify_exit_code=None,
+            scope_confined=True,
+            verify_cmd=verify_cmd,
+            bwrap_flags=bwrap_flags,
+            verify_stdout_tail=stdout_s[-800:],
+            verify_stderr_tail=stderr_s[-800:],
+        )
+        rcpt = _sign_with_plan(rcpt, sign_active, resolved_alg, sign_key)
+        append_receipt_ledger(rcpt, ledger_path=receipt_log)
         return {
             "ok": False,
             "error": f"confined verify timed out after {eff_timeout}s",
-            "confinement_receipt": {
-                "bwrap_bin": bwrap,
-                "network_isolated": True,
-                "worktree_path": str(resolved_wt),
-                "worktree_diff_sha256": diff_sha,
-                "verify_exit_code": None,
-                "scope_confined": True,
-                "verify_stdout_tail": stdout_s[-800:],
-                "verify_stderr_tail": stderr_s[-800:],
-            },
+            "confinement_receipt": rcpt,
         }
     except OSError as exc:
+        rcpt = _build_confinement_receipt(
+            bwrap_bin=bwrap,
+            network_isolated=False,
+            worktree_path=str(resolved_wt),
+            worktree_diff_sha256=diff_sha,
+            verify_exit_code=None,
+            scope_confined=False,
+            verify_cmd=verify_cmd,
+            bwrap_flags=[],
+        )
+        rcpt = _sign_with_plan(rcpt, sign_active, resolved_alg, sign_key)
+        append_receipt_ledger(rcpt, ledger_path=receipt_log)
         return {
             "ok": False,
             "error": f"bwrap execution failed: {exc}",
-            "confinement_receipt": {
-                "bwrap_bin": bwrap,
-                "network_isolated": False,
-                "worktree_path": str(resolved_wt),
-                "worktree_diff_sha256": diff_sha,
-                "verify_exit_code": None,
-                "scope_confined": False,
-            },
+            "confinement_receipt": rcpt,
         }
 
+    rcpt = _build_confinement_receipt(
+        bwrap_bin=bwrap,
+        network_isolated=True,
+        worktree_path=str(resolved_wt),
+        worktree_diff_sha256=diff_sha,
+        verify_exit_code=proc.returncode,
+        scope_confined=True,
+        verify_cmd=verify_cmd,
+        bwrap_flags=bwrap_flags,
+        verify_stdout_tail=(proc.stdout or "")[-800:],
+        verify_stderr_tail=(proc.stderr or "")[-800:],
+    )
+    rcpt = _sign_with_plan(rcpt, sign_active, resolved_alg, sign_key)
+    append_receipt_ledger(rcpt, ledger_path=receipt_log)
     return {
         "ok": proc.returncode == 0,
-        "confinement_receipt": {
-            "bwrap_bin": bwrap,
-            "network_isolated": True,
-            "worktree_path": str(resolved_wt),
-            "worktree_diff_sha256": diff_sha,
-            "verify_exit_code": proc.returncode,
-            "scope_confined": True,
-            "verify_stdout_tail": (proc.stdout or "")[-800:],
-            "verify_stderr_tail": (proc.stderr or "")[-800:],
-        },
+        "confinement_receipt": rcpt,
     }
 
 
@@ -225,6 +698,9 @@ def _run_one(
     idx: int,
     payload_confined: bool = False,
     payload_verify_cmd: str | None = None,
+    payload_sign_receipt: bool | None = None,
+    payload_sign_alg: str | None = None,
+    payload_receipt_log: str | None = None,
 ) -> dict:
     name = str(task.get("name") or f"grok-{idx + 1}")
     prompt = str(task.get("prompt") or "").strip()
@@ -237,20 +713,55 @@ def _run_one(
 
     confined = bool(task.get("confined", payload_confined))
     verify_cmd = task.get("verify_cmd", payload_verify_cmd)
-    if confined and find_bwrap() is None:
-        return {
-            "name": name,
-            "ok": False,
-            "error": "bwrap binary not found (fail-closed confinement)",
-            "confinement_receipt": {
-                "bwrap_bin": None,
-                "network_isolated": False,
-                "worktree_path": cwd,
-                "worktree_diff_sha256": None,
-                "verify_exit_code": None,
-                "scope_confined": False,
-            },
-        }
+    sign_receipt = task.get("sign_receipt", payload_sign_receipt)
+    sign_alg = task.get("sign_alg", payload_sign_alg)
+    receipt_log = task.get("receipt_log", payload_receipt_log)
+    eff_verify_cmd = str(verify_cmd or "git status --short") if action == "worktree" else (str(verify_cmd) if verify_cmd else None)
+
+    if confined:
+        try:
+            sign_active, resolved_alg, sign_key = _resolve_signing_plan(
+                sign_receipt=sign_receipt,
+                sign_alg=sign_alg,
+                require_sign=bool(sign_receipt is True or (sign_alg is not None and str(sign_alg).strip())),
+            )
+        except (ValueError, OSError) as exc:
+            rcpt = _build_confinement_receipt(
+                bwrap_bin=find_bwrap(),
+                network_isolated=False,
+                worktree_path=cwd,
+                worktree_diff_sha256=None,
+                verify_exit_code=None,
+                scope_confined=False,
+                verify_cmd=eff_verify_cmd,
+                bwrap_flags=[],
+            )
+            append_receipt_ledger(rcpt, ledger_path=receipt_log)
+            return {
+                "name": name,
+                "ok": False,
+                "error": f"confinement receipt signing failed closed: {exc}",
+                "confinement_receipt": rcpt,
+            }
+        if find_bwrap() is None:
+            rcpt = _build_confinement_receipt(
+                bwrap_bin=None,
+                network_isolated=False,
+                worktree_path=cwd,
+                worktree_diff_sha256=None,
+                verify_exit_code=None,
+                scope_confined=False,
+                verify_cmd=eff_verify_cmd,
+                bwrap_flags=[],
+            )
+            rcpt = _sign_with_plan(rcpt, sign_active, resolved_alg, sign_key)
+            append_receipt_ledger(rcpt, ledger_path=receipt_log)
+            return {
+                "name": name,
+                "ok": False,
+                "error": "bwrap binary not found (fail-closed confinement)",
+                "confinement_receipt": rcpt,
+            }
 
     cmd = [ca, "-p", "--output-format", "json", "--model", model]
     wt_name = ""
@@ -333,7 +844,15 @@ def _run_one(
             rec["git_status"] = st.stdout.strip()[:400]
             rec["diff_stat"] = ds.stdout.strip()[:400]
             if confined:
-                vres = run_confined_verify(wt_path, str(verify_cmd or "git status --short"), timeout_sec)
+                vres = run_confined_verify(
+                    wt_path,
+                    str(verify_cmd or "git status --short"),
+                    timeout_sec,
+                    sign_receipt=sign_receipt,
+                    sign_alg=sign_alg,
+                    require_sign=bool(sign_receipt is True or (sign_alg is not None and str(sign_alg).strip())),
+                    receipt_log=receipt_log,
+                )
                 rec["confinement_receipt"] = vres["confinement_receipt"]
                 if not vres["ok"]:
                     rec["ok"] = False
@@ -345,16 +864,32 @@ def _run_one(
         elif confined:
             rec["ok"] = False
             rec.setdefault("error", f"worktree path not created for confined verify: {wt_path}")
-            rec["confinement_receipt"] = {
-                "bwrap_bin": find_bwrap(),
-                "network_isolated": False,
-                "worktree_path": str(wt_path),
-                "worktree_diff_sha256": None,
-                "verify_exit_code": None,
-                "scope_confined": False,
-            }
+            rcpt = _build_confinement_receipt(
+                bwrap_bin=find_bwrap(),
+                network_isolated=False,
+                worktree_path=str(wt_path),
+                worktree_diff_sha256=None,
+                verify_exit_code=None,
+                scope_confined=False,
+                verify_cmd=str(verify_cmd or "git status --short"),
+                bwrap_flags=[],
+            )
+            try:
+                rcpt = _sign_with_plan(rcpt, sign_active, resolved_alg, sign_key)
+            except (ValueError, OSError) as exc:
+                rec["error"] = f"{rec['error']}; receipt signing failed closed: {exc}"
+            append_receipt_ledger(rcpt, ledger_path=receipt_log)
+            rec["confinement_receipt"] = rcpt
     elif confined and verify_cmd:
-        vres = run_confined_verify(Path(cwd), str(verify_cmd), timeout_sec)
+        vres = run_confined_verify(
+            Path(cwd),
+            str(verify_cmd),
+            timeout_sec,
+            sign_receipt=sign_receipt,
+            sign_alg=sign_alg,
+            require_sign=bool(sign_receipt is True or (sign_alg is not None and str(sign_alg).strip())),
+            receipt_log=receipt_log,
+        )
         rec["confinement_receipt"] = vres["confinement_receipt"]
         if not vres["ok"]:
             rec["ok"] = False
@@ -383,34 +918,109 @@ def run_swarm(payload: dict) -> dict:
 
     payload_confined = bool(payload.get("confined", False))
     payload_verify_cmd = payload.get("verify_cmd")
+    payload_sign_receipt = payload.get("sign_receipt")
+    payload_sign_alg = payload.get("sign_alg")
+    payload_receipt_log = payload.get("receipt_log")
+
     any_confined = any(
         bool(t.get("confined", payload_confined)) if isinstance(t, dict) else payload_confined
         for t in tasks
     )
-    if any_confined and find_bwrap() is None:
-        fail_workers = [
-            {
-                "name": str((t if isinstance(t, dict) else {}).get("name") or f"grok-{i + 1}"),
+    bwrap_bin = find_bwrap() if any_confined else None
+
+    if any_confined:
+        sign_errors: list[tuple[int, str]] = []
+        sign_plans: list[tuple[bool, str | None, object | None]] = []
+        for i, t in enumerate(tasks):
+            td = t if isinstance(t, dict) else {}
+            t_conf = bool(td.get("confined", payload_confined))
+            if not t_conf:
+                sign_plans.append((False, None, None))
+                continue
+            t_sr = td.get("sign_receipt", payload_sign_receipt)
+            t_sa = td.get("sign_alg", payload_sign_alg)
+            try:
+                plan = _resolve_signing_plan(
+                    sign_receipt=t_sr,
+                    sign_alg=t_sa,
+                    require_sign=bool(t_sr is True or (t_sa is not None and str(t_sa).strip())),
+                )
+                sign_plans.append(plan)
+            except (ValueError, OSError) as exc:
+                sign_plans.append((False, None, None))
+                sign_errors.append((i, str(exc)))
+
+        if sign_errors:
+            err_msg = f"confinement receipt signing failed closed: {sign_errors[0][1]}"
+            err_map = dict(sign_errors)
+            fail_workers = []
+            for i, t in enumerate(tasks):
+                td = t if isinstance(t, dict) else {}
+                vcmd = td.get("verify_cmd", payload_verify_cmd)
+                eff_cmd = str(vcmd or "git status --short") if action == "worktree" else (str(vcmd) if vcmd else None)
+                rcpt = _build_confinement_receipt(
+                    bwrap_bin=bwrap_bin,
+                    network_isolated=False,
+                    worktree_path=str(td.get("cwd") or os.getcwd()),
+                    worktree_diff_sha256=None,
+                    verify_exit_code=None,
+                    scope_confined=False,
+                    verify_cmd=eff_cmd,
+                    bwrap_flags=[],
+                )
+                t_log = td.get("receipt_log", payload_receipt_log)
+                append_receipt_ledger(rcpt, ledger_path=t_log)
+                fail_workers.append(
+                    {
+                        "name": str(td.get("name") or f"grok-{i + 1}"),
+                        "ok": False,
+                        "error": f"confinement receipt signing failed closed: {err_map[i]}" if i in err_map else err_msg,
+                        "confinement_receipt": rcpt,
+                    }
+                )
+            return {
                 "ok": False,
-                "error": "bwrap binary not found (fail-closed confinement)",
-                "confinement_receipt": {
-                    "bwrap_bin": None,
-                    "network_isolated": False,
-                    "worktree_path": str((t if isinstance(t, dict) else {}).get("cwd") or os.getcwd()),
-                    "worktree_diff_sha256": None,
-                    "verify_exit_code": None,
-                    "scope_confined": False,
-                },
+                "action": action,
+                "model": model,
+                "error": err_msg,
+                "workers": fail_workers,
             }
-            for i, t in enumerate(tasks)
-        ]
-        return {
-            "ok": False,
-            "action": action,
-            "model": model,
-            "error": "bwrap binary not found (fail-closed confinement)",
-            "workers": fail_workers,
-        }
+
+        if bwrap_bin is None:
+            fail_workers = []
+            for i, t in enumerate(tasks):
+                td = t if isinstance(t, dict) else {}
+                vcmd = td.get("verify_cmd", payload_verify_cmd)
+                eff_cmd = str(vcmd or "git status --short") if action == "worktree" else (str(vcmd) if vcmd else None)
+                rcpt = _build_confinement_receipt(
+                    bwrap_bin=None,
+                    network_isolated=False,
+                    worktree_path=str(td.get("cwd") or os.getcwd()),
+                    worktree_diff_sha256=None,
+                    verify_exit_code=None,
+                    scope_confined=False,
+                    verify_cmd=eff_cmd,
+                    bwrap_flags=[],
+                )
+                s_act, s_alg, s_key = sign_plans[i]
+                rcpt = _sign_with_plan(rcpt, s_act, s_alg, s_key)
+                t_log = td.get("receipt_log", payload_receipt_log)
+                append_receipt_ledger(rcpt, ledger_path=t_log)
+                fail_workers.append(
+                    {
+                        "name": str(td.get("name") or f"grok-{i + 1}"),
+                        "ok": False,
+                        "error": "bwrap binary not found (fail-closed confinement)",
+                        "confinement_receipt": rcpt,
+                    }
+                )
+            return {
+                "ok": False,
+                "action": action,
+                "model": model,
+                "error": "bwrap binary not found (fail-closed confinement)",
+                "workers": fail_workers,
+            }
 
     ca = find_cursor_agent()
     if not ca:
@@ -434,6 +1044,9 @@ def run_swarm(payload: dict) -> dict:
                 i,
                 payload_confined,
                 payload_verify_cmd,
+                payload_sign_receipt,
+                payload_sign_alg,
+                payload_receipt_log,
             ): i
             for i, t in enumerate(tasks)
         }
@@ -492,6 +1105,33 @@ def run_swarm(payload: dict) -> dict:
     return {"_raw_text": encoded, **out}
 
 
+def cmd_verify_receipt(file_arg: str, hmac_key: str | None, pubkey_file: str | None) -> int:
+    try:
+        raw_text = sys.stdin.read() if file_arg == "-" else Path(file_arg).read_text(encoding="utf-8")
+        data = json.loads(raw_text)
+    except Exception as exc:
+        print(json.dumps({"ok": False, "reason": f"failed to read receipt JSON: {exc}"}))
+        return 1
+
+    receipt = data
+    if isinstance(data, dict) and "receipt_version" not in data and isinstance(data.get("confinement_receipt"), dict):
+        receipt = data["confinement_receipt"]
+
+    ok, reason = verify_confinement_receipt(
+        receipt,
+        hmac_key=hmac_key,
+        ed25519_public_key=pubkey_file,
+    )
+    out = {
+        "ok": ok,
+        "reason": reason,
+        "receipt_version": receipt.get("receipt_version") if isinstance(receipt, dict) else None,
+        "signature_alg": receipt.get("signature_alg") if isinstance(receipt, dict) else None,
+    }
+    print(json.dumps(out, indent=2))
+    return 0 if ok else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Parallel Grok 4.7 Swarm Runner via cursor-agent")
     sub = parser.add_subparsers(dest="cmd")
@@ -500,6 +1140,9 @@ def main() -> int:
     run_p.add_argument("--json-stdin", action="store_true", required=True)
     run_p.add_argument("--confined", action="store_true", help="Enable bwrap read-only/network-isolated verification")
     run_p.add_argument("--verify-cmd", default=None, help="Verification command executed inside bwrap confinement")
+    run_p.add_argument("--sign-receipt", action="store_true", help="Sign confinement_receipt (fail-closed without key)")
+    run_p.add_argument("--sign-alg", choices=["auto", "hmac-sha256", "ed25519"], default=None, help="Receipt signature algorithm")
+    run_p.add_argument("--receipt-log", default=None, help="Append-only JSONL ledger path for confinement receipts")
 
     wt_p = sub.add_parser("worktree", help="Run an isolated git-worktree Grok worker (optionally bwrap-confined)")
     wt_p.add_argument("--prompt", required=True, help="Worker prompt")
@@ -509,10 +1152,20 @@ def main() -> int:
     wt_p.add_argument("--timeout-sec", type=int, default=120, help="Worker timeout seconds")
     wt_p.add_argument("--confined", action="store_true", help="Enable bwrap read-only/network-isolated verification")
     wt_p.add_argument("--verify-cmd", default=None, help="Verification command executed inside bwrap confinement")
+    wt_p.add_argument("--sign-receipt", action="store_true", help="Sign confinement_receipt (fail-closed without key)")
+    wt_p.add_argument("--sign-alg", choices=["auto", "hmac-sha256", "ed25519"], default=None, help="Receipt signature algorithm")
+    wt_p.add_argument("--receipt-log", default=None, help="Append-only JSONL ledger path for confinement receipts")
+
+    vr_p = sub.add_parser("verify-receipt", help="Verify a wm-confinement-receipt/1.1 JSON receipt")
+    vr_p.add_argument("--file", default="-", help="Path to receipt JSON file or '-' for stdin")
+    vr_p.add_argument("--hmac-key", default=None, help="HMAC key (UTF-8, hex:<hex>, or base64:<b64>)")
+    vr_p.add_argument("--pubkey-file", default=None, help="Path to Ed25519 PEM or raw 32-byte public key")
 
     args = parser.parse_args()
     if args.cmd == "status":
         return cmd_status()
+    if args.cmd == "verify-receipt":
+        return cmd_verify_receipt(args.file, args.hmac_key, args.pubkey_file)
     if args.cmd == "run":
         try:
             payload = json.loads(sys.stdin.read() or "{}")
@@ -523,6 +1176,12 @@ def main() -> int:
             payload["confined"] = True
         if args.verify_cmd is not None:
             payload["verify_cmd"] = args.verify_cmd
+        if args.sign_receipt:
+            payload["sign_receipt"] = True
+        if args.sign_alg is not None:
+            payload["sign_alg"] = args.sign_alg
+        if args.receipt_log is not None:
+            payload["receipt_log"] = args.receipt_log
         res = run_swarm(payload)
         print(res.pop("_raw_text", json.dumps(res, indent=2)))
         return 0 if res.get("ok") else 1
@@ -539,6 +1198,12 @@ def main() -> int:
         }
         if args.verify_cmd is not None:
             payload["verify_cmd"] = args.verify_cmd
+        if args.sign_receipt:
+            payload["sign_receipt"] = True
+        if args.sign_alg is not None:
+            payload["sign_alg"] = args.sign_alg
+        if args.receipt_log is not None:
+            payload["receipt_log"] = args.receipt_log
         res = run_swarm(payload)
         print(res.pop("_raw_text", json.dumps(res, indent=2)))
         return 0 if res.get("ok") else 1
