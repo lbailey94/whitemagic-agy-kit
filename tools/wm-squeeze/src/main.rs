@@ -358,34 +358,109 @@ fn compress_gotest(text: &str) -> String {
     out.join("\n")
 }
 
-/// CoACT-style structured diagnostic grouping for tsc / ruff / mypy / eslint:
-/// groups identical error messages/codes per file while preserving exact `file:line` anchors!
+/// Parse a linter diagnostic line into `(file, line_anchor, message_template)`.
+/// Supports BOTH `tsc` format (`src/a.ts(12,4): error TS2322: ...`)
+/// AND `ruff`/`mypy`/`eslint`/`rustc`/`gcc` format (`src/a.py:12:4: E501 ...`).
+fn parse_linter_diag(line: &str) -> Option<(String, String, String)> {
+    let t = line.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // 1. tsc / MSBuild format: `path/to/file.ts(12,4): msg`
+    if let Some(lparen) = t.find('(') {
+        let f = &t[..lparen];
+        if !f.is_empty() && !f.contains(' ') && (f.contains('.') || f.contains('/')) {
+            if let Some(rparen_rel) = t[lparen + 1..].find("):") {
+                let coords = &t[lparen + 1..lparen + 1 + rparen_rel];
+                let line_num = coords.split(',').next().unwrap_or(coords).trim();
+                if !line_num.is_empty() && line_num.bytes().all(|b| b.is_ascii_digit()) {
+                    let msg = t[lparen + 1 + rparen_rel + 2..].trim();
+                    return Some((f.to_string(), format!("L{}", line_num), clamp_line(msg, 160)));
+                }
+            }
+        }
+    }
+    // 2. Colon format: `path/to/file.py:12:4: msg` or `path/to/file.py:12: msg`
+    if let Some(c1) = t.find(':') {
+        let f = &t[..c1];
+        if !f.is_empty() && !f.contains(' ') && (f.contains('.') || f.contains('/')) {
+            let rest = &t[c1 + 1..];
+            if let Some(c2) = rest.find(':') {
+                let tok = rest[..c2].trim();
+                if !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_digit()) {
+                    let after_line = &rest[c2 + 1..];
+                    // Optional column number `:col: msg`
+                    let msg = if let Some(c3) = after_line.find(':') {
+                        let col = after_line[..c3].trim();
+                        if !col.is_empty() && col.bytes().all(|b| b.is_ascii_digit()) {
+                            after_line[c3 + 1..].trim()
+                        } else {
+                            after_line.trim()
+                        }
+                    } else {
+                        after_line.trim()
+                    };
+                    return Some((f.to_string(), format!("L{}", tok), clamp_line(msg, 160)));
+                }
+            }
+            return Some((f.to_string(), String::new(), clamp_line(rest.trim(), 160)));
+        }
+    }
+    None
+}
+
+/// CoACT + Drain-style structural diagnostic clustering for tsc / ruff / mypy / eslint:
+/// groups identical error templates per file while preserving exact `L<line>` anchors!
 fn compress_linter(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return dedup_consecutive(text.lines().map(|l| clamp_line(l, MAX_LINE_CHARS)).collect()).join("\n");
     }
-    let mut by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // file -> (total_issues, template_msg -> Vec<line_anchor>)
+    let mut by_file: BTreeMap<String, (usize, BTreeMap<String, Vec<String>>)> = BTreeMap::new();
     let mut other = Vec::new();
     for line in text.lines() {
         let t = line.trim();
         if t.is_empty() { continue; }
-        if let Some(colon) = t.find(':') {
-            let f = &t[..colon];
-            if !f.is_empty() && !f.contains(' ') && (f.contains('.') || f.contains('/')) {
-                by_file.entry(f.to_string()).or_default().push(clamp_line(&t[colon + 1..], 180));
-                continue;
+        if let Some((file, anchor, msg)) = parse_linter_diag(t) {
+            let entry = by_file.entry(file).or_insert_with(|| (0, BTreeMap::new()));
+            entry.0 += 1;
+            let anchors = entry.1.entry(msg).or_default();
+            if !anchor.is_empty() {
+                anchors.push(anchor);
+            }
+        } else {
+            other.push(clamp_line(t, 200));
+        }
+    }
+    let total_issues: usize = by_file.values().map(|(c, _)| *c).sum();
+    let mut out = vec![format!(
+        "[linter-grouped: {} files, {} diagnostics clustered by template]",
+        by_file.len(),
+        total_issues
+    )];
+    for (file, (file_total, templates)) in by_file {
+        out.push(format!("## {} ({} issues, {} unique):", file, file_total, templates.len()));
+        // Sort templates by descending frequency so highest-impact errors always appear first
+        let mut ranked: Vec<(String, Vec<String>)> = templates.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        for (msg, anchors) in ranked.iter().take(6) {
+            let cnt = anchors.len().max(1);
+            if cnt > 1 {
+                let sample: Vec<&str> = anchors.iter().take(5).map(|s| s.as_str()).collect();
+                let more = if anchors.len() > 5 {
+                    format!(" (+{})", anchors.len() - 5)
+                } else {
+                    String::new()
+                };
+                out.push(format!("  [x{}] {}{}: {}", cnt, sample.join(","), more, msg));
+            } else if let Some(a) = anchors.first() {
+                out.push(format!("  {}: {}", a, msg));
+            } else {
+                out.push(format!("  {}", msg));
             }
         }
-        other.push(clamp_line(t, 200));
-    }
-    let mut out = vec![format!("[linter-grouped: {} files with diagnostics]", by_file.len())];
-    for (file, diags) in by_file {
-        out.push(format!("## {} ({} issues):", file, diags.len()));
-        for d in diags.iter().take(8) {
-            out.push(format!("  :{}", d));
-        }
-        if diags.len() > 8 {
-            out.push(format!("  [+{} more diagnostics in {}]", diags.len() - 8, file));
+        if ranked.len() > 6 {
+            out.push(format!("  [+{} more unique templates in {}]", ranked.len() - 6, file));
         }
     }
     if !other.is_empty() {

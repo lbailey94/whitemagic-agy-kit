@@ -114,18 +114,34 @@ def extract_commands(args):
 
 
 def latest_ctx_tokens(transcript_path):
-    """O(1) tail seek (last 24 KB) of transcript.jsonl to read current context tokens."""
+    """O(1) mtime/size-cached tail seek (last 24 KB) of transcript.jsonl for context tokens."""
     if not transcript_path:
         return 0
     try:
         p = Path(transcript_path)
-        if not p.is_file():
+        st = p.stat()
+        if not os.path.isfile(p):
             return 0
-        sz = p.stat().st_size
+        sz = st.st_size
+        mtime_ns = st.st_mtime_ns
+        # Fast O(1) stat-cache hit across parallel tool bursts within the same turn
+        cf = STATE_DIR / "ctx_stat_cache.json"
+        try:
+            if cf.is_file():
+                cached = json.loads(cf.read_text(encoding="utf-8"))
+                if (
+                    cached.get("path") == str(p)
+                    and cached.get("sz") == sz
+                    and cached.get("mtime_ns") == mtime_ns
+                ):
+                    return int(cached.get("ctx") or 0)
+        except Exception:
+            pass
         with open(p, "rb") as f:
             if sz > 24576:
                 f.seek(sz - 24576)
             tail = f.read().decode("utf-8", errors="replace")
+        ctx_found = 0
         for line in reversed(tail.splitlines()):
             if '"PLANNER_RESPONSE"' not in line:
                 continue
@@ -136,7 +152,17 @@ def latest_ctx_tokens(transcript_path):
             if o.get("type") == "PLANNER_RESPONSE":
                 ctx = int(o.get("input_tokens") or 0) + int(o.get("cache_read_tokens") or 0)
                 if ctx > 0:
-                    return ctx
+                    ctx_found = ctx
+                    break
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            cf.write_text(
+                json.dumps({"path": str(p), "sz": sz, "mtime_ns": mtime_ns, "ctx": ctx_found}),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        return ctx_found
     except Exception:
         pass
     return 0
@@ -450,30 +476,37 @@ def handle_read_file(args, payload):
 
     # C2: Auto-clamp unbounded, unbounded-tail, or wide-span (>250L / >200L@120k) reads
     if b_off is None and os.environ.get("WM_READ_CLAMP_OFF") != "1":
-        cur_ctx = latest_ctx_tokens(transcript)
-        max_span = 150 if cur_ctx >= 120_000 else 200
-        clamp_trigger = 200 if cur_ctx >= 120_000 else 250
-        is_large_file = file_exceeds_lines(p, threshold=clamp_trigger)
-        if is_large_file and conv_id and step_idx > 0:
-            if track_and_check_burst(conv_id, abs_p, step_idx):
-                max_span = min(max_span, 120)
+        # Fast-path: explicitly bounded <=150L slices can never trigger clamping — skip disk line scan!
+        already_compact = (
+            s_line is not None
+            and e_line is not None
+            and (int(e_line) - int(s_line) + 1) <= 150
+        )
+        if not already_compact:
+            cur_ctx = latest_ctx_tokens(transcript)
+            max_span = 150 if cur_ctx >= 120_000 else 200
+            clamp_trigger = 200 if cur_ctx >= 120_000 else 250
+            is_large_file = file_exceeds_lines(p, threshold=clamp_trigger)
+            if is_large_file and conv_id and step_idx > 0:
+                if track_and_check_burst(conv_id, abs_p, step_idx):
+                    max_span = min(max_span, 120)
 
-        if s_line is None and e_line is None:
-            if is_large_file:
-                s_line = 1
-                e_line = max_span
-                overwrite = {"StartLine": 1, "EndLine": max_span}
-        elif s_line is not None and e_line is None:
-            if is_large_file:
+            if s_line is None and e_line is None:
+                if is_large_file:
+                    s_line = 1
+                    e_line = max_span
+                    overwrite = {"StartLine": 1, "EndLine": max_span}
+            elif s_line is not None and e_line is None:
+                if is_large_file:
+                    s_int = int(s_line)
+                    e_line = s_int + max_span - 1
+                    overwrite = {"EndLine": e_line}
+            elif s_line is not None and e_line is not None:
                 s_int = int(s_line)
-                e_line = s_int + max_span - 1
-                overwrite = {"EndLine": e_line}
-        elif s_line is not None and e_line is not None:
-            s_int = int(s_line)
-            e_int = int(e_line)
-            if (e_int - s_int + 1) > clamp_trigger:
-                e_line = s_int + max_span - 1
-                overwrite = {"EndLine": e_line}
+                e_int = int(e_line)
+                if (e_int - s_int + 1) > clamp_trigger:
+                    e_line = s_int + max_span - 1
+                    overwrite = {"EndLine": e_line}
 
     # C3: Exact unchanged duplicate-slice dedup
     if conv_id and step_idx > 0:
@@ -509,6 +542,10 @@ def handle_whitemagic_mcp(tool_name, args):
         lim = args.get("limit")
         if lim is None or (isinstance(lim, (int, float)) and lim > 6):
             return {"decision": "allow", "overwrite": {"limit": 5}}
+    elif tool_name == "mcp_wm-research-engine_research_hunt":
+        lim = args.get("limit")
+        if isinstance(lim, (int, float)) and lim > 8:
+            return {"decision": "allow", "overwrite": {"limit": 8}}
     return {"decision": "allow"}
 
 
@@ -648,12 +685,13 @@ def main():
         emit(handle_manage_task(args, payload))
         return
 
-    # 4. WhiteMagic MCP auto-budget enforcement
+    # 4. WhiteMagic & Research Engine MCP auto-budget enforcement
     if tool_name in (
         "mcp_whitemagic_session_continuity",
         "mcp_whitemagic_memory_recall",
         "mcp_whitemagic_whitemagic_gen3_session_continuity",
         "mcp_whitemagic_whitemagic_gen3_memory_recall",
+        "mcp_wm-research-engine_research_hunt",
     ):
         emit(handle_whitemagic_mcp(tool_name, args))
         return

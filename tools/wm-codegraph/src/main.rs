@@ -496,13 +496,18 @@ fn load_cache(path: &Path) -> BTreeMap<String, FileEntry> {
     };
     let mut cur_rel: Option<String> = None;
     for line in raw.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        match parts.first().copied() {
-            Some("F") if parts.len() >= 5 => {
-                let rel = parts[1].to_string();
-                let mtime_ns = parts[2].parse().unwrap_or(0);
-                let size = parts[3].parse().unwrap_or(0);
-                let lines = parts[4].parse().unwrap_or(0);
+        let mut it = line.split('\t');
+        match it.next() {
+            Some("F") => {
+                let (Some(rel_s), Some(mt_s), Some(sz_s), Some(ln_s)) =
+                    (it.next(), it.next(), it.next(), it.next())
+                else {
+                    continue;
+                };
+                let rel = rel_s.to_string();
+                let mtime_ns = mt_s.parse().unwrap_or(0);
+                let size = sz_s.parse().unwrap_or(0);
+                let lines = ln_s.parse().unwrap_or(0);
                 map.insert(
                     rel.clone(),
                     FileEntry {
@@ -515,29 +520,34 @@ fn load_cache(path: &Path) -> BTreeMap<String, FileEntry> {
                 );
                 cur_rel = Some(rel);
             }
-            Some("I") if parts.len() >= 2 => {
-                if let Some(r) = &cur_rel {
+            Some("I") => {
+                if let (Some(r), Some(imp)) = (&cur_rel, it.next()) {
                     if let Some(fe) = map.get_mut(r) {
-                        fe.imports.push(parts[1].to_string());
+                        fe.imports.push(imp.to_string());
                     }
                 }
             }
-            Some("S") if parts.len() >= 7 => {
+            Some("S") => {
+                let (Some(kind), Some(name), Some(st), Some(en), Some(calls_s), Some(sig)) =
+                    (it.next(), it.next(), it.next(), it.next(), it.next(), it.next())
+                else {
+                    continue;
+                };
                 if let Some(r) = &cur_rel {
                     if let Some(fe) = map.get_mut(r) {
-                        let calls = if parts[5].is_empty() {
+                        let calls = if calls_s.is_empty() {
                             Vec::new()
                         } else {
-                            parts[5].split(',').map(String::from).collect()
+                            calls_s.split(',').map(String::from).collect()
                         };
                         fe.symbols.push(Symbol {
-                            kind: parts[1].to_string(),
-                            name: parts[2].to_string(),
+                            kind: kind.to_string(),
+                            name: name.to_string(),
                             file: r.clone(),
-                            start_line: parts[3].parse().unwrap_or(1),
-                            end_line: parts[4].parse().unwrap_or(1),
+                            start_line: st.parse().unwrap_or(1),
+                            end_line: en.parse().unwrap_or(1),
                             calls,
-                            signature: parts[6].to_string(),
+                            signature: sig.to_string(),
                         });
                     }
                 }
@@ -576,7 +586,7 @@ fn save_cache(path: &Path, files: &BTreeMap<String, FileEntry>) {
 impl RepoIndex {
     fn build(root: &Path) -> Self {
         let cpath = cache_file_for(root);
-        let prev = load_cache(&cpath);
+        let mut prev = load_cache(&cpath);
         let mut discovered = Vec::new();
         walk_repo(root, root, &mut discovered);
 
@@ -584,9 +594,9 @@ impl RepoIndex {
         let mut changed = prev.len() != discovered.len();
 
         for (rel, abs, mtime_ns, size, lang) in discovered {
-            if let Some(old) = prev.get(&rel) {
+            if let Some(old) = prev.remove(&rel) {
                 if old.mtime_ns == mtime_ns && old.size == size {
-                    files.insert(rel, old.clone());
+                    files.insert(rel, old);
                     continue;
                 }
             }
@@ -693,17 +703,17 @@ impl RepoIndex {
                 out.push(format!("  - `{}:{}-{} ` {}", d.file, d.start_line, d.end_line, d.signature));
             }
         }
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-        visited.insert(target.to_string());
-        queue.push_back((target.to_string(), 0));
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut queue: VecDeque<(&str, usize)> = VecDeque::new();
+        visited.insert(target);
+        queue.push_back((target, 0));
         let mut edges = Vec::new();
 
         while let Some((cur, depth)) = queue.pop_front() {
             if depth >= max_depth {
                 continue;
             }
-            if let Some(callers) = rev.get(cur.as_str()) {
+            if let Some(callers) = rev.get(cur) {
                 for caller in callers {
                     edges.push(format!(
                         "  [d{}] `{}` ({}:L{}-L{}) -> `{}`",
@@ -714,8 +724,8 @@ impl RepoIndex {
                         caller.end_line,
                         cur
                     ));
-                    if visited.insert(caller.name.clone()) {
-                        queue.push_back((caller.name.clone(), depth + 1));
+                    if visited.insert(caller.name.as_str()) {
+                        queue.push_back((caller.name.as_str(), depth + 1));
                     }
                 }
             }
