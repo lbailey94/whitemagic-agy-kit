@@ -30,6 +30,7 @@ const TM7B_MAGIC_V3: &[u8; 8] = b"TM7B\x03\x00\x00\x00";
 const TM7B_MAGIC_V4: &[u8; 8] = b"TM7B\x04\x00\x00\x00";
 const TM7B_MAGIC_V5: &[u8; 8] = b"TM7B\x05\x00\x00\x00";
 const TM7B_MAGIC_V6: &[u8; 8] = b"TM7B\x06\x00\x00\x00";
+const TM7B_MAGIC_V7: &[u8; 8] = b"TM7B\x07\x00\x00\x00";
 const HMS_MAGIC_V1: &[u8; 8] = b"HMS1\x01\x00\x00\x00";
 const NS3S_MAGIC_V1: &[u8; 8] = b"NS3S\x01\x00\x00\x00";
 const CSPD_MAGIC_V1: &[u8; 8] = b"CSPD\x01\x00\x00\x00";
@@ -48,6 +49,10 @@ struct ModelConfig {
     engram_dim: usize,
     mac_dim: usize,
     core_delta_mask: u32,
+    conv_k: usize,
+    rope_theta: f32,
+    rope_scale: f32,
+    rope_rotary_frac: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,53 +213,97 @@ struct TernaryLayer {
 /// (`0.75 bytes/weight` = `5.3x` smaller than FP32, `>0.999` cosine similarity!) of FP32 layers
 /// (`tok_emb`, `prelude.0`, `coda.1`, `w_write`) used ONLY by the Matryoshka self-speculative
 /// drafter (`--spec-k > 0`). Target verification always uses exact FP32 + T-MAC.
-fn quantize_f32_to_tmac_layer(w: &[f32], rows: usize, cols: usize) -> TernaryLayer {
-    let mut s1_scales = vec![1e-6_f32; rows];
-    let mut s2_scales = vec![1e-6_f32; rows];
-    let mut s3_scales = vec![1e-6_f32; rows];
+fn quantize_f32_to_tmac_layer(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    scale_axis: ScaleAxis,
+) -> TernaryLayer {
     let mut q1 = vec![0i8; rows * cols];
     let mut q2 = vec![0i8; rows * cols];
     let mut q3 = vec![0i8; rows * cols];
 
-    q1.par_chunks_mut(cols)
-        .zip(q2.par_chunks_mut(cols))
-        .zip(q3.par_chunks_mut(cols))
-        .zip(s1_scales.par_iter_mut())
-        .zip(s2_scales.par_iter_mut())
-        .zip(s3_scales.par_iter_mut())
-        .enumerate()
-        .for_each(|(r, (((((q1_r, q2_r), q3_r), sc1), sc2), sc3))| {
-            let src = &w[r * cols..(r + 1) * cols];
+    let (s1_scales, s2_scales, s3_scales) = if scale_axis == ScaleAxis::PerIc {
+        let mut s1_c = vec![1e-6_f32; cols];
+        let mut s2_c = vec![1e-6_f32; cols];
+        let mut s3_c = vec![1e-6_f32; cols];
+        for c in 0..cols {
             let mut sum_abs = 0.0_f32;
-            for &v in src {
-                sum_abs += v.abs();
+            for r in 0..rows {
+                sum_abs += w[r * cols + c].abs();
             }
-            let s1 = (sum_abs / (cols as f32)).max(1e-6);
+            let s1 = (sum_abs / (rows as f32)).max(1e-6);
             let s2 = s1 / 3.0;
-            *sc1 = s1;
-            *sc2 = s2;
+            s1_c[c] = s1;
+            s2_c[c] = s2;
             let mut res_abs = 0.0_f32;
-            for c in 0..cols {
-                let q9 = (src[c] / s2).round().clamp(-4.0, 4.0);
+            for r in 0..rows {
+                let idx = r * cols + c;
+                let q9 = (w[idx] / s2).round().clamp(-4.0, 4.0);
                 let v1 = q9.signum() * ((q9.abs() + 1.0) / 3.0).floor();
                 let v2 = q9 - 3.0 * v1;
-                q1_r[c] = v1 as i8;
-                q2_r[c] = v2 as i8;
-                let r2 = src[c] - (v1 * s1 + v2 * s2);
-                res_abs += r2.abs();
+                q1[idx] = v1 as i8;
+                q2[idx] = v2 as i8;
+                res_abs += (w[idx] - (v1 * s1 + v2 * s2)).abs();
             }
-            let s3 = (res_abs / (cols as f32)).max(1e-6);
-            *sc3 = s3;
-            for c in 0..cols {
-                let r2 = src[c] - (f32::from(q1_r[c]) * s1 + f32::from(q2_r[c]) * s2);
-                q3_r[c] = (r2 / s3).round().clamp(-1.0, 1.0) as i8;
+            let s3 = (res_abs / (rows as f32)).max(1e-6);
+            s3_c[c] = s3;
+            for r in 0..rows {
+                let idx = r * cols + c;
+                let r2 = w[idx] - (f32::from(q1[idx]) * s1 + f32::from(q2[idx]) * s2);
+                q3[idx] = (r2 / s3).round().clamp(-1.0, 1.0) as i8;
             }
-        });
+        }
+        (s1_c, s2_c, s3_c)
+    } else {
+        let mut s1_r = vec![1e-6_f32; rows];
+        let mut s2_r = vec![1e-6_f32; rows];
+        let mut s3_r = vec![1e-6_f32; rows];
+        q1.par_chunks_mut(cols)
+            .zip(q2.par_chunks_mut(cols))
+            .zip(q3.par_chunks_mut(cols))
+            .zip(s1_r.par_iter_mut())
+            .zip(s2_r.par_iter_mut())
+            .zip(s3_r.par_iter_mut())
+            .enumerate()
+            .for_each(|(r, (((((q1_r, q2_r), q3_r), sc1), sc2), sc3))| {
+                let src = &w[r * cols..(r + 1) * cols];
+                let mut sum_abs = 0.0_f32;
+                for &v in src {
+                    sum_abs += v.abs();
+                }
+                let s1 = (sum_abs / (cols as f32)).max(1e-6);
+                let s2 = s1 / 3.0;
+                *sc1 = s1;
+                *sc2 = s2;
+                let mut res_abs = 0.0_f32;
+                for c in 0..cols {
+                    let q9 = (src[c] / s2).round().clamp(-4.0, 4.0);
+                    let v1 = q9.signum() * ((q9.abs() + 1.0) / 3.0).floor();
+                    let v2 = q9 - 3.0 * v1;
+                    q1_r[c] = v1 as i8;
+                    q2_r[c] = v2 as i8;
+                    let r2 = src[c] - (v1 * s1 + v2 * s2);
+                    res_abs += r2.abs();
+                }
+                let s3 = (res_abs / (cols as f32)).max(1e-6);
+                *sc3 = s3;
+                for c in 0..cols {
+                    let r2 = src[c] - (f32::from(q1_r[c]) * s1 + f32::from(q2_r[c]) * s2);
+                    q3_r[c] = (r2 / s3).round().clamp(-1.0, 1.0) as i8;
+                }
+            });
+        (s1_r, s2_r, s3_r)
+    };
 
     TernaryLayer {
         rows,
         cols,
-        scale_axis: ScaleAxis::PerOc,
+        scale_axis: if scale_axis == ScaleAxis::PerIc {
+            ScaleAxis::PerIc
+        } else {
+            ScaleAxis::PerOc
+        },
         shells: vec![
             TernaryShell {
                 scales: s1_scales,
@@ -1095,8 +1144,13 @@ fn build_draft_tmac_mirrors(b: &mut MuninnBundle) {
             && rows % 32 == 0
             && cols % 2 == 0
         {
+            let axis = if name.ends_with(".wo.weight") || name.ends_with(".w_down.weight") {
+                ScaleAxis::PerIc
+            } else {
+                ScaleAxis::PerOc
+            };
             b.floats_tmac
-                .insert(name, quantize_f32_to_tmac_layer(w, rows, cols));
+                .insert(name, quantize_f32_to_tmac_layer(w, rows, cols, axis));
         }
     }
 }
@@ -1109,7 +1163,9 @@ fn load_tm7b_v3(path: &str, max_shells_opt: Option<usize>) -> MuninnBundle {
     let mut reader = BufReader::with_capacity(1 << 20, file);
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic).expect("read TM7B magic");
-    let bundle_version = if &magic == TM7B_MAGIC_V6 {
+    let bundle_version = if &magic == TM7B_MAGIC_V7 {
+        7u8
+    } else if &magic == TM7B_MAGIC_V6 {
         6u8
     } else if &magic == TM7B_MAGIC_V5 {
         5u8
@@ -1118,7 +1174,7 @@ fn load_tm7b_v3(path: &str, max_shells_opt: Option<usize>) -> MuninnBundle {
     } else if &magic == TM7B_MAGIC_V3 {
         3u8
     } else {
-        panic!("invalid TM7B\\x03, TM7B\\x04, TM7B\\x05, or TM7B\\x06 magic");
+        panic!("invalid TM7B\\x03..TM7B\\x07 magic");
     };
     let vocab_size = stream_u32_le(&mut reader) as usize;
     let d_model = stream_u32_le(&mut reader) as usize;
@@ -1132,6 +1188,15 @@ fn load_tm7b_v3(path: &str, max_shells_opt: Option<usize>) -> MuninnBundle {
     let core_delta_mask = stream_u32_le(&mut reader);
     let n_floats = stream_u32_le(&mut reader) as usize;
     let n_ternary = stream_u32_le(&mut reader) as usize;
+    let (conv_k, rope_theta, rope_scale, rope_rotary_frac) = if bundle_version >= 7 {
+        let ck = (stream_u32_le(&mut reader) as usize).max(1);
+        let rt = stream_f32_le(&mut reader);
+        let rs = stream_f32_le(&mut reader);
+        let rrf = stream_f32_le(&mut reader);
+        (ck, rt, rs, rrf)
+    } else {
+        (4usize, 1_000_000.0_f32, 1.0_f32, 1.0_f32)
+    };
 
     let tok_len = stream_u32_le(&mut reader) as usize;
     let mut tok_bytes = vec![0u8; tok_len];
@@ -1300,6 +1365,10 @@ fn load_tm7b_v3(path: &str, max_shells_opt: Option<usize>) -> MuninnBundle {
             engram_dim,
             mac_dim,
             core_delta_mask,
+            conv_k,
+            rope_theta,
+            rope_scale,
+            rope_rotary_frac,
         },
         tok,
         floats,
@@ -1356,12 +1425,37 @@ fn linear_vec_bias(
     out
 }
 
-fn apply_rope_pos(v: &mut [f32], pos: usize, n_heads: usize, head_dim: usize) {
-    let p = pos as f32;
+fn rms_norm_per_head_inplace(v: &mut [f32], w: &[f32], n_heads: usize, head_dim: usize) {
     for h in 0..n_heads {
         let base = h * head_dim;
-        for i in (0..head_dim).step_by(2) {
-            let inv_freq = 1.0_f32 / (1_000_000.0_f32.powf((i as f32) / (head_dim as f32)));
+        let mut sq = 0.0_f32;
+        for d in 0..head_dim {
+            let x = v[base + d];
+            sq += x * x;
+        }
+        let inv = (sq / (head_dim as f32) + 1e-6).sqrt().recip();
+        for d in 0..head_dim {
+            v[base + d] = v[base + d] * inv * w[d];
+        }
+    }
+}
+
+fn apply_rope_pos(
+    v: &mut [f32],
+    pos: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    rope_scale: f32,
+    rope_rotary_frac: f32,
+) {
+    let p = (pos as f32) / rope_scale.max(1e-6);
+    let rotary_dim = ((((head_dim as f32) * rope_rotary_frac).round() as usize).clamp(2, head_dim))
+        & !1;
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        for i in (0..rotary_dim).step_by(2) {
+            let inv_freq = 1.0_f32 / (rope_theta.powf((i as f32) / (rotary_dim as f32)));
             let ang = p * inv_freq;
             let (s, c) = ang.sin_cos();
             let x0 = v[base + i];
@@ -1465,13 +1559,14 @@ impl BlockState {
             v: Vec::with_capacity(max_len * d_model),
         }
     }
-    fn new_delta(n_heads: usize, head_dim: usize) -> Self {
+    fn new_delta(n_heads: usize, head_dim: usize, conv_k: usize) -> Self {
         let d_model = n_heads * head_dim;
+        let hist_taps = conv_k.saturating_sub(1);
         Self::DeltaHologram {
             s_mat: vec![0.0_f32; n_heads * head_dim * head_dim],
-            conv_q: vec![0.0_f32; 3 * d_model],
-            conv_k: vec![0.0_f32; 3 * d_model],
-            conv_v: vec![0.0_f32; 3 * d_model],
+            conv_q: vec![0.0_f32; hist_taps * d_model],
+            conv_k: vec![0.0_f32; hist_taps * d_model],
+            conv_v: vec![0.0_f32; hist_taps * d_model],
         }
     }
 }
@@ -1584,7 +1679,7 @@ impl MuninnRuntimeState {
             for b_idx in 0..cfg.n_core_blocks {
                 let is_delta = ((cfg.core_delta_mask >> b_idx) & 1) != 0;
                 if is_delta {
-                    core.push(BlockState::new_delta(cfg.n_heads, cfg.head_dim));
+                    core.push(BlockState::new_delta(cfg.n_heads, cfg.head_dim, cfg.conv_k));
                 } else {
                     core.push(BlockState::new_attn(cfg.d_model, max_len));
                 }
@@ -1955,10 +2050,37 @@ fn forward_batch_k_ext(
         };
         let is_delta_v6 = b.cfg.bundle_version >= 6
             && matches!(blk_state, BlockState::DeltaHologram { .. });
+        if !matches!(blk_state, BlockState::DeltaHologram { .. }) {
+            if let (Some(qnw), Some(knw)) = (
+                b.floats.get(&format!("{prefix}.q_norm.weight")),
+                b.floats.get(&format!("{prefix}.k_norm.weight")),
+            ) {
+                for t in 0..k_len {
+                    rms_norm_per_head_inplace(&mut qs[t], qnw, n_heads, head_dim);
+                    rms_norm_per_head_inplace(&mut ks[t], knw, n_heads, head_dim);
+                }
+            }
+        }
         if use_rope && !is_delta_v6 {
             for t in 0..k_len {
-                apply_rope_pos(&mut qs[t], base_pos + t, n_heads, head_dim);
-                apply_rope_pos(&mut ks[t], base_pos + t, n_heads, head_dim);
+                apply_rope_pos(
+                    &mut qs[t],
+                    base_pos + t,
+                    n_heads,
+                    head_dim,
+                    b.cfg.rope_theta,
+                    b.cfg.rope_scale,
+                    b.cfg.rope_rotary_frac,
+                );
+                apply_rope_pos(
+                    &mut ks[t],
+                    base_pos + t,
+                    n_heads,
+                    head_dim,
+                    b.cfg.rope_theta,
+                    b.cfg.rope_scale,
+                    b.cfg.rope_rotary_frac,
+                );
             }
         }
 
@@ -1977,9 +2099,18 @@ fn forward_batch_k_ext(
                     2 * n_heads,
                     d_model,
                 );
+                let w_write_tern_key = format!("{prefix}.w_write");
                 let w_write_key = format!("{prefix}.w_write.weight");
                 let w_write_b = &b.floats[&format!("{prefix}.w_write.bias")];
-                let mut w_raws = if use_i8_fp32
+                let mut w_raws = if let Some(tl) = b.ternary.get(&w_write_tern_key) {
+                    let mut tmp = eval_tmac_ternary_gemm_k(arch, tl, &hs, active_shells, true);
+                    for o in &mut tmp {
+                        for i in 0..d_model {
+                            o[i] += w_write_b[i];
+                        }
+                    }
+                    tmp
+                } else if use_i8_fp32
                     && let Some(tl) = b.floats_tmac.get(&w_write_key)
                 {
                     let mut tmp = eval_tmac_ternary_gemm_k(arch, tl, &hs, 3, true);
@@ -1998,25 +2129,27 @@ fn forward_batch_k_ext(
                 // When `record_snaps` is true, also capture per-token `s_mat` + `conv` snapshots for O(1) 0.2ms rollback!
                 let mut conv_snaps: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
                 if b.cfg.bundle_version >= 6 {
+                    let k_taps = b.cfg.conv_k.max(1);
+                    let hist_taps = k_taps.saturating_sub(1);
                     for t in 0..k_len {
                         let apply_short_conv =
                             |vec_cur: &mut [f32], hist: &mut [f32], cname: &str| {
                                 if let Some(cw) = b.floats.get(&format!("{prefix}.{cname}.weight")) {
                                     let cb = b.floats.get(&format!("{prefix}.{cname}.bias"));
                                     for d in 0..d_model {
-                                        let x0 = hist[d];
-                                        let x1 = hist[d_model + d];
-                                        let x2 = hist[2 * d_model + d];
-                                        let x3 = vec_cur[d];
-                                        hist[d] = x1;
-                                        hist[d_model + d] = x2;
-                                        hist[2 * d_model + d] = x3;
-                                        let w0 = cw[d * 4];
-                                        let w1 = cw[d * 4 + 1];
-                                        let w2 = cw[d * 4 + 2];
-                                        let w3 = cw[d * 4 + 3];
-                                        let bias = cb.map(|bv| bv[d]).unwrap_or(0.0);
-                                        let y = w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3 + bias;
+                                        let mut y = cb.map(|bv| bv[d]).unwrap_or(0.0);
+                                        let w_off = d * k_taps;
+                                        for j in 0..hist_taps {
+                                            y += cw[w_off + j] * hist[j * d_model + d];
+                                        }
+                                        let x_cur = vec_cur[d];
+                                        y += cw[w_off + hist_taps] * x_cur;
+                                        if hist_taps > 0 {
+                                            for j in 0..(hist_taps - 1) {
+                                                hist[j * d_model + d] = hist[(j + 1) * d_model + d];
+                                            }
+                                            hist[(hist_taps - 1) * d_model + d] = x_cur;
+                                        }
                                         vec_cur[d] = y * sigmoid(y);
                                     }
                                 }
@@ -2218,7 +2351,8 @@ fn forward_batch_k_ext(
         }
     };
 
-    run_block_batch(&mut xs, &mut state.prelude[0], None, "prelude.0", true, false, 1.0);
+    let p0_tern = b.ternary.contains_key("prelude.0.wq");
+    run_block_batch(&mut xs, &mut state.prelude[0], None, "prelude.0", true, p0_tern, 1.0);
     run_block_batch(&mut xs, &mut state.prelude[1], None, "prelude.1", false, true, 1.0);
     let xs_prelude = xs.clone();
 
@@ -2229,6 +2363,20 @@ fn forward_batch_k_ext(
         .collect();
 
     for loop_idx in 0..state.r_loops {
+        if let Some(le) = b.floats.get("loop_emb") {
+            let max_r = le.len() / d_model;
+            if max_r > 0 {
+                let r_clamped = loop_idx.min(max_r - 1);
+                let row = &le[r_clamped * d_model..(r_clamped + 1) * d_model];
+                for st_t in &mut streams {
+                    for s_i in 0..N_STREAMS {
+                        for d in 0..d_model {
+                            st_t[s_i][d] += row[d];
+                        }
+                    }
+                }
+            }
+        }
         let trop_temp = 1.0 + 0.15 * (loop_idx as f32);
         for b_idx in 0..n_core {
             let mhc = &b.mhc_core[b_idx];
@@ -2316,8 +2464,9 @@ fn forward_batch_k_ext(
         })
         .collect();
 
+    let c1_tern = b.ternary.contains_key("coda.1.wq");
     run_block_batch(&mut mergeds, &mut state.coda[0], None, "coda.0", true, true, 1.0);
-    run_block_batch(&mut mergeds, &mut state.coda[1], None, "coda.1", false, false, 1.0);
+    run_block_batch(&mut mergeds, &mut state.coda[1], None, "coda.1", false, c1_tern, 1.0);
     state.pos += k_len;
 
     let fn_w = &b.floats["final_norm.weight"];
@@ -2500,9 +2649,34 @@ fn forward_step(
         }
         let is_delta_v6 = b.cfg.bundle_version >= 6
             && matches!(blk_state, BlockState::DeltaHologram { .. });
+        if !matches!(blk_state, BlockState::DeltaHologram { .. }) {
+            if let (Some(qnw), Some(knw)) = (
+                b.floats.get(&format!("{prefix}.q_norm.weight")),
+                b.floats.get(&format!("{prefix}.k_norm.weight")),
+            ) {
+                rms_norm_per_head_inplace(&mut q, qnw, n_heads, head_dim);
+                rms_norm_per_head_inplace(&mut k, knw, n_heads, head_dim);
+            }
+        }
         if use_rope && !is_delta_v6 {
-            apply_rope_pos(&mut q, pos, n_heads, head_dim);
-            apply_rope_pos(&mut k, pos, n_heads, head_dim);
+            apply_rope_pos(
+                &mut q,
+                pos,
+                n_heads,
+                head_dim,
+                b.cfg.rope_theta,
+                b.cfg.rope_scale,
+                b.cfg.rope_rotary_frac,
+            );
+            apply_rope_pos(
+                &mut k,
+                pos,
+                n_heads,
+                head_dim,
+                b.cfg.rope_theta,
+                b.cfg.rope_scale,
+                b.cfg.rope_rotary_frac,
+            );
         }
 
         let ctx = match blk_state {
@@ -2512,26 +2686,28 @@ fn forward_step(
                 conv_k,
                 conv_v,
             } => {
-                // TM7B\x06: Causal depthwise short_conv1d(k=4) + SiLU on NoPE DeltaNet-2 q, k, v!
+                // TM7B\x06+ Causal depthwise short_conv1d(k=conv_k) + SiLU on NoPE DeltaNet-2 q, k, v!
                 if b.cfg.bundle_version >= 6 {
+                    let k_taps = b.cfg.conv_k.max(1);
+                    let hist_taps = k_taps.saturating_sub(1);
                     let apply_short_conv =
                         |vec_cur: &mut [f32], hist: &mut [f32], cname: &str| {
                             if let Some(cw) = b.floats.get(&format!("{prefix}.{cname}.weight")) {
                                 let cb = b.floats.get(&format!("{prefix}.{cname}.bias"));
                                 for d in 0..d_model {
-                                    let x0 = hist[d];
-                                    let x1 = hist[d_model + d];
-                                    let x2 = hist[2 * d_model + d];
-                                    let x3 = vec_cur[d];
-                                    hist[d] = x1;
-                                    hist[d_model + d] = x2;
-                                    hist[2 * d_model + d] = x3;
-                                    let w0 = cw[d * 4];
-                                    let w1 = cw[d * 4 + 1];
-                                    let w2 = cw[d * 4 + 2];
-                                    let w3 = cw[d * 4 + 3];
-                                    let bias = cb.map(|bv| bv[d]).unwrap_or(0.0);
-                                    let y = w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3 + bias;
+                                    let mut y = cb.map(|bv| bv[d]).unwrap_or(0.0);
+                                    let w_off = d * k_taps;
+                                    for j in 0..hist_taps {
+                                        y += cw[w_off + j] * hist[j * d_model + d];
+                                    }
+                                    let x_cur = vec_cur[d];
+                                    y += cw[w_off + hist_taps] * x_cur;
+                                    if hist_taps > 0 {
+                                        for j in 0..(hist_taps - 1) {
+                                            hist[j * d_model + d] = hist[(j + 1) * d_model + d];
+                                        }
+                                        hist[(hist_taps - 1) * d_model + d] = x_cur;
+                                    }
                                     vec_cur[d] = y * sigmoid(y);
                                 }
                             }
@@ -2548,14 +2724,25 @@ fn forward_step(
                     2 * n_heads,
                     d_model,
                 );
-                let w_raw = linear_vec_bias(
-                    arch,
-                    &b.floats[&format!("{prefix}.w_write.weight")],
-                    &b.floats[&format!("{prefix}.w_write.bias")],
-                    &h,
-                    d_model,
-                    d_model,
-                );
+                let w_write_b = &b.floats[&format!("{prefix}.w_write.bias")];
+                let w_raw = if let Some(tl) = b.ternary.get(&format!("{prefix}.w_write")) {
+                    let mut dummy_diff = 0i32;
+                    let mut tmp =
+                        eval_tmac_ternary_gemv(arch, tl, &h, active_shells, true, false, &mut dummy_diff);
+                    for i in 0..d_model {
+                        tmp[i] += w_write_b[i];
+                    }
+                    tmp
+                } else {
+                    linear_vec_bias(
+                        arch,
+                        &b.floats[&format!("{prefix}.w_write.weight")],
+                        w_write_b,
+                        &h,
+                        d_model,
+                        d_model,
+                    )
+                };
                 let mut out_vec = vec![0.0_f32; d_model];
                 s_mat
                     .par_chunks_mut(head_dim * head_dim)
@@ -2654,12 +2841,13 @@ fn forward_step(
         apply_clifford_wedge(step_x, &fn_in, &ffn_out, c_alpha);
     };
 
+    let p0_tern = b.ternary.contains_key("prelude.0.wq");
     run_block_step(
         &mut x,
         &mut state.prelude[0],
         "prelude.0",
         true,
-        false,
+        p0_tern,
         1.0,
         false,
         max_int_diff,
@@ -2679,6 +2867,18 @@ fn forward_step(
     let inj = b.floats["gamma_inj"][0].tanh() * 0.25;
     let mut streams = [x.clone(), x.clone(), x.clone(), x];
     for loop_idx in 0..state.r_loops {
+        if let Some(le) = b.floats.get("loop_emb") {
+            let max_r = le.len() / d_model;
+            if max_r > 0 {
+                let r_clamped = loop_idx.min(max_r - 1);
+                let row = &le[r_clamped * d_model..(r_clamped + 1) * d_model];
+                for s_i in 0..N_STREAMS {
+                    for d in 0..d_model {
+                        streams[s_i][d] += row[d];
+                    }
+                }
+            }
+        }
         let trop_temp = 1.0 + 0.15 * (loop_idx as f32);
         for b_idx in 0..n_core {
             let mhc = &b.mhc_core[b_idx];
@@ -2782,6 +2982,7 @@ fn forward_step(
     for d in 0..d_model {
         merged[d] = 0.25 * (streams[0][d] + streams[1][d] + streams[2][d] + streams[3][d]);
     }
+    let c1_tern = b.ternary.contains_key("coda.1.wq");
     run_block_step(
         &mut merged,
         &mut state.coda[0],
@@ -2797,7 +2998,7 @@ fn forward_step(
         &mut state.coda[1],
         "coda.1",
         false,
-        false,
+        c1_tern,
         1.0,
         false,
         max_int_diff,
@@ -3999,6 +4200,8 @@ fn main() {
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i)
             .unwrap_or(0);
+        let mut lg_s1: Option<Vec<f32>> = None;
+        let mut lg_s3: Option<Vec<f32>> = None;
         for sh in 1..=bundle.cfg.n_shells {
             let mut dummy = 0i32;
             let mut st = MuninnRuntimeState::new(&bundle.cfg, 4, r0.pids.len() + 2);
@@ -4021,6 +4224,12 @@ fn main() {
                     lg = l;
                 }
             }
+            if sh == 1 {
+                lg_s1 = Some(lg.clone());
+            }
+            if sh == bundle.cfg.n_shells {
+                lg_s3 = Some(lg.clone());
+            }
             let am = lg
                 .iter()
                 .enumerate()
@@ -4040,6 +4249,16 @@ fn main() {
                 "ref0_cosine_vs_pytorch_full": (cos * 1_000_000.0).round() / 1_000_000.0,
                 "ref0_max_logit_diff": md,
                 "ref0_top1_match_full": am == argmax_py,
+            }));
+        }
+        if let (Some(a), Some(b)) = (lg_s1.as_ref(), lg_s3.as_ref()) {
+            let cos_13 = cosine_sim(a, b);
+            let div_13 = (1.0 - cos_13).max(0.0);
+            guna_probes.push(serde_json::json!({
+                "dual_shell_crc_audit": true,
+                "s1_vs_s3_cosine": (cos_13 * 1_000_000.0).round() / 1_000_000.0,
+                "s1_vs_s3_divergence": (div_13 * 1_000_000.0).round() / 1_000_000.0,
+                "crc_alpha_0_01_pass": div_13 < 0.25,
             }));
         }
         let _ = ref0_logits.len();
