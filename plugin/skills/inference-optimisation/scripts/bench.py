@@ -122,7 +122,7 @@ def document(tokens, seed, needles=3):
 def on_ac():
     try:
         if sys.platform == "darwin":
-            return "AC Power" in subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
+            return "AC Power" in subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=15).stdout
         import glob
         vals = [open(p).read().strip() for p in glob.glob("/sys/class/power_supply/*/online")]
         return not vals or "1" in vals
@@ -157,13 +157,13 @@ def run(cfg_path, long_ctx=None, skip_cn=False, reps=6):
 
     def stop_server():
         if cfg.get("stop"):
-            subprocess.run(cfg["stop"], capture_output=True)
+            subprocess.run(cfg["stop"], capture_output=True, timeout=30)
 
     watch = MemWatch(cfg["memory"], stop_server) if cfg.get("memory", {}).get("probe") else None
     if cfg.get("launch"):
         stop_server()
         t0 = time.monotonic()
-        subprocess.run(cfg["launch"], check=True, capture_output=True)
+        subprocess.run(cfg["launch"], check=True, capture_output=True, timeout=int(cfg.get("health_timeout_s", 900)))
         if watch:
             watch.start()
         deadline = t0 + cfg.get("health_timeout_s", 900)

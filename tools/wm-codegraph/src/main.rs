@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -494,7 +495,7 @@ fn load_cache(path: &Path) -> BTreeMap<String, FileEntry> {
     let Ok(raw) = fs::read_to_string(path) else {
         return map;
     };
-    let mut cur_rel: Option<String> = None;
+    let mut cur: Option<(String, FileEntry)> = None;
     for line in raw.lines() {
         let mut it = line.split('\t');
         match it.next() {
@@ -504,12 +505,15 @@ fn load_cache(path: &Path) -> BTreeMap<String, FileEntry> {
                 else {
                     continue;
                 };
+                if let Some((prev_rel, prev_fe)) = cur.take() {
+                    map.insert(prev_rel, prev_fe);
+                }
                 let rel = rel_s.to_string();
                 let mtime_ns = mt_s.parse().unwrap_or(0);
                 let size = sz_s.parse().unwrap_or(0);
                 let lines = ln_s.parse().unwrap_or(0);
-                map.insert(
-                    rel.clone(),
+                cur = Some((
+                    rel,
                     FileEntry {
                         mtime_ns,
                         size,
@@ -517,14 +521,11 @@ fn load_cache(path: &Path) -> BTreeMap<String, FileEntry> {
                         imports: Vec::new(),
                         symbols: Vec::new(),
                     },
-                );
-                cur_rel = Some(rel);
+                ));
             }
             Some("I") => {
-                if let (Some(r), Some(imp)) = (&cur_rel, it.next()) {
-                    if let Some(fe) = map.get_mut(r) {
-                        fe.imports.push(imp.to_string());
-                    }
+                if let (Some((_, ref mut fe)), Some(imp)) = (&mut cur, it.next()) {
+                    fe.imports.push(imp.to_string());
                 }
             }
             Some("S") => {
@@ -533,27 +534,29 @@ fn load_cache(path: &Path) -> BTreeMap<String, FileEntry> {
                 else {
                     continue;
                 };
-                if let Some(r) = &cur_rel {
-                    if let Some(fe) = map.get_mut(r) {
-                        let calls = if calls_s.is_empty() {
-                            Vec::new()
-                        } else {
-                            calls_s.split(',').map(String::from).collect()
-                        };
-                        fe.symbols.push(Symbol {
-                            kind: kind.to_string(),
-                            name: name.to_string(),
-                            file: r.clone(),
-                            start_line: st.parse().unwrap_or(1),
-                            end_line: en.parse().unwrap_or(1),
-                            calls,
-                            signature: sig.to_string(),
-                        });
+                if let Some((ref cur_rel, ref mut fe)) = cur {
+                    let mut calls = Vec::new();
+                    if !calls_s.is_empty() {
+                        for c in calls_s.split(',') {
+                            calls.push(c.to_string());
+                        }
                     }
+                    fe.symbols.push(Symbol {
+                        kind: kind.to_string(),
+                        name: name.to_string(),
+                        file: String::from(cur_rel.as_str()),
+                        start_line: st.parse().unwrap_or(1),
+                        end_line: en.parse().unwrap_or(1),
+                        calls,
+                        signature: sig.to_string(),
+                    });
                 }
             }
             _ => {}
         }
+    }
+    if let Some((last_rel, last_fe)) = cur {
+        map.insert(last_rel, last_fe);
     }
     map
 }
@@ -564,23 +567,31 @@ fn save_cache(path: &Path, files: &BTreeMap<String, FileEntry>) {
     }
     let mut buf = String::with_capacity(files.len() * 256);
     for (rel, fe) in files {
-        buf.push_str(&format!("F\t{}\t{}\t{}\t{}\n", rel, fe.mtime_ns, fe.size, fe.lines));
+        let _ = writeln!(buf, "F\t{}\t{}\t{}\t{}", rel, fe.mtime_ns, fe.size, fe.lines);
         for imp in &fe.imports {
-            buf.push_str(&format!("I\t{}\n", imp.replace(['\t', '\n', '\r'], " ")));
+            let _ = writeln!(buf, "I\t{}", imp.replace(['\t', '\n', '\r'], " "));
         }
         for sym in &fe.symbols {
-            buf.push_str(&format!(
-                "S\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            let _ = writeln!(
+                buf,
+                "S\t{}\t{}\t{}\t{}\t{}\t{}",
                 sym.kind,
                 sym.name,
                 sym.start_line,
                 sym.end_line,
                 sym.calls.join(","),
                 sym.signature.replace(['\t', '\n', '\r'], " ")
-            ));
+            );
         }
     }
-    let _ = fs::write(path, buf);
+    let tmp = path.with_extension(format!("idx.tmp.{}", std::process::id()));
+    if fs::write(&tmp, buf).is_ok() {
+        if fs::rename(&tmp, path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = fs::remove_file(&tmp);
+    }
 }
 
 impl RepoIndex {

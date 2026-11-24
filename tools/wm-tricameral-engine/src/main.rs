@@ -3266,7 +3266,9 @@ fn run_real_muninn_fault_bench(
                     (theta * drift + rng_a.next_normal() * sigma).clamp(0.0, std::f64::consts::PI);
                 *dst = (theta_eff.cos() as f32) * *max_abs;
             }
-            bundle.ternary.get_mut(name).unwrap().override_f32 = Some(wf);
+            if let Some(layer) = bundle.ternary.get_mut(name) {
+                layer.override_f32 = Some(wf);
+            }
         }
         let (a_cos, a_t1, a_t5) = eval_bundle_refs_accuracy(arch, bundle, 3);
 
@@ -3288,7 +3290,9 @@ fn run_real_muninn_fault_bench(
                     *dst += eff * sc;
                 }
             }
-            bundle.ternary.get_mut(name).unwrap().override_f32 = Some(wf);
+            if let Some(layer) = bundle.ternary.get_mut(name) {
+                layer.override_f32 = Some(wf);
+            }
         }
         let (t3_cos, t3_t1, t3_t5) = eval_bundle_refs_accuracy(arch, bundle, 3);
 
@@ -3317,7 +3321,9 @@ fn run_real_muninn_fault_bench(
                     *dst += eff * sc;
                 }
             }
-            bundle.ternary.get_mut(name).unwrap().override_f32 = Some(wf);
+            if let Some(layer) = bundle.ternary.get_mut(name) {
+                layer.override_f32 = Some(wf);
+            }
         }
         let (tb_cos, tb_t1, tb_t5) = eval_bundle_refs_accuracy(arch, bundle, 3);
 
@@ -3365,7 +3371,9 @@ fn run_real_muninn_fault_bench(
                 };
                 *dst = eff;
             }
-            bundle.ternary.get_mut(name).unwrap().override_f32 = Some(wf);
+            if let Some(layer) = bundle.ternary.get_mut(name) {
+                layer.override_f32 = Some(wf);
+            }
         }
         let (a_cos, a_t1, a_t5) = eval_bundle_refs_accuracy(arch, bundle, 3);
 
@@ -3388,7 +3396,9 @@ fn run_real_muninn_fault_bench(
                     *dst += eff * sc;
                 }
             }
-            bundle.ternary.get_mut(name).unwrap().override_f32 = Some(wf);
+            if let Some(layer) = bundle.ternary.get_mut(name) {
+                layer.override_f32 = Some(wf);
+            }
         }
         let (m_cos, m_t1, m_t5) = eval_bundle_refs_accuracy(arch, bundle, 3);
 
@@ -3417,7 +3427,9 @@ fn run_real_muninn_fault_bench(
                     }
                 }
             }
-            bundle.ternary.get_mut(name).unwrap().override_f32 = Some(wf);
+            if let Some(layer) = bundle.ternary.get_mut(name) {
+                layer.override_f32 = Some(wf);
+            }
         }
         let (h_cos, h_t1, h_t5) = eval_bundle_refs_accuracy(arch, bundle, 3);
 
@@ -3444,7 +3456,9 @@ fn run_real_muninn_fault_bench(
     }
 
     for name in &layer_names {
-        bundle.ternary.get_mut(name).unwrap().override_f32 = None;
+        if let Some(layer) = bundle.ternary.get_mut(name) {
+            layer.override_f32 = None;
+        }
     }
 
     let report = serde_json::json!({
@@ -3461,7 +3475,7 @@ fn run_real_muninn_fault_bench(
         "photonic_pcm_sweep": photonic_rows,
         "memristor_fault_sweep": mem_rows,
     });
-    fs::write(out_path, serde_json::to_string_pretty(&report).unwrap())
+    fs::write(out_path, serde_json::to_string_pretty(&report).unwrap_or_default())
         .expect("write fault receipt");
     println!("Wrote real Muninn-1 full-model photonic/memristor fault receipt to {out_path}");
 }
@@ -3652,7 +3666,7 @@ fn main() {
                 "full_s1r2_tmac_k1_ms": (full_s1r2_tmac_1 * 100.0).round() / 100.0,
                 "full_s1r1_tmac_k1_ms": (full_s1r1_tmac_1 * 100.0).round() / 100.0,
             }))
-            .unwrap()
+            .unwrap_or_default()
         );
         return;
     }

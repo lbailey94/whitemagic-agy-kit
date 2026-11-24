@@ -82,13 +82,19 @@ def ping_sock(sock_path: Path) -> bool:
         return False
 
 
+def _read_magic5(path: Path) -> bytes:
+    with path.open("rb") as fh:
+        return fh.read(5)
+
+
 def download_hf(repo: str, rev: str, hf_path: str, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
     if not token:
         tok_file = Path.home() / ".cache" / "huggingface" / "token"
         if tok_file.is_file():
-            token = tok_file.read_text(encoding="utf-8").strip()
+            with tok_file.open(encoding="utf-8") as tf:
+                token = tf.read().strip()
 
     url = f"https://huggingface.co/{repo}/resolve/{rev}/{hf_path}"
     headers = {"User-Agent": "whitemagic-agy-kit/3.1.0"}
@@ -131,8 +137,9 @@ def download_gdrive(remote_root: str, rel_path: str, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}")
     src = f"{remote_root.rstrip('/')}/{rel_path.lstrip('/')}"
+    dl_timeout = int(os.environ.get("WM_MODELS_DL_TIMEOUT", "600"))
     try:
-        subprocess.run([rclone, "copyto", "--progress", src, str(tmp)], check=True)
+        subprocess.run([rclone, "copyto", "--progress", src, str(tmp)], check=True, timeout=dl_timeout)
         os.replace(tmp, dst)
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -197,7 +204,7 @@ def cmd_pull(manifest: Dict[str, Any], models_dir: Path, target: str, source: st
             download_hf(repo, rev, spec["hf_path"], dst)
         else:
             download_gdrive(remote, spec["gdrive_path"], dst)
-        hdr = dst.read_bytes()[:5]
+        hdr = _read_magic5(dst)
         if not hdr.startswith(b"TM7B"):
             raise RuntimeError(f"Downloaded file {dst} does not have a valid TM7B header ({hdr!r})")
         exp_sha = spec.get("sha256") or ""
@@ -227,7 +234,7 @@ def cmd_verify(manifest: Dict[str, Any], models_dir: Path) -> None:
         if not p:
             print(f"[miss] {k:<12} not installed")
             continue
-        hdr = p.read_bytes()[:5]
+        hdr = _read_magic5(p)
         valid_hdr = hdr[:4] == b"TM7B" and hdr[4] in (5, 6)
         digest = sha256_file(p)
         exp = spec.get("sha256") or ""

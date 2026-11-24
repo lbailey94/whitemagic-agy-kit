@@ -50,7 +50,9 @@ def print_status(recent=30):
     )[:recent]
     stats = defaultdict(lambda: [0, 0, 0, 0])  # turns, unc, cac, out
     for lp in logs:
-        for line in Path(lp).read_text(errors="replace").splitlines():
+        with open(lp, encoding="utf-8", errors="replace") as fh:
+            raw_lines = fh.read().splitlines()
+        for line in raw_lines:
             try:
                 o = json.loads(line)
             except Exception:

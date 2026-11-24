@@ -18,6 +18,8 @@ from typing import Any
 BRAIN_DIR = Path.home() / ".gemini" / "antigravity-cli" / "brain"
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+SWARM_NAME_CID_RE = re.compile(r'"name"\s*:\s*"([^"]+)"[^}]*?"conversation_id"\s*:\s*"([0-9a-f-]{36})"')
+SWARM_CID_NAME_RE = re.compile(r'"conversation_id"\s*:\s*"([0-9a-f-]{36})"[^}]*?"name"\s*:\s*"([^"]+)"')
 
 
 def sanitize_report(text: str) -> str:
@@ -60,13 +62,13 @@ def discover_swarm_workers(coord_id: str) -> list[tuple[str, str]]:
             c = str(o.get("content") or "")
             if '"conversation_id"' in c or "conversation_id" in c:
                 # Extract pairs of ("name":"..." ... "conversation_id":"...") or raw UUIDs
-                for m in re.finditer(r'"name"\s*:\s*"([^"]+)"[^}]*?"conversation_id"\s*:\s*"([0-9a-f-]{36})"', c):
+                for m in SWARM_NAME_CID_RE.finditer(c):
                     wname, wcid = m.group(1), m.group(2)
                     if wcid not in seen:
                         seen.add(wcid)
                         found.append((wname, wcid))
                 # Reverse order in JSON if conversation_id came before name
-                for m in re.finditer(r'"conversation_id"\s*:\s*"([0-9a-f-]{36})"[^}]*?"name"\s*:\s*"([^"]+)"', c):
+                for m in SWARM_CID_NAME_RE.finditer(c):
                     wcid, wname = m.group(1), m.group(2)
                     if wcid not in seen:
                         seen.add(wcid)

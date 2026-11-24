@@ -67,7 +67,7 @@ def bench_wm_squeeze_v3():
         ]
     )
     t0 = time.perf_counter()
-    p = subprocess.run([sq, "--pipe", "--kind", "cargo"], input=cargo_raw, capture_output=True, text=True, env=env)
+    p = subprocess.run([sq, "--pipe", "--kind", "cargo"], input=cargo_raw, capture_output=True, text=True, env=env, timeout=30)
     ms = (time.perf_counter() - t0) * 1000
     cases["cargo_test_noisy"] = {
         "raw_bytes": len(cargo_raw), "out_bytes": len(p.stdout),
@@ -83,7 +83,7 @@ def bench_wm_squeeze_v3():
             lint_lines.append(f"src/mod_{fidx}.ts({lnum},14): error TS2322: Type 'string | undefined' is not assignable to type 'string'.")
     lint_raw = "\n".join(lint_lines)
     t0 = time.perf_counter()
-    p = subprocess.run([sq, "--pipe", "--kind", "linter"], input=lint_raw, capture_output=True, text=True, env=env)
+    p = subprocess.run([sq, "--pipe", "--kind", "linter"], input=lint_raw, capture_output=True, text=True, env=env, timeout=30)
     ms = (time.perf_counter() - t0) * 1000
     cases["linter_420_diags"] = {
         "raw_bytes": len(lint_raw), "out_bytes": len(p.stdout),
@@ -99,7 +99,7 @@ def bench_wm_squeeze_v3():
         + "\ndiff --git a/src/router.rs b/src/router.rs\n@@ -40,3 +40,3 @@\n-let ttl = 30;\n+let ttl = 300;\n"
     )
     t0 = time.perf_counter()
-    p = subprocess.run([sq, "--pipe", "--kind", "git"], input=diff_raw, capture_output=True, text=True, env=env)
+    p = subprocess.run([sq, "--pipe", "--kind", "git"], input=diff_raw, capture_output=True, text=True, env=env, timeout=30)
     ms = (time.perf_counter() - t0) * 1000
     cases["git_diff_lockfile"] = {
         "raw_bytes": len(diff_raw), "out_bytes": len(p.stdout),
@@ -113,10 +113,10 @@ def bench_wm_squeeze_v3():
     env_cache.pop("WM_SQUEEZE_NO_CACHE", None)
     # Clear existing cache entry by passing unique max-bytes or running twice
     t0 = time.perf_counter()
-    p1 = subprocess.run([sq, "--safe", "--cwd", str(KIT_DIR / "tools" / "wm-squeeze"), "--", "cargo", "check"], capture_output=True, text=True, env=env_cache)
+    p1 = subprocess.run([sq, "--safe", "--cwd", str(KIT_DIR / "tools" / "wm-squeeze"), "--", "cargo", "check"], capture_output=True, text=True, env=env_cache, timeout=120)
     cold_ms = (time.perf_counter() - t0) * 1000
     t0 = time.perf_counter()
-    p2 = subprocess.run([sq, "--safe", "--cwd", str(KIT_DIR / "tools" / "wm-squeeze"), "--", "cargo", "check"], capture_output=True, text=True, env=env_cache)
+    p2 = subprocess.run([sq, "--safe", "--cwd", str(KIT_DIR / "tools" / "wm-squeeze"), "--", "cargo", "check"], capture_output=True, text=True, env=env_cache, timeout=120)
     warm_ms = (time.perf_counter() - t0) * 1000
     cases["content_addressed_cache"] = {
         "cold_ms": round(cold_ms, 1),
@@ -143,12 +143,16 @@ def bench_wm_codegraph():
         # Measure naive cost: total bytes of all source files containing `sym`
         naive_bytes = 0
         matched_files = 0
-        for ext in ("*.rs", "*.py", "*.ts", "*.js"):
-            for fp in root.rglob(ext):
-                if any(part in ("target", "node_modules", ".git", "__pycache__") for part in fp.parts):
+        skip_parts = {"target", "node_modules", ".git", "__pycache__"}
+        wanted_exts = {".rs", ".py", ".ts", ".js"}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in skip_parts)
+            for fn in sorted(filenames):
+                if os.path.splitext(fn)[1] not in wanted_exts:
                     continue
                 try:
-                    txt = fp.read_text(encoding="utf-8", errors="replace")
+                    with open(os.path.join(dirpath, fn), encoding="utf-8", errors="replace") as _fp:
+                        txt = _fp.read()
                 except Exception:
                     continue
                 if sym in txt:
@@ -156,10 +160,10 @@ def bench_wm_codegraph():
                     matched_files += 1
 
         t0 = time.perf_counter()
-        p_ov = subprocess.run([cg, "overview", "--root", str(root)], capture_output=True, text=True)
+        p_ov = subprocess.run([cg, "overview", "--root", str(root)], capture_output=True, text=True, timeout=30)
         cold_ms = (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
-        p_cal = subprocess.run([cg, "callers", sym, "--root", str(root)], capture_output=True, text=True)
+        p_cal = subprocess.run([cg, "callers", sym, "--root", str(root)], capture_output=True, text=True, timeout=30)
         warm_ms = (time.perf_counter() - t0) * 1000
         cg_bytes = len(p_cal.stdout.encode("utf-8"))
         results[label] = {
@@ -191,7 +195,9 @@ def bench_historical_replay():
         prev_ts = None
         prev_ctx = 0
         turn_idx = 0
-        for line in lp.read_text(errors="replace").splitlines():
+        with lp.open(encoding="utf-8", errors="replace") as _lf:
+            raw_lines = _lf.read().splitlines()
+        for line in raw_lines:
             try:
                 o = json.loads(line)
             except Exception:
@@ -251,11 +257,11 @@ def bench_historical_replay():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def init_git(d: Path):
-    subprocess.run(["git", "init", "-q"], cwd=d, check=True)
-    subprocess.run(["git", "config", "user.email", "bench@example.com"], cwd=d, check=True)
-    subprocess.run(["git", "config", "user.name", "Bench"], cwd=d, check=True)
-    subprocess.run(["git", "add", "."], cwd=d, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=d, check=True)
+    subprocess.run(["git", "init", "-q"], cwd=d, check=True, timeout=30)
+    subprocess.run(["git", "config", "user.email", "bench@example.com"], cwd=d, check=True, timeout=30)
+    subprocess.run(["git", "config", "user.name", "Bench"], cwd=d, check=True, timeout=30)
+    subprocess.run(["git", "add", "."], cwd=d, check=True, timeout=30)
+    subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=d, check=True, timeout=30)
 
 
 def build_level1_repo(d: Path):

@@ -18,6 +18,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat as stat_mod
 import sys
 from pathlib import Path
 
@@ -68,19 +69,33 @@ def check_huginn_kekkai_socket(cmd):
 
 DESTRUCTIVE_PATTERNS = [
     (
-        r"(?:^|[;&|]\s*)rm\s+(?:-(?:[^\s]*r[^\s]*f|[^\s]*f[^\s]*r)[^\s]*|-[^\s]*r[^\s]*\s+-[^\s]*f[^\s]*|-[^\s]*f[^\s]*\s+-[^\s]*r[^\s]*)\s+(?:/\s*$|/\*|\~|\$HOME(?:\s|$)|/(?:home|Users)/[^/\s]+(?:\s|$))",
+        re.compile(
+            r"(?:^|[;&|]\s*)rm\s+(?:-(?:[^\s]*r[^\s]*f|[^\s]*f[^\s]*r)[^\s]*|-[^\s]*r[^\s]*\s+-[^\s]*f[^\s]*|-[^\s]*f[^\s]*\s+-[^\s]*r[^\s]*)\s+(?:/\s*$|/\*|\~|\$HOME(?:\s|$)|/(?:home|Users)/[^/\s]+(?:\s|$))",
+            re.IGNORECASE,
+        ),
         "Recursive force-delete targeting root or home directory",
     ),
-    (r"\bdrop\s+(?:table|database|schema|view)\b", "SQL DROP statement detected"),
-    (r"\btruncate\s+table\b", "SQL TRUNCATE TABLE detected"),
-    (r"\bgcloud\s+projects\s+delete\b", "Destructive gcloud project deletion detected"),
-    (r"\b(?:gsutil|gcloud\s+storage)\s+rm\b", "Cloud Storage deletion command detected"),
-    (r"\bgit\s+push\s+(?:--force|-f)\b.*\b(?:main|master)\b", "Force-push to main/master branch detected"),
+    (re.compile(r"\bdrop\s+(?:table|database|schema|view)\b", re.IGNORECASE), "SQL DROP statement detected"),
+    (re.compile(r"\btruncate\s+table\b", re.IGNORECASE), "SQL TRUNCATE TABLE detected"),
+    (re.compile(r"\bgcloud\s+projects\s+delete\b", re.IGNORECASE), "Destructive gcloud project deletion detected"),
+    (re.compile(r"\b(?:gsutil|gcloud\s+storage)\s+rm\b", re.IGNORECASE), "Cloud Storage deletion command detected"),
+    (re.compile(r"\bgit\s+push\s+(?:--force|-f)\b.*\b(?:main|master)\b", re.IGNORECASE), "Force-push to main/master branch detected"),
     (
-        r"\bmkfs\.[a-z0-9]+\b|\bdd\s+if=.*\bof=/dev/|\bdiskutil\s+(?:eraseDisk|eraseVolume|partitionDisk)\b",
+        re.compile(
+            r"\bmkfs\.[a-z0-9]+\b|\bdd\s+if=.*\bof=/dev/|\bdiskutil\s+(?:eraseDisk|eraseVolume|partitionDisk)\b",
+            re.IGNORECASE,
+        ),
         "Raw disk/block device formatting or overwrite detected",
     ),
 ]
+_CONV_ID_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _write_json_atomic(path: Path, payload_obj) -> None:
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(payload_obj, fh)
+    os.replace(tmp, path)
 
 SHELL_META_RE = re.compile(r"[|><;`\n$*?\[\]{}]|(?<!&)&(?!&)|(?:^|\s)~")
 MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".pdf")
@@ -120,7 +135,7 @@ def latest_ctx_tokens(transcript_path):
     try:
         p = Path(transcript_path)
         st = p.stat()
-        if not os.path.isfile(p):
+        if not stat_mod.S_ISREG(st.st_mode):
             return 0
         sz = st.st_size
         mtime_ns = st.st_mtime_ns
@@ -156,9 +171,8 @@ def latest_ctx_tokens(transcript_path):
                     break
         try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
-            cf.write_text(
-                json.dumps({"path": str(p), "sz": sz, "mtime_ns": mtime_ns, "ctx": ctx_found}),
-                encoding="utf-8",
+            _write_json_atomic(
+                cf, {"path": str(p), "sz": sz, "mtime_ns": mtime_ns, "ctx": ctx_found}
             )
         except Exception:
             pass
@@ -371,7 +385,7 @@ def check_and_record_read_dedup(conv_id, abs_path, start_line, end_line, step_id
         return None
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        sf = STATE_DIR / f"{re.sub(r'[^a-zA-Z0-9_-]', '', conv_id)[:20]}.json"
+        sf = STATE_DIR / f"{_CONV_ID_SANITIZE_RE.sub('', conv_id)[:20]}.json"
         state = {}
         if sf.is_file():
             try:
@@ -396,7 +410,7 @@ def check_and_record_read_dedup(conv_id, abs_path, start_line, end_line, step_id
             # Drop oldest half by step
             items = sorted(state.items(), key=lambda kv: kv[1].get("step", 0))[-96:]
             state = dict(items)
-        sf.write_text(json.dumps(state), encoding="utf-8")
+        _write_json_atomic(sf, state)
     except Exception:
         pass
     return None
@@ -408,7 +422,7 @@ def track_and_check_burst(conv_id, abs_path, step_idx):
         return False
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        bf = STATE_DIR / f"burst_{re.sub(r'[^a-zA-Z0-9_-]', '', conv_id)[:20]}.json"
+        bf = STATE_DIR / f"burst_{_CONV_ID_SANITIZE_RE.sub('', conv_id)[:20]}.json"
         entries = []
         if bf.is_file():
             try:
@@ -425,7 +439,7 @@ def track_and_check_burst(conv_id, abs_path, step_idx):
         distinct_paths = {e[0] for e in kept}
         burst_triggered = len(distinct_paths) >= 4
         kept.append([abs_path, step_idx])
-        bf.write_text(json.dumps(kept[-32:]), encoding="utf-8")
+        _write_json_atomic(bf, kept[-32:])
         return burst_triggered
     except Exception:
         return False
@@ -561,7 +575,7 @@ def handle_manage_task(args, payload):
         return {"decision": "allow"}
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        pf = STATE_DIR / f"poll_{re.sub(r'[^a-zA-Z0-9_-]', '', conv_id)[:20]}.json"
+        pf = STATE_DIR / f"poll_{_CONV_ID_SANITIZE_RE.sub('', conv_id)[:20]}.json"
         state = {}
         if pf.is_file():
             try:
@@ -579,7 +593,7 @@ def handle_manage_task(args, payload):
         if len(state) > 32:
             items = sorted(state.items(), key=lambda kv: kv[1].get("last_step", 0))[-24:]
             state = dict(items)
-        pf.write_text(json.dumps(state), encoding="utf-8")
+        _write_json_atomic(pf, state)
         if cnt >= 3:
             return {
                 "decision": "deny",
@@ -657,7 +671,7 @@ def main():
         return
     for cmd in extract_commands(args):
         for pattern, reason in DESTRUCTIVE_PATTERNS:
-            if re.search(pattern, cmd, flags=re.IGNORECASE):
+            if pattern.search(cmd):
                 emit({
                     "decision": "force_ask",
                     "reason": f"[Data-Loss Guard] {reason}. Confirm explicitly before proceeding.",

@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -136,18 +137,44 @@ fn print_stats() {
     );
 }
 
-/// Fast git workspace fingerprint (<5ms) for content-addressed read-only command caching.
-fn workspace_cache_key(dir: &Path, cmd: &str, args: &[String], max_bytes: usize) -> Option<String> {
-    let head = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !head.status.success() {
+fn fast_git_head(dir: &Path) -> Option<String> {
+    let git_dir = dir.join(".git");
+    if !git_dir.is_dir() {
         return None;
     }
+    let head_raw = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head_trim = head_raw.trim();
+    if let Some(ref_rel) = head_trim.strip_prefix("ref: ") {
+        let sha = fs::read_to_string(git_dir.join(ref_rel.trim())).ok()?;
+        let s = sha.trim();
+        if s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(s.to_string());
+        }
+        return None;
+    }
+    if head_trim.len() == 40 && head_trim.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(head_trim.to_string());
+    }
+    None
+}
+
+/// Fast git workspace fingerprint (<5ms) for content-addressed read-only command caching.
+fn workspace_cache_key(dir: &Path, cmd: &str, args: &[String], max_bytes: usize) -> Option<String> {
+    let head_sha = if let Some(s) = fast_git_head(dir) {
+        s
+    } else {
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !head.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&head.stdout).trim().to_string()
+    };
     let status = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(dir)
@@ -162,14 +189,14 @@ fn workspace_cache_key(dir: &Path, cmd: &str, args: &[String], max_bytes: usize)
     let mut fp = String::with_capacity(512);
     fp.push_str(&dir.to_string_lossy());
     fp.push('|');
-    fp.push_str(String::from_utf8_lossy(&head.stdout).trim());
+    fp.push_str(&head_sha);
     fp.push('|');
     fp.push_str(cmd);
     for a in args {
         fp.push('\x1f');
         fp.push_str(a);
     }
-    fp.push_str(&format!("|mb={}|", max_bytes));
+    let _ = write!(fp, "|mb={}|", max_bytes);
     // Include dirty file mtimes & sizes so ANY edit invalidates the cache instantly
     for line in st_text.lines().take(64) {
         fp.push_str(line);
@@ -178,7 +205,7 @@ fn workspace_cache_key(dir: &Path, cmd: &str, args: &[String], max_bytes: usize)
             let p = dir.join(rel);
             if let Ok(m) = fs::metadata(&p) {
                 let mt = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
-                fp.push_str(&format!(":{}:{}", m.len(), mt));
+                let _ = write!(fp, ":{}:{}", m.len(), mt);
             }
         }
         fp.push(';');
@@ -206,7 +233,14 @@ fn write_cached(key: &str, code: i32, orig_bytes: usize, body: &str) {
     if let Some(dir) = cache_dir() {
         let _ = fs::create_dir_all(&dir);
         let p = dir.join(format!("{}.cache", key));
-        let _ = fs::write(p, format!("{}\t{}\n{}", code, orig_bytes, body));
+        let tmp = dir.join(format!("{}.cache.tmp.{}", key, std::process::id()));
+        if fs::write(&tmp, format!("{}\t{}\n{}", code, orig_bytes, body)).is_ok() {
+            if fs::rename(&tmp, &p).is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -273,8 +307,11 @@ fn dedup_consecutive(lines: Vec<String>) -> Vec<String> {
         if let Some(p) = prev.take() {
             if *run > 2 {
                 out.push(format!("{}  [x{}]", p, *run));
-            } else {
-                for _ in 0..*run { out.push(p.clone()); }
+            } else if *run == 2 {
+                out.push(p.clone());
+                out.push(p);
+            } else if *run == 1 {
+                out.push(p);
             }
             *run = 0;
         }
@@ -780,12 +817,12 @@ fn main() {
         std::process::exit(2);
     }
 
-    let mut cwd: Option<String> = None;
+    let mut cwd: Option<&str> = None;
     let mut safe_envs: Vec<(String, String)> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--cwd" if i + 1 < args.len() => { cwd = Some(args[i + 1].clone()); i += 2; }
+            "--cwd" if i + 1 < args.len() => { cwd = Some(args[i + 1].as_str()); i += 2; }
             "--env" if i + 1 < args.len() => {
                 let kv = &args[i + 1];
                 if let Some((k, v)) = kv.split_once('=') {
@@ -821,7 +858,7 @@ fn main() {
         }
     };
 
-    let work_dir = cwd.as_deref().map(PathBuf::from).unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let work_dir = cwd.map(PathBuf::from).unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let label = if let Some(sub) = cmd_args.first() {
         format!("{} {}", Path::new(cmd).file_name().and_then(|s| s.to_str()).unwrap_or(cmd), sub)
     } else {

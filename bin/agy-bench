@@ -30,12 +30,13 @@ OUT_DIR = HOME / ".local" / "share" / "whitemagic" / "agy_benchmarks"
 SQUEEZE_STATS = HOME / ".local" / "share" / "whitemagic" / "wm_squeeze_stats.jsonl"
 CFG_JSON = HOME / ".gemini" / "config" / "config.json"
 PLUGINS_DIR = HOME / ".gemini" / "config" / "plugins"
+MD_TABLE_ROW_RE = re.compile(r"^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$")
 
 
 def parse_agy_fast_md(md_text):
     metrics = {}
     for line in md_text.splitlines():
-        m = re.match(r"^\|\s*(.+?)\s*\|\s*(.+?)\s*\|$", line)
+        m = MD_TABLE_ROW_RE.match(line)
         if m and m.group(1) not in ("Metric", ":---"):
             metrics[m.group(1).strip()] = m.group(2).strip()
     return metrics
@@ -219,7 +220,8 @@ def measure_plugin_overhead():
             continue
         for sf in glob.glob(str(pdir / "**" / "SKILL.md"), recursive=True):
             skill_cnt += 1
-            txt = Path(sf).read_text(encoding="utf-8", errors="replace")
+            with open(sf, encoding="utf-8", errors="replace") as fh:
+                txt = fh.read()
             if txt.startswith("---"):
                 parts = txt.split("---", 2)
                 if len(parts) >= 2:
@@ -244,7 +246,7 @@ def run_capture(args):
                 cmd.append("--split-usage")
         else:
             cmd.extend(["--recent", str(args.recent)])
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         agy_fast_md = proc.stdout.strip()
         af_metrics = parse_agy_fast_md(agy_fast_md)
 

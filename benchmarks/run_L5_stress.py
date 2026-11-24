@@ -28,11 +28,11 @@ LOCAL_BIN = HOME / ".local" / "bin"
 
 
 def init_git(d: Path):
-    subprocess.run(["git", "init", "-q"], cwd=d, check=True)
-    subprocess.run(["git", "config", "user.email", "bench@example.com"], cwd=d, check=True)
-    subprocess.run(["git", "config", "user.name", "Bench"], cwd=d, check=True)
-    subprocess.run(["git", "add", "."], cwd=d, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "initial monorepo"], cwd=d, check=True)
+    subprocess.run(["git", "init", "-q"], cwd=d, check=True, timeout=30)
+    subprocess.run(["git", "config", "user.email", "bench@example.com"], cwd=d, check=True, timeout=30)
+    subprocess.run(["git", "config", "user.name", "Bench"], cwd=d, check=True, timeout=30)
+    subprocess.run(["git", "add", "."], cwd=d, check=True, timeout=30)
+    subprocess.run(["git", "commit", "-q", "-m", "initial monorepo"], cwd=d, check=True, timeout=30)
 
 
 def build_monorepo(d: Path):
@@ -200,7 +200,8 @@ def test_cached_discount():
 
 def inject_phase4_noisy_lockfile(d: Path):
     """Simulate a 50 KB Cargo.lock regeneration + 1 real edge-case requirement before Phase 4."""
-    lock = (d / "rs_engine" / "Cargo.lock").read_text()
+    with (d / "rs_engine" / "Cargo.lock").open(encoding="utf-8") as _lf:
+        lock = _lf.read()
     extra = "\n".join(
         f'[[package]]\nname = "transitive-dep-{i:04d}"\nversion = "1.{i%10}.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "deadbeef{i:08x}cafebabe{i:08x}"'
         for i in range(380)
@@ -211,7 +212,9 @@ def inject_phase4_noisy_lockfile(d: Path):
 def parse_transcript_full(tp: Path):
     turns = tools = peak = unc_sum = cac_sum = out_sum = spills = tool_bytes = 0
     per_turn_hits = []
-    for line in tp.read_text(errors="replace").splitlines():
+    with tp.open(encoding="utf-8", errors="replace") as _tf:
+        raw_lines = _tf.read().splitlines()
+    for line in raw_lines:
         try:
             o = json.loads(line)
         except Exception:

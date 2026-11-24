@@ -256,7 +256,8 @@ def main() -> None:
             "--batch-jsonl", str(in_p),
             "--batch-out", str(out_p),
         ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        tc_timeout = int(os.environ.get("WM_TRICAMERAL_TIMEOUT", "120"))
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=tc_timeout)
         row = json.loads(out_p.read_text(encoding="utf-8").splitlines()[0])
         in_p.unlink(missing_ok=True)
         out_p.unlink(missing_ok=True)

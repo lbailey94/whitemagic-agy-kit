@@ -155,7 +155,8 @@ def cmd_audit(args):
     rule_word_sets = []
     for rf in RULE_FILES:
         if rf.exists():
-            data = rf.read_bytes()
+            with rf.open("rb") as _rfh:
+                data = _rfh.read()
             text = data.decode("utf-8", errors="replace")
             h = hashlib.sha256(data).hexdigest()[:12]
             pct = (len(data) / AGY_RULE_BYTE_CAP) * 100
@@ -217,7 +218,8 @@ def cmd_audit(args):
                     continue
                 for sf in glob.glob(str(pdir / "**" / "SKILL.md"), recursive=True):
                     skill_cnt += 1
-                    txt = Path(sf).read_text(encoding="utf-8", errors="replace")
+                    with open(sf, encoding="utf-8", errors="replace") as _sfh:
+                        txt = _sfh.read()
                     if txt.startswith("---"):
                         parts = txt.split("---", 2)
                         if len(parts) >= 2:
@@ -302,20 +304,23 @@ def cmd_prefix_hash(args):
     print("=== Turn-0 ContextCacheToken Prefix Audit ===")
     for rf in RULE_FILES:
         if rf.exists():
-            data = rf.read_bytes()
+            with rf.open("rb") as _rfh:
+                data = _rfh.read()
             total_bytes += len(data)
             h.update(f"rule:{rf.name}\n".encode() + data + b"\n")
             print(f"  RULE  {rf.name:28s}: {len(data):6,} B (~{len(data)//4:4,} tok)")
     mcp_dir = HOME / ".gemini" / "antigravity-cli" / "mcp"
     if mcp_dir.is_dir():
         for jf in sorted(mcp_dir.glob("*/*.json")):
-            data = jf.read_bytes()
+            with jf.open("rb") as _jfh:
+                data = _jfh.read()
             h.update(f"mcp:{jf.parent.name}/{jf.name}\n".encode() + data + b"\n")
     skills_dir = HOME / ".gemini" / "config" / "skills"
     if skills_dir.is_dir():
         sk_bytes = 0
         for sf in sorted(skills_dir.glob("*/SKILL.md")):
-            txt = sf.read_text(encoding="utf-8", errors="replace")
+            with sf.open(encoding="utf-8", errors="replace") as _sfh:
+                txt = _sfh.read()
             if txt.startswith("---"):
                 parts = txt.split("---", 2)
                 if len(parts) >= 2:

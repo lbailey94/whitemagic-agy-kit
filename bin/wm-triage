@@ -85,10 +85,14 @@ def _lane_board(home: Path) -> str:
         age_h = (now - p.stat().st_mtime) / 3600.0
         h1 = ""
         try:
-            for ln in p.read_text(encoding="utf-8", errors="replace").splitlines()[:6]:
-                if ln.startswith("# "):
-                    h1 = ln[2:].strip()[:75]
-                    break
+            with p.open(encoding="utf-8", errors="replace") as fh:
+                for _ in range(6):
+                    ln = fh.readline()
+                    if not ln:
+                        break
+                    if ln.startswith("# "):
+                        h1 = ln[2:].strip()[:75]
+                        break
         except Exception:
             pass
         rows.append(f"  - [{age_h:.1f}h] {p.stem[:42]}" + (f": {h1}" if h1 else ""))
