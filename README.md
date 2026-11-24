@@ -1,15 +1,21 @@
-# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v4.0.0 — Fused Turbo+Fast Edition)
+# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v4.1.0 — Token-Burn Shield + Fused Turbo+Fast Edition)
 
 Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity CLI (`agy 1.5.14+`), Desktop 2.0, and IDE optimization suite fusing `whitemagic-agy-kit` and `INK-Q/agy-fast` (MIT) into a single unified plugin:
+- **Token-Burn Shield (`v4.1.0`):** Forensic `agy-token-audit` CLI (`--recent`, `--conv`, `--swarm`, `--report-md`), wide-span & burst `read_file` auto-clamping (`>250L` / `150L` above `120k` ctx / `120L` burst), multiline inline `python3 - <<'PY'` heredoc `wm-squeeze --pipe` auto-wrapping, portable `[Env-Write Guard]` (`force_ask` on `.env*` secrets, fixing AGY sandbox relative deny-rule errors), automatic user/plugin skill deduplication, and `110/110` passing regression tests.
 - **5-Tool Eager Stdio MCP (`whitemagic-agy-kit_fast`):** `batch_search` (auto-collapses lockfile diffs), `apply_edits` (safe unique line-drift auto-relocate + trailing-whitespace unique fallback + `wm-squeeze` inline `verify`), `read_slices`, `run_checks` (CoACT `wm-squeeze` compression + 300s git-aware cache in `compact` mode), and `code_graph` (`wm-codegraph` AST/call-graph).
 - **Unified Zero-Jitter `SessionStart` (`session_start_brief.py`):** Single `<2.6 KB` Turn-0 digest combining cached preflight brief + SIM ledger + Dream digest + compact workspace snapshot (suppressing `$HOME` noise).
 - **Deterministic `PreToolUse` Guards, `wm-squeeze v3`, `wm-handoff`, `Tricameral CyberBrain`, & SIM Memory.**
 
-Built from empirical offline forensics across `50` real sessions (`12,740` turns, `2.27B` input tokens) plus controlled 4-level live `agy -p` A/B benchmarks ([`benchmarks/RESULTS_2026-11-21.md`](./benchmarks/RESULTS_2026-11-21.md)) and designed strictly within Antigravity's documented extension interfaces (`plugin.json`, `hooks.json`, `mcp_config.json`, `rules/AGENTS.md`, `statusLine`, and `--model` / `--settings`).
+Built from empirical offline forensics across `50` real sessions (`12,740` turns, `2.27B` input tokens), controlled 4-level live `agy -p` A/B benchmarks ([`benchmarks/RESULTS_2026-11-21.md`](./benchmarks/RESULTS_2026-11-21.md)), and live 19-session `/swarm` before/after telemetry ([`benchmarks/AGY_SWARM_TOKEN_TELEMETRY_REPORT_2026-11-23.md`](./benchmarks/AGY_SWARM_TOKEN_TELEMETRY_REPORT_2026-11-23.md)), designed strictly within Antigravity's documented extension interfaces (`plugin.json`, `hooks.json`, `mcp_config.json`, `rules/AGENTS.md`, `statusLine`, and `--model` / `--settings`).
 
 ---
 
-## Headline Empirical Results ([Full Report & Raw Receipts](./benchmarks/RESULTS_2026-11-21.md))
+## Headline Empirical Results ([Benchmarks](./benchmarks/RESULTS_2026-11-21.md) · [v4.1.0 Swarm Telemetry](./benchmarks/AGY_SWARM_TOKEN_TELEMETRY_REPORT_2026-11-23.md))
+
+- **Live 19-Session `/swarm` Before vs. After (`v4.1.0` Token-Burn Shield, `agy-token-audit --swarm`):**
+  - **Avg uncached input / worker:** `0.57M → 0.175M` (**`-69.4%`**) · **Avg total input / worker:** `8.99M → 1.89M` (**`-79.0%`**) · **Avg output / worker:** `111.5k → 52.6k` (**`-52.8%`**)
+  - **Peak single-turn uncached spike:** `384.2k → 34.7k` (**`-91.0%`**) · **Auto-compactions:** `4 → 0` (**`-100%`**) · **Cross-model flips:** `14 → 0` (**`-100%`**)
+  - **Verifier head-to-head (identical 6-check rigor):** `66 → 11` turns (**`-83.3%`**), `0.90M → 0.10M` uncached (**`-88.9%`**), `16.1M → 0.66M` total input (**`-95.9%`**)
 
 - **Live 4-Level Controlled A/B (`agy -p`, incremental on top of Wave 1/2 rules):**
   - **100% elimination of `run_command` disk spills** (`0` spills across all Wave 4 runs vs `4` on controls)
@@ -78,6 +84,7 @@ Verify and benchmark offline or live:
 ```bash
 python3 tests/test_wave3.py
 python3 benchmarks/run_progressive_bench.py --track1
+agy-token-audit --recent 10
 agy-bench --credits --recent 30
 wm-sim prefix-hash
 wm-squeeze --stats
