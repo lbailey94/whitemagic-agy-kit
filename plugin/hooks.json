@@ -44,7 +44,7 @@
     "PostInvocation": [
       {
         "type": "command",
-        "command": "python3 -S -B ./hooks/longevity_hud.py",
+        "command": "if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze --hud; elif [ -x \"$HOME/.local/bin/wm-squeeze\" ]; then exec \"$HOME/.local/bin/wm-squeeze\" --hud; else exec python3 -S -B ./hooks/longevity_hud.py; fi",
         "timeout": 3
       }
     ]

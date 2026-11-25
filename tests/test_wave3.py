@@ -1483,6 +1483,130 @@ def test_v44_ide_longevity_shield():
     check("wm-sim audit confirms fast MCP VALID", p_sim.returncode == 0 and "whitemagic-agy-kit MCP: VALID" in p_sim.stdout)
 
 
+def test_v441_spill_cap_and_rust_hud():
+    print("\n10. v4.4.1 Compound Spill Shield, Sub-4ms Rust HUD & CLI Hygiene:")
+    SQ_BIN = LOCAL_BIN / "wm-squeeze"
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        (td_path / "f1.py").write_text("foo = 1\nbar = 2\n", encoding="utf-8")
+
+        # 10a) Multiline read-only inspection wrapped & executes cleanly
+        cmd_ml = f'ls -la {td}\necho "==="\nrg -n foo {td}'
+        rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd_ml}}})
+        rew_ml = (json.loads(out).get("overwrite") or {}).get("CommandLine", "")
+        check("multiline read-only rewritten with set +o pipefail + wm-squeeze --pipe", rc == 0 and "(set +o pipefail" in rew_ml and "--pipe" in rew_ml)
+        p_ml = subprocess.run(["bash", "-c", rew_ml], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"})
+        check("rewritten multiline executes rc=0 & keeps output", p_ml.returncode == 0 and "===" in p_ml.stdout and "foo = 1" in p_ml.stdout)
+
+        # 10b) Multiline with inner `| head -n 2` exits 0 (zero false SIGPIPE 141)
+        cmd_sig = 'python3 -c "for i in range(4000): print(i)" | head -n 2\necho SIGPIPE_OK'
+        rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd_sig}}})
+        rew_sig = (json.loads(out).get("overwrite") or {}).get("CommandLine", "")
+        p_sig = subprocess.run(["bash", "-c", rew_sig], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"})
+        check("multiline with inner | head exits rc=0 (no SIGPIPE 141)", p_sig.returncode == 0 and "SIGPIPE_OK" in p_sig.stdout)
+
+        # 10c) Failing command inside wrapped compound block preserves exact non-zero exit code
+        cmd_fail = f'ls {td} && python3 -c "import sys; print(\'boom\'); sys.exit(7)"'
+        _, out_cf, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd_fail}}})
+        rew_cf = (json.loads(out_cf).get("overwrite") or {}).get("CommandLine", "")
+        p_cf = subprocess.run(["bash", "-c", rew_cf], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"})
+        check("wrapped failing compound cmd preserves exit code 7", p_cf.returncode == 7)
+
+        # 10d) Complex heredoc (`cd <dir> && python3 - <<'PY'`) wrapped & capped <=8.4KB
+        cmd_hd = f"cd {td} && python3 - <<'PY'\nfor i in range(400):\n    print(f'row {{i}}: ' + 'x'*55)\nPY"
+        _, out_hd, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd_hd}}})
+        rew_hd = (json.loads(out_hd).get("overwrite") or {}).get("CommandLine", "")
+        p_hd = subprocess.run(["bash", "-c", rew_hd], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"})
+        check("cd && python3 heredoc wrapped & capped <=8.4KB", "--pipe" in rew_hd and p_hd.returncode == 0 and len(p_hd.stdout.encode("utf-8")) <= 8400)
+
+        # 10e) Uncapped pipeline wrapped (`rg ... | grep ...`)
+        cmd_pipe = f'rg -n "foo|bar" {td} | grep foo'
+        _, out_p, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd_pipe}}})
+        check("uncapped pipeline rg | grep wrapped", "--pipe" in (json.loads(out_p).get("overwrite") or {}).get("CommandLine", ""))
+
+        # 10f) Safety & bounded boundaries UNTOUCHED
+        for label, safe_cmd in [
+            ("bounded git diff | head", "git diff | head -n 20"),
+            ("unquoted glob", "ls *.py"),
+            ("output redirect", "echo hi > /tmp/x"),
+            ("arbitrary python script", "python3 script.py"),
+            ("mutating rm &&", "rm -rf /tmp/v441_nonexistent && echo done"),
+            ("compound redirect", "cat a > /tmp/b && echo done"),
+            ("background &", "sleep 1 &"),
+            ("sed -i &&", "sed -i 's/a/b/' /tmp/f && echo ok"),
+        ]:
+            _, out_u, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": safe_cmd}}})
+            check(f"v4.4.1 untouched ({label})", "overwrite" not in json.loads(out_u))
+
+        # 10g) Rust `wm-squeeze --hud` full parity + idle-gap attribution + sub-25ms speed
+        def run_rust_hud(payload, env_extra=None):
+            env = os.environ.copy()
+            if env_extra:
+                env.update(env_extra)
+            t0 = time.perf_counter()
+            p = subprocess.run([str(SQ_BIN), "--hud"], input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=5)
+            return p.returncode, p.stdout.strip(), (time.perf_counter() - t0) * 1000.0
+
+        app_dir = td_path / ".gemini" / "antigravity" / "brain" / "r-hud" / ".system_generated" / "logs"
+        app_dir.mkdir(parents=True)
+        tr_r = app_dir / "transcript.jsonl"
+        tr_r.write_text(json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 10000, "cache_read_tokens": 80000, "model": "gemini-4-hydrogen-xhigh", "step_index": 1}) + "\n")
+        rc, out_r, _ = run_rust_hud({"conversationId": "rust-hud-1", "transcriptPath": str(tr_r), "invocationNum": 1})
+        check("Rust HUD <120k -> {}", rc == 0 and json.loads(out_r) == {})
+
+        tr_r.write_text(tr_r.read_text() + json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 10000, "cache_read_tokens": 115000, "model": "gemini-4-hydrogen-xhigh", "step_index": 2}) + "\n")
+        rc, out_r, _ = run_rust_hud({"conversationId": "rust-hud-1", "transcriptPath": str(tr_r), "invocationNum": 2})
+        sm_r = json.loads(out_r).get("injectSteps", [{}])[0].get("systemMessage", {})
+        check("Rust HUD App 125k -> zero-token Context Watch", rc == 0 and sm_r.get("systemMessage") == "" and "Context Watch" in sm_r.get("metadata", {}).get("user_markdown", ""))
+
+        tr_r.write_text(tr_r.read_text() + json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 3000, "cache_read_tokens": 125000, "model": "gemini-4-hydrogen-xhigh", "step_index": 3}) + "\n")
+        rc, out_r, _ = run_rust_hud({"conversationId": "rust-hud-1", "transcriptPath": str(tr_r), "invocationNum": 3})
+        check("Rust HUD 128k repeat -> {}", rc == 0 and json.loads(out_r) == {})
+
+        tr_r.write_text(tr_r.read_text() + json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 8000, "cache_read_tokens": 197000, "model": "gemini-4-hydrogen-xhigh", "step_index": 4}) + "\n")
+        rc, out_r, _ = run_rust_hud({"conversationId": "rust-hud-1", "transcriptPath": str(tr_r), "invocationNum": 4})
+        check("Rust HUD 205k -> Context Cliff", rc == 0 and "Context Cliff" in json.loads(out_r).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", ""))
+
+        tr_r.write_text(tr_r.read_text() + json.dumps({"type": "CHECKPOINT", "content": "ok"}) + "\n" + json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 5000, "cache_read_tokens": 120000, "model": "gemini-4-hydrogen-xhigh", "step_index": 5}) + "\n")
+        rc, out_r, _ = run_rust_hud({"conversationId": "rust-hud-1", "transcriptPath": str(tr_r), "invocationNum": 5})
+        check("Rust HUD post-CHECKPOINT re-arms 120k watch", rc == 0 and "Context Watch" in json.loads(out_r).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", ""))
+
+        cli_dir = td_path / ".gemini" / "antigravity-cli" / "brain" / "r-cli" / ".system_generated" / "logs"
+        cli_dir.mkdir(parents=True)
+        tr_rc = cli_dir / "transcript.jsonl"
+        tr_rc.write_text(
+            "\n".join([
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 10000, "cache_read_tokens": 90000, "model": "gemini-4-neon-xhigh", "step_index": 1}),
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 110000, "cache_read_tokens": 0, "model": "gemini-4-hydrogen-xhigh", "step_index": 2}),
+            ]) + "\n"
+        )
+        rc, out_rf, _ = run_rust_hud({"conversationId": "rust-hud-cli", "transcriptPath": str(tr_rc), "invocationNum": 2})
+        check("Rust HUD CLI model flip -> Model Flip alert", rc == 0 and "Model Flip Cache Eviction" in json.loads(out_rf).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", ""))
+        rc, out_rv, _ = run_rust_hud({"conversationId": "rust-hud-cli2", "transcriptPath": str(tr_rc), "invocationNum": 2}, env_extra={"WM_AGY_BENCH_VANILLA": "1"})
+        check("Rust HUD VANILLA=1 -> {}", rc == 0 and json.loads(out_rv) == {})
+
+        # Idle-gap attribution (12m gap)
+        tr_idle = app_dir / "idle.jsonl"
+        tr_idle.write_text(
+            "\n".join([
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 10000, "cache_read_tokens": 120000, "model": "gemini-4-hydrogen-xhigh", "created_at": "2026-11-25T15:00:00Z", "step_index": 1}),
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 140000, "cache_read_tokens": 0, "model": "gemini-4-hydrogen-xhigh", "created_at": "2026-11-25T15:12:00Z", "step_index": 2}),
+            ]) + "\n"
+        )
+        rc, out_ri, _ = run_rust_hud({"conversationId": "rust-hud-idle", "transcriptPath": str(tr_idle), "invocationNum": 6})
+        um_ri = json.loads(out_ri).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", "")
+        check("Rust HUD 12m idle resume -> Cold Resume After Idle (idle 12m)", rc == 0 and "Cold Resume After Idle" in um_ri and "idle 12m" in um_ri, um_ri)
+
+        # Rust HUD latency (<25ms median)
+        hud_lats = sorted(run_rust_hud({"conversationId": f"rust-lat-{i}", "transcriptPath": str(tr_r), "invocationNum": 5})[2] for i in range(10))
+        med_ms = hud_lats[len(hud_lats) // 2]
+        check(f"Rust wm-squeeze --hud median latency < 25ms ({med_ms:.1f}ms)", med_ms < 25.0)
+
+    # 10h) wm-sim audit skips disabled agy-fast rules
+    p_sim_audit = subprocess.run([str(LOCAL_BIN / "wm-sim"), "audit"], capture_output=True, text=True)
+    check("wm-sim audit skips disabled agy-fast rule file", p_sim_audit.returncode == 0 and "plugins/agy-fast/rules/AGENTS.md" not in p_sim_audit.stdout)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="agy_hook_state_") as state_td:
         os.environ["WM_HOOK_STATE_DIR"] = state_td
@@ -1496,7 +1620,8 @@ def main():
         test_remote_confinement_attestation()
         test_v41_token_burn_shield()
         test_v44_ide_longevity_shield()
-    print(f"\n=== Wave 3/4/v4.4 Test Summary: {PASS} passed, {FAIL} failed ===")
+        test_v441_spill_cap_and_rust_hud()
+    print(f"\n=== Wave 3/4/v4.4.1 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

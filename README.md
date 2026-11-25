@@ -1,7 +1,8 @@
-# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v4.4.0 — App/IDE Parity & Longevity Shield)
+# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v4.4.1 — Compound Spill Shield, Sub-4ms Rust HUD & App/IDE Parity)
 
-Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity App 2.0, Antigravity IDE, and CLI (`agy 1.5.14+`) optimization suite fusing `whitemagic-agy-kit` and `INK-Q/agy-fast` (MIT) into a single unified plugin:
-- **App/IDE Parity & Longevity Shield (`v4.4.0`):** Quote-aware `PreToolUse` `wm-squeeze` (`+38.6%` more commands squeezed across `3,497` real commands, eliminating quoted `rg`/`find` bypasses), standalone `python3 -c` `wm-squeeze --pipe` wrapping, wide-line JSON/JSONL `<=50L` `read_file` clamping, Firecrawl/Research Engine MCP auto-budgeting, zero-token `PostInvocation` App/IDE Longevity HUD (`0` model tokens, `2.48%` alert rate on `7,188` replayed turns), multi-surface (`app`+`ide`+`cli`) companion CLIs, hardened Node/MCP wiring, deduplicated `AGENTS.md` (`-26.6%` bytes), and `139/139` passing regression tests ([`benchmarks/RESULTS_2026-11-25_v44.md`](./benchmarks/RESULTS_2026-11-25_v44.md)).
+Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity App 2.0, Antigravity IDE, and CLI (`agy 1.5.14+`) optimization suite fusing `whitemagic-agy-kit` and `INK-Q/agy-fast` (MIT) into a single unified plugin — **works standalone with zero external dependencies** (plus optional WhiteMagic Gen3 & Tricameral integrations):
+- **Compound Spill Shield & Rust HUD (`v4.4.1`):** Compound/multiline read-only bash, uncapped pipeline, and complex heredoc (`cd ... && python3 - <<'PY'`) `wm-squeeze --pipe` wrapping (zero false `SIGPIPE` via `(set +o pipefail ...)`), compiled zero-dep Rust `wm-squeeze --hud` `PostInvocation` hook with idle-gap attribution, JSON-encoded `transcript.jsonl` arg unwrapping across companion CLIs, and disabled-plugin rule filtering in `wm-sim audit`.
+- **App/IDE Parity & Longevity Shield (`v4.4.0`):** Quote-aware `PreToolUse` `wm-squeeze` (`+38.6%` more commands squeezed across `3,497` real commands, eliminating quoted `rg`/`find` bypasses), standalone `python3 -c` `wm-squeeze --pipe` wrapping, wide-line JSON/JSONL `<=50L` `read_file` clamping, Firecrawl/Research Engine MCP auto-budgeting, zero-token `PostInvocation` App/IDE Longevity HUD (`0` model tokens, `2.48%` alert rate on `7,188` replayed turns), multi-surface (`app`+`ide`+`cli`) companion CLIs, hardened Node/MCP wiring, deduplicated `AGENTS.md` (`-26.6%` bytes), and [`benchmarks/RESULTS_2026-11-25_v44.md`](./benchmarks/RESULTS_2026-11-25_v44.md).
 - **Token-Burn Shield (`v4.1.0`):** Forensic `agy-token-audit` CLI (`--recent`, `--conv`, `--swarm`, `--report-md`), wide-span & burst `read_file` auto-clamping (`>250L` / `150L` above `120k` ctx / `120L` burst), multiline inline `python3 - <<'PY'` heredoc `wm-squeeze --pipe` auto-wrapping, portable `[Env-Write Guard]` (`force_ask` on `.env*` secrets, fixing AGY sandbox relative deny-rule errors), and automatic user/plugin skill deduplication.
 - **5-Tool Eager Stdio MCP (`whitemagic-agy-kit_fast`):** `batch_search` (auto-collapses lockfile diffs), `apply_edits` (safe unique line-drift auto-relocate + trailing-whitespace unique fallback + `wm-squeeze` inline `verify`), `read_slices`, `run_checks` (CoACT `wm-squeeze` compression + 300s git-aware cache in `compact` mode), and `code_graph` (`wm-codegraph` AST/call-graph).
 - **Unified Zero-Jitter `SessionStart` (`session_start_brief.py`):** Single `<2.6 KB` Turn-0 digest combining cached preflight brief + SIM ledger + Dream digest + compact workspace snapshot (suppressing `$HOME` noise).
@@ -11,12 +12,12 @@ Built from empirical offline forensics across `50` real sessions (`12,740` turns
 
 ---
 
-## Headline Empirical Results ([v4.4.0 Benchmarks](./benchmarks/RESULTS_2026-11-25_v44.md) · [v3/Wave4 Benchmarks](./benchmarks/RESULTS_2026-11-21.md) · [v4.1.0 Swarm Telemetry](./benchmarks/AGY_SWARM_TOKEN_TELEMETRY_REPORT_2026-11-23.md))
+## Headline Empirical Results ([v4.4.1 3-Way Benchmarks](./benchmarks/RESULTS_2026-11-25_v441.md) · [v4.4.0 Benchmarks](./benchmarks/RESULTS_2026-11-25_v44.md) · [v3/Wave4 Benchmarks](./benchmarks/RESULTS_2026-11-21.md) · [v4.1.0 Swarm Telemetry](./benchmarks/AGY_SWARM_TOKEN_TELEMETRY_REPORT_2026-11-23.md))
 
-- **App/IDE Parity & Longevity Shield (`v4.4.0`, [RESULTS_2026-11-25_v44.md](./benchmarks/RESULTS_2026-11-25_v44.md)):**
-  - **22-Session Historical Replay (`3,497` `run_command` calls):** `533 → 739` commands auto-squeezed (**`+38.6%`**), catching `118` `python3 -c` and `53` quoted `rg` commands; `plugin/rules/AGENTS.md` cut **`-26.6%`** (`3,573 B → 2,621 B`).
-  - **20-Session `PostInvocation` Longevity HUD Replay (`7,188` turns):** `178` alerts (`2.48%` alert rate: `167` model-flip warnings, `6` `120k` watches, `2` `200k` cliffs, `6` cold misses) with **`0` model tokens** added.
-  - **Live `agy -p` Head-to-Head (`Vanilla` vs `v4.4.0`, `Gemini 4 Hydrogen (High)`):** `28.68s → 20.11s` (**`-29.9%` wall-time**), `1 → 0` disk spills (**`-100%`**), `2` `PreToolUse` rewrites (`rg` + `python3 -c`), `0` hook errors.
+- **Compound Spill Shield & Rust HUD (`v4.4.1`, [RESULTS_2026-11-25_v441.md](./benchmarks/RESULTS_2026-11-25_v441.md)):**
+  - **3-Way 22-Session Replay (`3,391` `run_command` calls):** `515` (`v4.3.0`) → `725` (`v4.4.0`) → **`1,350` (`v4.4.1`, `+162.1%`)** commands auto-squeezed; spill-command capture jumped `42/229 → 55/229 → 124/229` (**`54.1%`**, `2.95×` `v4.3.0`); `plugin/rules/AGENTS.md` cut **`-26.6%`** (`3,573 B → 2,623 B`).
+  - **Rust `wm-squeeze --hud` vs Python (`30` runs + `6,894`-turn replay):** **`2.1 ms` median (`4.1 ms` p95)** vs Python `57.6 ms` (**`27.9×` faster**, exact JSON parity `true`), emitting alerts on `2.45%` of turns with **`0` model tokens** added.
+  - **Live `agy -p` Verifications (`Gemini 4 Hydrogen (High)`):** `v4.4.0` A/B cut wall-time **`-29.9%`** (`28.68s → 20.11s`) & spills **`1 → 0`**; `v4.4.1` multiline compound smoke test rewrote & ran cleanly (`rc=0`, `0` spills, `0` hook errors).
 
 - **Live 19-Session `/swarm` Before vs. After (`v4.1.0` Token-Burn Shield, `agy-token-audit --swarm`):**
   - **Avg uncached input / worker:** `0.57M → 0.175M` (**`-69.4%`**) · **Avg total input / worker:** `8.99M → 1.89M` (**`-79.0%`**) · **Avg output / worker:** `111.5k → 52.6k` (**`-52.8%`**)
@@ -38,22 +39,23 @@ Built from empirical offline forensics across `50` real sessions (`12,740` turns
 
 ---
 
-## What's Included in v3.0.0
+## What's Included (Core Architecture — v4.4.1)
 
-1. **`wm-squeeze v3` — Zero-Dependency Rust CoACT CLI Compressor & Cache (`tools/wm-squeeze/`):**
-   - Single stripped `std`-only Rust binary (`<500 KB`, `<3 ms`) wired via `PreToolUse` `overwrite` for strictly allowlisted read-only and local build/test commands (`git`, `cargo`, `go test`, `pytest`, `npm`/`pnpm`/`yarn`, `rg`, `grep`, `find`, `ls`, `tree`, `gh`, `wm3`, `ruff`, `mypy`, `eslint`, `tsc`).
+1. **`wm-squeeze` — Zero-Dependency Rust CoACT CLI Compressor, Cache & HUD (`tools/wm-squeeze/`):**
+   - Single stripped `std`-only Rust binary (`<500 KB`, `<3 ms`) wired via `PreToolUse` `overwrite` for strictly allowlisted read-only/build/test commands (`git`, `cargo`, `go test`, `pytest`, `npm`/`pnpm`/`yarn`, `rg`, `grep`, `find`, `ls`, `tree`, `gh`, `wm3`, `ruff`, `mypy`, `eslint`, `tsc`), plus safe compound/multiline/piped read-only blocks, standalone `python3 -c`, and inline Python heredocs (`wm-squeeze --pipe`).
    - **Zero permission bypass:** `--safe` executes directly via `execvp` (no `sh -c`), enforces a compiled-in safe allowlist, and refuses dangerous flags (`find -exec/-delete`, `git -c/--exec-path`, `rg --pre`, `cargo --config`) with exit code `2`.
    - **Content-addressed git-aware result cache** (`300s` TTL, auto-invalidated on any file edit) prevents 20–60 s repeat rebuild gaps from evicting Gemini 4's prefix cache.
-2. **`wm-codegraph v3` — Zero-Dependency Rust Incremental Symbol & Call-Graph Engine (`tools/wm-codegraph/`):**
+   - **Sub-4ms Zero-Token Longevity HUD (`wm-squeeze --hud`):** `PostInvocation` hook emitting `metadata.user_markdown` (`"systemMessage": ""`, `0` model tokens) on model flips, `120k`/`200k` context cliffs (App/IDE), and cold idle resumes.
+2. **`wm-codegraph` — Zero-Dependency Rust Incremental Symbol & Call-Graph Engine (`tools/wm-codegraph/`):**
    - Indexes Rust, Python, TS/JS, Go, C/C++, and Shell incrementally (`~/.cache/wm-codegraph/`).
-   - Runs as CLI (`wm-codegraph overview|defs|callers|callees|impact|skeleton <target>`) or 1-tool local Stdio MCP (`wm-codegraph --mcp`).
+   - Runs as CLI (`wm-codegraph overview|defs|callers|callees|impact|skeleton <target>`) or inside the 5-tool eager MCP (`code_graph`).
 3. **Deterministic `PreToolUse` Safety & Anti-Bloat Engine (`plugin/hooks/pre_tool_guard.py`):**
-   - Data-Loss Guard (`force_ask`), `wm-squeeze --safe` `overwrite`, `>250`-line unbounded `read_file` auto-clamp (`L1–200`), compaction-aware unchanged duplicate-read dedup (`deny`), `>=150k` multimodal cache-cliff guard (`force_ask`), and WhiteMagic MCP `token_budget`/`max_content_bytes` auto-caps.
+   - Data-Loss & `.env*` secret guards (`force_ask`), quote-aware `wm-squeeze` rewriting, `>250`-line unbounded/wide-span `read_file` auto-clamp (`L1–200`, `<=150L` at `>=120k` ctx, `<=120L` on 4+ read bursts, `<=50L` on wide-line JSON/JSONL), compaction-aware duplicate-read dedup (`deny`), `>=150k` multimodal cache-cliff guard (`force_ask`), and MCP auto-budgeting.
 4. **`wm-handoff` (*CliffCompaction* Verbatim Session Reset Crystalizer, `bin/wm-handoff`):**
-   - Zero-paraphrase, truncation-only, SHA-256-pinned `<1.8k`-token session handoff crystal for cleanly resetting cold `>100k` sessions instead of paying 200k+ uncached re-prefills.
-5. **Zero-Jitter Turn-0 Prefix (`ContextCacheToken`), Cache-Warmth `statusLine`, `Stop` Telemetry & `agy-bench --credits`:**
-   - Stable `SessionStart` header (no volatile per-minute `age=Xm`) enables cross-session & subagent implicit prefix cache hits; `wm-sim prefix-hash` audits Turn-0 drift; `statusline.py` displays live `hit:XX% warm:12s unc:Xk`.
-6. **Non-Destructive `agy-mode` Launcher (`longevity|orchestrator|deep|turbo|status`), `$0` Local Offload (`wm-local-digest`), `wm-dream` Consolidation, Hardened `agy-fast`, Plugin Pruning (`-10.4k` tok), and 34-Test Suite (`tests/test_wave3.py`).**
+   - Multi-surface (`--surface all|app|ide|cli`) zero-paraphrase, truncation-only, SHA-256-pinned `<1.8k`-token session handoff crystal for cleanly resetting cold `>100k` sessions instead of paying 200k+ uncached re-prefills.
+5. **Zero-Jitter Turn-0 Prefix (`ContextCacheToken`), Cache-Warmth `statusLine`, `Stop` Telemetry & Multi-Surface CLIs:**
+   - Stable `SessionStart` header (no volatile per-minute timestamps) preserves implicit prefix cache hits; `wm-sim prefix-hash` audits Turn-0 drift; `statusline.py` renders live `hit:XX% warm:12s unc:Xk`; `agy-token-audit` & `agy-bench --credits` profile App, IDE, and CLI transcripts.
+6. **Non-Destructive `agy-mode` Launcher (`longevity|orchestrator|deep|turbo|status`), `$0` Local Offload (`wm-local-digest`), `wm-dream` Consolidation, Plugin Pruning (`-10.4k` tok), and 150+ Test Suite (`tests/test_wave3.py` + `81` `agy-turbo-mcp` TS tests).**
 
 ---
 
@@ -69,21 +71,25 @@ Built from empirical offline forensics across `50` real sessions (`12,740` turns
 
 ---
 
-## Quickstart & Upgrading (macOS & Linux)
+## Standalone Quickstart & Upgrading (App, IDE & CLI — Zero WhiteMagic Required)
+
+Works out-of-the-box for any Antigravity App 2.0, Antigravity IDE, or `agy` CLI user on **macOS** & **Linux** (Rust `cargo`/`rustc` optional for native binaries; Node >=20 optional for the 5-tool MCP):
 
 ```bash
-# Fresh install
+# 1. Clone & install (automatically wires App, IDE & CLI via ~/.gemini/config/)
 git clone https://github.com/lbailey94/whitemagic-agy-kit.git ~/.local/src/whitemagic-agy-kit
 cd ~/.local/src/whitemagic-agy-kit
-./install.sh                     # native AGY plugin (or --sync-global to merge into ~/.gemini/config)
+./install.sh --skip-tricameral-engine   # standalone AGY kit (omit flag to include Tricameral engine)
 
-# Upgrading on Mac / Inspiron (1-command sync)
-git pull && ./install.sh
+# 2. Upgrading later (1-command sync)
+git pull && ./install.sh --skip-tricameral-engine
 
-# Optional: pull local Tricameral micro-organ spores (~122 MB for Huginn-1, ~479 MB for both Ravens)
+# Optional: pull local Tricameral micro-organ spores (~122 MB for Huginn, ~479 MB for both Ravens)
 wm-models pull huginn            # set HF_TOKEN=... for private HF repo, or add --source gdrive
 wm-models list
 ```
+
+> **Turn-0 Context Tip:** Disable domain-specific marketplace plugins globally (e.g., `chrome-devtools-plugin`, `modern-web-guidance-plugin`, `google-antigravity-sdk` ≈ `~1,003` Turn-0 tokens) and re-enable them only in web/SDK repos via `.agents/plugins.json`.
 
 Verify and benchmark offline or live:
 

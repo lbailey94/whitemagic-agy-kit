@@ -101,6 +101,19 @@ SHELL_META_RE = re.compile(r"[|><;`\n$*?\[\]{}]|(?<!&)&(?!&)|(?:^|\s)~")
 _UNQUOTED_UNSAFE_CHARS = set("|><;`\n$*?[]{}()")
 _DOUBLE_QUOTED_UNSAFE_CHARS = set("$`\n")
 _PY_SAFE_FLAGS = {"-u", "-B", "-S", "-O", "-E", "-s", "-q"}
+_COMPOUND_SAFE_CMDS = {
+    "echo", "printf", "cd", "pwd", "ls", "ll", "find", "rg", "grep", "egrep", "fgrep",
+    "cat", "head", "tail", "wc", "sed", "awk", "cut", "sort", "uniq", "tr", "nl",
+    "stat", "file", "tree", "du", "df", "ps", "uptime", "uname", "which", "command",
+    "type", "env", "printenv", "jq", "diff", "sha256sum", "shasum", "md5sum",
+    "git", "cargo", "pytest", "go", "npm", "pnpm", "yarn", "ruff", "mypy", "eslint",
+    "tsc", "python3", "python", "wm3", "wm-gen3", "wm-preflight-brief", "wm-sim",
+    "wm-models", "wm-handoff", "wm-codegraph", "wm-vps", "wm-triage", "agy", "gh",
+    "systemctl", "true", "false",
+}
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_HEREDOC_OP_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_SED_INPLACE_RE = re.compile(r"^-[A-Za-z]*i")
 MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".pdf")
 BINARY_EXTS = (
     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".pdf", ".zip", ".gz", ".tar",
@@ -385,6 +398,290 @@ def _split_top_level_and(s: str):
     return parts
 
 
+def _strip_inline_comment(seg: str) -> str:
+    """Strip shell `# comment` outside single/double quotes and escapes."""
+    in_single = False
+    in_double = False
+    escaped = False
+    for i, ch in enumerate(seg):
+        if escaped:
+            escaped = False
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+        if in_double:
+            if ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_double = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == "'":
+            in_single = True
+            continue
+        if ch == '"':
+            in_double = True
+            continue
+        if ch == "#" and (i == 0 or seg[i - 1].isspace()):
+            return seg[:i].strip()
+    return seg.strip()
+
+
+def _is_compound_segment_safe(seg: str) -> tuple[bool, str, list[str]]:
+    """Validate one statement/pipe segment for read-only/diagnostic safety."""
+    cleaned = _strip_inline_comment(seg)
+    if not cleaned:
+        return True, "", []
+    # Strip harmless trailing/inline 2>&1, 2>/dev/null, >/dev/null
+    cleaned = re.sub(r"(?:^|\s)(?:2>&1|2>/dev/null|>/dev/null|>&[12])(?=\s|$)", " ", cleaned).strip()
+    # Strip trailing heredoc operator (`<<'TAG'` / `<<TAG`) for tokenization if present
+    cleaned = _HEREDOC_OP_RE.sub("", cleaned).strip()
+    if not cleaned:
+        return True, "", []
+    try:
+        toks = shlex.split(cleaned)
+    except Exception:
+        return False, "", []
+    while toks and _ASSIGN_RE.match(toks[0]):
+        toks.pop(0)
+    if not toks:
+        return True, "", []
+    # Reject shell control-flow keywords (only wrap clean command sequences/pipelines)
+    if toks[0] in ("if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "function"):
+        return False, "", []
+
+    cmd_base = os.path.basename(toks[0])
+    cmd_args = toks[1:]
+    if cmd_base not in _COMPOUND_SAFE_CMDS:
+        return False, cmd_base, cmd_args
+
+    if cmd_base in ("cargo", "pytest", "go", "npm", "pnpm", "yarn", "rg", "grep", "find", "wm3", "wm-gen3", "gh"):
+        return is_safe_squeezable(cmd_base, cmd_args), cmd_base, cmd_args
+    if cmd_base == "git":
+        if is_safe_squeezable("git", cmd_args):
+            return True, cmd_base, cmd_args
+        # Also allow rev-parse / describe / remote -v
+        i = 0
+        while i < len(cmd_args):
+            a = cmd_args[i]
+            if a in ("-c", "--paginate") or a.startswith(("-c", "--exec-path", "--config-env", "--upload-pack")):
+                return False, cmd_base, cmd_args
+            if a == "-C":
+                i += 2
+                continue
+            if a.startswith("-"):
+                i += 1
+                continue
+            nxt = cmd_args[i + 1] if i + 1 < len(cmd_args) else ""
+            ok = a in ("rev-parse", "describe") or (a == "remote" and nxt in ("", "-v"))
+            return ok, cmd_base, cmd_args
+        return False, cmd_base, cmd_args
+    if cmd_base in ("python3", "python"):
+        # Only allow `-c`, `-` (heredoc), `--version`, or safe `-m` modules
+        rest = [a for a in cmd_args if a not in _PY_SAFE_FLAGS]
+        if not rest:
+            return False, cmd_base, cmd_args
+        if rest[0] in ("-c", "-", "--version"):
+            return True, cmd_base, cmd_args
+        if len(rest) >= 2 and rest[0] == "-m" and rest[1] in ("pytest", "unittest", "mypy", "ruff", "json.tool"):
+            return True, cmd_base, cmd_args
+        return False, cmd_base, cmd_args
+    if cmd_base == "sed":
+        for a in cmd_args:
+            if a == "--in-place" or a.startswith("--in-place=") or _SED_INPLACE_RE.match(a):
+                return False, cmd_base, cmd_args
+        return True, cmd_base, cmd_args
+    if cmd_base == "awk":
+        joined = " ".join(cmd_args)
+        if "system(" in joined or ">" in joined:
+            return False, cmd_base, cmd_args
+        return True, cmd_base, cmd_args
+    if cmd_base == "systemctl":
+        sub = next((a for a in cmd_args if not a.startswith("-")), "")
+        return sub in ("status", "cat", "is-active", "is-enabled", "list-units", "list-timers", "show"), cmd_base, cmd_args
+    if cmd_base == "agy":
+        pos = [a for a in cmd_args if not a.startswith("-")]
+        if "--version" in cmd_args or "--help" in cmd_args:
+            return True, cmd_base, cmd_args
+        return (pos[:1] in (["models"], ["changelog"])) or (pos[:2] in (["plugin", "list"], ["mcp", "list"])), cmd_base, cmd_args
+    return True, cmd_base, cmd_args
+
+
+def _maybe_wrap_safe_compound_readonly(s: str):
+    """Wrap safe compound/multiline/piped/heredoc read-only inspection blocks via `wm-squeeze --pipe`."""
+    if os.environ.get("WM_SQUEEZE_COMPOUND_OFF") == "1":
+        return None
+    if not s or "wm-squeeze" in s:
+        return None
+
+    segments = []  # list of (sep_before, seg_text)
+    cur = []
+    sep_before = ""
+    has_compound_sep = False
+    has_pipe = False
+    in_single = False
+    in_double = False
+    escaped = False
+    pending_heredoc = None
+    in_heredoc = False
+    i = 0
+    n = len(s)
+
+    while i < n:
+        if in_heredoc:
+            nl = s.find("\n", i)
+            line_end = n if nl == -1 else nl
+            if s[i:line_end].strip() == pending_heredoc:
+                in_heredoc = False
+                pending_heredoc = None
+            i = line_end + 1 if nl != -1 else n
+            continue
+
+        ch = s[i]
+        if escaped:
+            cur.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if in_single:
+            cur.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\":
+                cur.append(ch)
+                escaped = True
+                i += 1
+                continue
+            if ch in ("`",) or (ch == "$" and i + 1 < n and s[i + 1] == "("):
+                return None
+            cur.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        # Outside quotes
+        if ch == "\\":
+            cur.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "`" or (ch == "$" and i + 1 < n and s[i + 1] == "("):
+            return None
+        if ch in ("(", ")", "{", "}"):
+            return None
+        if ch == "<" and i + 1 < n and s[i + 1] == "(":
+            return None
+        if ch == "<" and i + 1 < n and s[i + 1] == "<":
+            m_hd = _HEREDOC_OP_RE.match(s, i)
+            if m_hd:
+                pending_heredoc = m_hd.group(2)
+                cur.append(m_hd.group(0))
+                i = m_hd.end()
+                continue
+        if ch == ">":
+            if i + 1 < n and s[i + 1] == "(":
+                return None
+            # Allow only 2>&1, 2>/dev/null, >/dev/null, >&1, >&2
+            prev_ch = s[i - 1] if i > 0 else ""
+            if s.startswith(">&1", i) or s.startswith(">&2", i):
+                cur.append(s[i : i + 3])
+                i += 3
+                continue
+            if s.startswith(">/dev/null", i) and (i + 10 == n or s[i + 10].isspace() or s[i + 10] in ";|&\n"):
+                if prev_ch in ("", " ", "\t", "2", "1"):
+                    cur.append(">/dev/null")
+                    i += 10
+                    continue
+            return None
+        if ch == "&":
+            if i + 1 < n and s[i + 1] == "&":
+                if i + 2 < n and s[i + 2] == "&":
+                    return None
+                segments.append((sep_before, "".join(cur).strip()))
+                cur = []
+                sep_before = "&&"
+                has_compound_sep = True
+                i += 2
+                continue
+            return None
+        if ch == "|":
+            if i + 1 < n and s[i + 1] == "|":
+                segments.append((sep_before, "".join(cur).strip()))
+                cur = []
+                sep_before = "||"
+                has_compound_sep = True
+                i += 2
+                continue
+            segments.append((sep_before, "".join(cur).strip()))
+            cur = []
+            sep_before = "|"
+            has_pipe = True
+            i += 1
+            continue
+        if ch == ";" or ch == "\n":
+            segments.append((sep_before, "".join(cur).strip()))
+            cur = []
+            sep_before = ch
+            if ch == ";" or not pending_heredoc:
+                has_compound_sep = True
+            if ch == "\n" and pending_heredoc:
+                in_heredoc = True
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+
+    if in_single or in_double or escaped or in_heredoc:
+        return None
+    tail_seg = "".join(cur).strip()
+    if tail_seg:
+        segments.append((sep_before, tail_seg))
+
+    if not has_compound_sep and not has_pipe:
+        return None
+
+    non_empty = []
+    for sep, seg_txt in segments:
+        ok, base, cargs = _is_compound_segment_safe(seg_txt)
+        if not ok:
+            return None
+        if base:
+            non_empty.append((sep, base, cargs))
+    if not non_empty:
+        return None
+
+    # For single-line pure pipelines (no \n, ;, &&, ||), don't wrap if already bounded by head/tail/wc/grep -c
+    if not has_compound_sep and has_pipe:
+        _, last_base, last_args = non_empty[-1]
+        if last_base in ("head", "tail", "wc"):
+            return None
+        if last_base in ("grep", "egrep", "fgrep", "rg") and any(a in ("-c", "--count") for a in last_args):
+            return None
+
+    sq_bin = find_wm_squeeze()
+    if not sq_bin:
+        return None
+    return f"set -o pipefail; (set +o pipefail\n{s}\n) 2>&1 | {shlex.quote(sq_bin)} --pipe --kind generic"
+
+
 def _maybe_wrap_python_dash_c(s: str):
     """Wrap standalone `python3 -c "..."` (single or multiline) through `wm-squeeze --pipe`."""
     cleaned = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
@@ -420,21 +717,21 @@ def maybe_squeeze_command(cmd_line):
     if not s or "wm-squeeze" in s:
         return None
 
-    # Safe inline Python heredoc output cap (`python3 - <<'PY' ...`)
+    # Safe inline Python heredoc output cap (`[cd <dir> && ] python3 [-u|-B] - <<'PY' ...`)
     if "\n" in s and os.environ.get("WM_SQUEEZE_HEREDOC_OFF") != "1":
         lines = s.splitlines()
         first = lines[0].strip()
         m = re.match(
-            r"^(python3?(?:\s+-u)?)\s+-\s+<<(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2(?:\s+2>&1)?\s*$",
+            r"^(?:cd\s+\S+\s+&&\s+)?(python3?(?:\s+-[uBSO]+)*)\s+-\s+<<(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2(?:\s+(?:2>&1|2>/dev/null))*\s*$",
             first,
         )
-        if m and not any(ch in first for ch in ("|", ";", "&", "$", "`")):
+        if m and not any(ch in first for ch in ("|", ";", "$", "`")) and not re.search(r"(?<!&)&\s*$", first):
             tag = m.group(3)
             last_non_empty = next((ln.strip() for ln in reversed(lines[1:]) if ln.strip()), "")
             if last_non_empty == tag:
                 sq_bin = find_wm_squeeze()
                 if sq_bin:
-                    clean_first = re.sub(r"\s+2>&1\s*$", "", first).strip()
+                    clean_first = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", first).strip()
                     new_first = (
                         f"set -o pipefail; {clean_first} 2>&1 | {shlex.quote(sq_bin)} --pipe --kind generic"
                     )
@@ -447,68 +744,57 @@ def maybe_squeeze_command(cmd_line):
             return wrapped_py
 
     # Strip harmless trailing 2>&1 / 2>/dev/null (wm-squeeze captures stdout + stderr)
-    s = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
-    if not s:
+    s_single = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
+    if not s_single:
         return None
 
-    parts = _split_top_level_and(s)
-    if not parts:
-        return None
+    parts = _split_top_level_and(s_single)
+    if parts:
+        cwd_arg = None
+        toks = None
+        # Support safe `cd <dir> && <simple_cmd>` pattern (quote-aware)
+        if len(parts) == 2:
+            left, right = parts[0], parts[1]
+            if left and right and not _has_unsafe_shell_meta(left) and not _has_unsafe_shell_meta(right):
+                try:
+                    ltoks = shlex.split(left)
+                    rtoks = shlex.split(right)
+                    if len(ltoks) == 2 and ltoks[0] == "cd" and rtoks:
+                        cwd_arg = ltoks[1]
+                        toks = rtoks
+                except Exception:
+                    toks = None
+        elif len(parts) == 1 and not _has_unsafe_shell_meta(s_single):
+            try:
+                toks = shlex.split(s_single) or None
+            except Exception:
+                toks = None
 
-    cwd_arg = None
-    # Support safe `cd <dir> && <simple_cmd>` pattern (quote-aware)
-    if len(parts) == 2:
-        left, right = parts[0], parts[1]
-        if not left or not right or _has_unsafe_shell_meta(left) or _has_unsafe_shell_meta(right):
-            return None
-        try:
-            ltoks = shlex.split(left)
-            rtoks = shlex.split(right)
-        except Exception:
-            return None
-        if len(ltoks) != 2 or ltoks[0] != "cd" or not rtoks:
-            return None
-        cwd_arg = ltoks[1]
-        toks = rtoks
-    elif len(parts) == 1:
-        if _has_unsafe_shell_meta(s):
-            return None
-        try:
-            toks = shlex.split(s)
-        except Exception:
-            return None
-        if not toks:
-            return None
-    else:
-        return None
+        if toks:
+            safe_env_keys = {"PYTHONPATH", "RUST_BACKTRACE", "RUST_LOG", "NO_COLOR", "CARGO_TERM_COLOR"}
+            env_args = []
+            while toks and "=" in toks[0]:
+                k, _, _ = toks[0].partition("=")
+                if k not in safe_env_keys:
+                    toks = []
+                    break
+                env_args.append(toks.pop(0))
+            if toks:
+                cmd_base = os.path.basename(toks[0])
+                if is_safe_squeezable(cmd_base, toks[1:]):
+                    sq_bin = find_wm_squeeze()
+                    if sq_bin:
+                        out = [sq_bin, "--safe"]
+                        if cwd_arg:
+                            out.extend(["--cwd", cwd_arg])
+                        for ev in env_args:
+                            out.extend(["--env", ev])
+                        out.append("--")
+                        out.extend(toks)
+                        return " ".join(shlex.quote(x) for x in out)
 
-    # Allow safe read-only env var prefixes (e.g., PYTHONPATH=. pytest) while rejecting arbitrary env mutations
-    safe_env_keys = {"PYTHONPATH", "RUST_BACKTRACE", "RUST_LOG", "NO_COLOR", "CARGO_TERM_COLOR"}
-    env_args = []
-    while toks and "=" in toks[0]:
-        k, _, _ = toks[0].partition("=")
-        if k not in safe_env_keys:
-            return None
-        env_args.append(toks.pop(0))
-    if not toks:
-        return None
-
-    cmd_base = os.path.basename(toks[0])
-    if not is_safe_squeezable(cmd_base, toks[1:]):
-        return None
-
-    sq_bin = find_wm_squeeze()
-    if not sq_bin:
-        return None
-
-    out = [sq_bin, "--safe"]
-    if cwd_arg:
-        out.extend(["--cwd", cwd_arg])
-    for ev in env_args:
-        out.extend(["--env", ev])
-    out.append("--")
-    out.extend(toks)
-    return " ".join(shlex.quote(x) for x in out)
+    # Safe compound / multiline / uncapped pipeline / complex heredoc fallback
+    return _maybe_wrap_safe_compound_readonly(s)
 
 
 def is_wide_line_file(path_obj, size: int) -> bool:

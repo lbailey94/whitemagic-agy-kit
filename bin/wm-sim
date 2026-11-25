@@ -148,12 +148,36 @@ def cmd_failures(args):
         )
 
 
+def _disabled_plugins() -> set:
+    cfg_json = HOME / ".gemini" / "config" / "config.json"
+    if not cfg_json.is_file():
+        return set()
+    try:
+        plugs = json.loads(cfg_json.read_text(encoding="utf-8")).get("plugins") or {}
+        return {k for k, v in plugs.items() if isinstance(v, dict) and v.get("enabled") is False}
+    except Exception:
+        return set()
+
+
+def _rule_plugin_name(rf: Path) -> str:
+    plugs_dir = HOME / ".gemini" / "config" / "plugins"
+    try:
+        rel = rf.relative_to(plugs_dir)
+        return rel.parts[0] if rel.parts else ""
+    except Exception:
+        return ""
+
+
 def cmd_audit(args):
+    disabled_plugs = _disabled_plugins()
     print("=== AGY CLI & WhiteMagic SIM Hygiene Audit ===\n")
     print("1. Rule Files (AGY per-file cap: 24,000 bytes):")
     seen_hashes = {}
     rule_word_sets = []
     for rf in RULE_FILES:
+        plug_name = _rule_plugin_name(rf)
+        if plug_name and plug_name in disabled_plugs:
+            continue
         if rf.exists():
             with rf.open("rb") as _rfh:
                 data = _rfh.read()
@@ -312,10 +336,14 @@ def cmd_sync_wm3(args):
 
 def cmd_prefix_hash(args):
     """Compute a ContextCacheToken-style canonical SHA-256 of Turn-0 rules, skills, and eager MCP schemas."""
+    disabled_plugs = _disabled_plugins()
     h = hashlib.sha256()
     total_bytes = 0
     print("=== Turn-0 ContextCacheToken Prefix Audit ===")
     for rf in RULE_FILES:
+        plug_name = _rule_plugin_name(rf)
+        if plug_name and plug_name in disabled_plugs:
+            continue
         if rf.exists():
             with rf.open("rb") as _rfh:
                 data = _rfh.read()

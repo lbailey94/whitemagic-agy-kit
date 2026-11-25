@@ -44,6 +44,17 @@ def parse_agy_fast_md(md_text):
     return metrics
 
 
+def _unwrap_json_str(v):
+    if isinstance(v, str) and len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        try:
+            u = json.loads(v)
+            if isinstance(u, str):
+                return u
+        except Exception:
+            pass
+    return v
+
+
 def parse_ts(v):
     if not v:
         return None
@@ -136,10 +147,10 @@ def measure_extended_and_credits(recent=30, since=None, surface="all"):
                     if name == "read_file":
                         rf_turn += 1
                         total_reads += 1
-                        sl, el = args.get("StartLine"), args.get("EndLine")
+                        sl, el = _unwrap_json_str(args.get("StartLine")), _unwrap_json_str(args.get("EndLine"))
                         if not sl and not el:
                             unbounded_reads += 1
-                        rkey = (str(args.get("Path", "")), sl, el)
+                        rkey = (str(_unwrap_json_str(args.get("Path", ""))), sl, el)
                         if rkey in seen_reads:
                             dup_reads += 1
                         seen_reads.add(rkey)

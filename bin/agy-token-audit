@@ -46,6 +46,17 @@ def find_transcript(conv_id: str, surface: str = "all") -> tuple[Path | None, st
     return None, ""
 
 
+def _unwrap_json_str(v: Any) -> Any:
+    if isinstance(v, str) and len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        try:
+            u = json.loads(v)
+            if isinstance(u, str):
+                return u
+        except Exception:
+            pass
+    return v
+
+
 def sanitize_report(text: str) -> str:
     home_str = str(Path.home())
     text = text.replace(home_str, "~")
@@ -81,8 +92,11 @@ def discover_swarm_workers(coord_id: str, surface: str = "all") -> list[tuple[st
                             args = json.loads(args)
                         except Exception:
                             args = {}
-                    if isinstance(args, dict) and args.get("action") == "add" and args.get("name"):
-                        pending_names.append(str(args["name"]))
+                    if isinstance(args, dict):
+                        act = _unwrap_json_str(args.get("action"))
+                        wname = _unwrap_json_str(args.get("name"))
+                        if act == "add" and wname:
+                            pending_names.append(str(wname))
         elif t == "GENERIC":
             c = str(o.get("content") or "")
             if '"conversation_id"' in c or "conversation_id" in c:

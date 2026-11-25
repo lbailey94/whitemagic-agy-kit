@@ -15,6 +15,7 @@ import os
 import re
 import stat as stat_mod
 import sys
+from datetime import datetime
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("WM_HOOK_STATE_DIR", "/tmp/agy-hook-state"))
@@ -39,6 +40,15 @@ def analyze_tail(transcript_path: str):
     if not stat_mod.S_ISREG(st.st_mode):
         return None
     return p, st.st_size, st.st_mtime_ns
+
+
+def _parse_iso_ts(val) -> float | None:
+    if not val:
+        return None
+    try:
+        return datetime.fromisoformat(str(val).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
 
 
 def parse_tail_metrics(p: Path, sz: int):
@@ -78,6 +88,7 @@ def parse_tail_metrics(p: Path, sz: int):
                 "ctx": unc + cac,
                 "model": str(o.get("model") or ""),
                 "step": o.get("step_index"),
+                "ts": _parse_iso_ts(o.get("created_at") or o.get("timestamp")),
             }
         )
     return checkpoints, responses[-2:]
@@ -138,7 +149,11 @@ def main():
         cur_model = last_pr["model"]
         prev_model = prev_pr["model"] if prev_pr else ""
         cur_inv = int(payload.get("invocationNum") or 0)
-        step_key = last_pr["step"] if last_pr["step"] is not None else f"inv:{cur_inv}:{sz}"
+        raw_step = last_pr.get("step")
+        step_key = str(raw_step) if raw_step is not None else f"inv:{cur_inv}:{sz}"
+        t_prev = prev_pr.get("ts") if prev_pr else None
+        t_last = last_pr.get("ts")
+        idle_secs = int(t_last - t_prev) if (t_prev is not None and t_last is not None and t_last > t_prev) else 0
 
         # Reset context-threshold flags after compaction or context shrink
         prev_epoch = int(state.get("epoch") or 0)
@@ -185,10 +200,16 @@ def main():
                 and unc >= 50_000
                 and (cur_inv - last_cold_inv) >= 5
             ):
-                alerts.append(
-                    f"❄️ **Cold Cache Miss (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% hit):** "
-                    f"Re-prefilled ~{unc / 1000:.0f}k uncached tok. Use `wm-handoff` before resuming idle sessions."
-                )
+                if idle_secs >= 300:
+                    alerts.append(
+                        f"❄️ **Cold Resume After Idle (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% hit · idle {idle_secs // 60}m):** "
+                        f"Re-prefilled ~{unc / 1000:.0f}k uncached tok. Use `wm-handoff` before resuming idle sessions."
+                    )
+                else:
+                    alerts.append(
+                        f"❄️ **Cold Cache Miss (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% hit):** "
+                        f"Re-prefilled ~{unc / 1000:.0f}k uncached tok. Use `wm-handoff` before resuming idle sessions."
+                    )
                 state["last_cold_inv"] = cur_inv
 
         _write_json_atomic(sf, state)

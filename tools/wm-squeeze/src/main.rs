@@ -10,8 +10,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -780,16 +780,500 @@ fn parse_kind(s: &str) -> Kind {
     }
 }
 
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn parse_json_str_at(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    if start >= bytes.len() || bytes[start] != b'"' {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut raw = Vec::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < bytes.len() {
+            let esc = bytes[i + 1];
+            match esc {
+                b'"' => raw.push(b'"'),
+                b'\\' => raw.push(b'\\'),
+                b'/' => raw.push(b'/'),
+                b'n' => raw.push(b'\n'),
+                b'r' => raw.push(b'\r'),
+                b't' => raw.push(b'\t'),
+                b'u' if i + 5 < bytes.len() => {
+                    if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6]) {
+                        if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                            if let Some(ch) = char::from_u32(cp) {
+                                let mut buf = [0u8; 4];
+                                raw.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            }
+                        }
+                    }
+                    i += 6;
+                    continue;
+                }
+                other => raw.push(other),
+            }
+            i += 2;
+            continue;
+        }
+        if b == b'"' {
+            let s = String::from_utf8_lossy(&raw).into_owned();
+            return Some((s, i + 1));
+        }
+        raw.push(b);
+        i += 1;
+    }
+    None
+}
+
+fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn skip_json_value(bytes: &[u8], start: usize) -> usize {
+    let i = skip_json_ws(bytes, start);
+    if i >= bytes.len() {
+        return i;
+    }
+    match bytes[i] {
+        b'"' => parse_json_str_at(bytes, i).map(|(_, e)| e).unwrap_or(bytes.len()),
+        b'{' | b'[' => {
+            let mut depth = 1usize;
+            let mut j = i + 1;
+            let mut in_str = false;
+            let mut esc = false;
+            while j < bytes.len() && depth > 0 {
+                let b = bytes[j];
+                if esc {
+                    esc = false;
+                } else if in_str {
+                    if b == b'\\' {
+                        esc = true;
+                    } else if b == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match b {
+                        b'"' => in_str = true,
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            j
+        }
+        _ => {
+            let mut j = i;
+            while j < bytes.len() && !matches!(bytes[j], b',' | b'}' | b']') && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            j
+        }
+    }
+}
+
+/// Zero-alloc depth-1 top-level JSON field scanner (returns raw string/scalar tokens by key).
+fn extract_top_level_fields(line: &str, wanted: &[&str]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let bytes = line.trim().as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return out;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        i = skip_json_ws(bytes, i);
+        if i >= bytes.len() || bytes[i] == b'}' {
+            break;
+        }
+        if bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] != b'"' {
+            break;
+        }
+        let Some((key, after_key)) = parse_json_str_at(bytes, i) else { break };
+        i = skip_json_ws(bytes, after_key);
+        if i >= bytes.len() || bytes[i] != b':' {
+            break;
+        }
+        i = skip_json_ws(bytes, i + 1);
+        let is_wanted = wanted.contains(&key.as_str());
+        if i < bytes.len() && bytes[i] == b'"' {
+            let Some((val, end)) = parse_json_str_at(bytes, i) else { break };
+            if is_wanted {
+                out.insert(key, val);
+            }
+            i = end;
+        } else {
+            let end = skip_json_value(bytes, i);
+            if is_wanted && end > i {
+                if let Ok(tok) = std::str::from_utf8(&bytes[i..end]) {
+                    let t = tok.trim();
+                    if t != "null" {
+                        out.insert(key, t.to_string());
+                    }
+                }
+            }
+            i = end;
+        }
+    }
+    out
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = y - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn parse_iso_epoch_secs(s: &str) -> Option<i64> {
+    let b = s.trim().as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b' ') || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let y: i64 = std::str::from_utf8(&b[0..4]).ok()?.parse().ok()?;
+    let m: i64 = std::str::from_utf8(&b[5..7]).ok()?.parse().ok()?;
+    let d: i64 = std::str::from_utf8(&b[8..10]).ok()?.parse().ok()?;
+    let hh: i64 = std::str::from_utf8(&b[11..13]).ok()?.parse().ok()?;
+    let mm: i64 = std::str::from_utf8(&b[14..16]).ok()?.parse().ok()?;
+    let ss: i64 = std::str::from_utf8(&b[17..19]).ok()?.parse().ok()?;
+    let mut idx = 19;
+    if idx < b.len() && b[idx] == b'.' {
+        idx += 1;
+        while idx < b.len() && b[idx].is_ascii_digit() {
+            idx += 1;
+        }
+    }
+    let mut tz_off = 0i64;
+    if idx < b.len() && (b[idx] == b'+' || b[idx] == b'-') && idx + 5 < b.len() {
+        let sign = if b[idx] == b'+' { 1i64 } else { -1i64 };
+        let th: i64 = std::str::from_utf8(&b[idx + 1..idx + 3]).ok()?.parse().ok()?;
+        let tm: i64 = if b[idx + 3] == b':' && idx + 5 < b.len() {
+            std::str::from_utf8(&b[idx + 4..idx + 6]).ok()?.parse().ok()?
+        } else if idx + 4 < b.len() {
+            std::str::from_utf8(&b[idx + 3..idx + 5]).ok()?.parse().ok()?
+        } else {
+            0
+        };
+        tz_off = sign * (th * 3600 + tm * 60);
+    }
+    Some(days_from_civil(y, m, d) * 86_400 + hh * 3600 + mm * 60 + ss - tz_off)
+}
+
+#[derive(Default)]
+struct HudState {
+    path: String,
+    sz: u64,
+    mtime_ns: u128,
+    epoch: u64,
+    warned_120k: bool,
+    warned_200k: bool,
+    last_flip_step: String,
+    last_cold_inv: i64,
+}
+
+fn load_hud_state(sf: &Path) -> HudState {
+    let mut st = HudState { last_cold_inv: -99, ..Default::default() };
+    let Ok(txt) = fs::read_to_string(sf) else { return st };
+    let fields = extract_top_level_fields(
+        &txt,
+        &["path", "sz", "mtime_ns", "epoch", "warned_120k", "warned_200k", "last_flip_step", "last_cold_inv"],
+    );
+    if let Some(v) = fields.get("path") { st.path = v.clone(); }
+    if let Some(v) = fields.get("sz") { st.sz = v.parse().unwrap_or(0); }
+    if let Some(v) = fields.get("mtime_ns") { st.mtime_ns = v.parse().unwrap_or(0); }
+    if let Some(v) = fields.get("epoch") { st.epoch = v.parse().unwrap_or(0); }
+    if let Some(v) = fields.get("warned_120k") { st.warned_120k = v == "true"; }
+    if let Some(v) = fields.get("warned_200k") { st.warned_200k = v == "true"; }
+    if let Some(v) = fields.get("last_flip_step") { st.last_flip_step = v.clone(); }
+    if let Some(v) = fields.get("last_cold_inv") { st.last_cold_inv = v.parse().unwrap_or(-99); }
+    st
+}
+
+fn save_hud_state(sf: &Path, st: &HudState) {
+    let body = format!(
+        "{{\"path\":\"{}\",\"sz\":{},\"mtime_ns\":{},\"epoch\":{},\"warned_120k\":{},\"warned_200k\":{},\"last_flip_step\":\"{}\",\"last_cold_inv\":{}}}",
+        json_escape(&st.path),
+        st.sz,
+        st.mtime_ns,
+        st.epoch,
+        if st.warned_120k { "true" } else { "false" },
+        if st.warned_200k { "true" } else { "false" },
+        json_escape(&st.last_flip_step),
+        st.last_cold_inv
+    );
+    if let Some(parent) = sf.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let name = sf.file_name().and_then(|s| s.to_str()).unwrap_or("hud.json");
+    let tmp = sf.with_file_name(format!(".{}.tmp.{}", name, std::process::id()));
+    if fs::write(&tmp, body.as_bytes()).is_ok() {
+        if fs::rename(&tmp, sf).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+struct PlannerTail {
+    unc: u64,
+    cac: u64,
+    ctx: u64,
+    model: String,
+    step: Option<String>,
+    ts_secs: Option<i64>,
+}
+
+fn run_hud() {
+    if env::var("WM_AGY_BENCH_VANILLA").ok().as_deref() == Some("1")
+        || env::var("WM_LONGEVITY_HUD_OFF").ok().as_deref() == Some("1")
+    {
+        println!("{{}}");
+        return;
+    }
+
+    let mut stdin_buf = String::new();
+    if io::stdin().read_to_string(&mut stdin_buf).is_err() || stdin_buf.trim().is_empty() {
+        println!("{{}}");
+        return;
+    }
+    let payload = extract_top_level_fields(&stdin_buf, &["transcriptPath", "conversationId", "invocationNum"]);
+    let tp = payload.get("transcriptPath").map(|s| s.as_str()).unwrap_or("");
+    if tp.is_empty() {
+        println!("{{}}");
+        return;
+    }
+    let conv_id = payload.get("conversationId").map(|s| s.as_str()).unwrap_or("default");
+    let cur_inv: i64 = payload.get("invocationNum").and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let tp_path = Path::new(tp);
+    let Ok(meta) = fs::metadata(tp_path) else {
+        println!("{{}}");
+        return;
+    };
+    if !meta.is_file() {
+        println!("{{}}");
+        return;
+    }
+    let sz = meta.len();
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    let state_dir = env::var("WM_HOOK_STATE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/tmp/agy-hook-state".to_string());
+    let mut san: String = conv_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(20)
+        .collect();
+    if san.is_empty() {
+        san = "default".to_string();
+    }
+    let sf = PathBuf::from(&state_dir).join(format!("hud_{}.json", san));
+    let mut state = load_hud_state(&sf);
+
+    if state.path == tp && state.sz == sz && state.mtime_ns == mtime_ns {
+        println!("{{}}");
+        return;
+    }
+
+    let Ok(mut fh) = File::open(tp_path) else {
+        println!("{{}}");
+        return;
+    };
+    let tail_start = sz.saturating_sub(49_152);
+    if tail_start > 0 {
+        let _ = fh.seek(SeekFrom::Start(tail_start));
+    }
+    let mut tail_bytes = Vec::new();
+    if fh.read_to_end(&mut tail_bytes).is_err() {
+        println!("{{}}");
+        return;
+    }
+    let chunk = String::from_utf8_lossy(&tail_bytes);
+
+    let mut checkpoints = 0u64;
+    let mut responses: Vec<PlannerTail> = Vec::new();
+    for line in chunk.lines() {
+        if !line.starts_with('{') {
+            continue;
+        }
+        if line.contains("\"CHECKPOINT\"") {
+            let fields = extract_top_level_fields(line, &["type"]);
+            if fields.get("type").map(|s| s.as_str()) == Some("CHECKPOINT") {
+                checkpoints += 1;
+            }
+            continue;
+        }
+        if !line.contains("\"PLANNER_RESPONSE\"") {
+            continue;
+        }
+        let fields = extract_top_level_fields(
+            line,
+            &["type", "input_tokens", "cache_read_tokens", "model", "step_index", "created_at", "timestamp"],
+        );
+        if fields.get("type").map(|s| s.as_str()) != Some("PLANNER_RESPONSE") {
+            continue;
+        }
+        let unc: u64 = fields.get("input_tokens").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let cac: u64 = fields.get("cache_read_tokens").and_then(|s| s.parse().ok()).unwrap_or(0);
+        if unc + cac == 0 {
+            continue;
+        }
+        let model = fields.get("model").cloned().unwrap_or_default();
+        let step = fields.get("step_index").cloned();
+        let ts_secs = fields
+            .get("created_at")
+            .or_else(|| fields.get("timestamp"))
+            .and_then(|s| parse_iso_epoch_secs(s));
+        responses.push(PlannerTail { unc, cac, ctx: unc + cac, model, step, ts_secs });
+    }
+
+    state.path = tp.to_string();
+    state.sz = sz;
+    state.mtime_ns = mtime_ns;
+
+    if responses.is_empty() {
+        save_hud_state(&sf, &state);
+        println!("{{}}");
+        return;
+    }
+
+    let last_pr = &responses[responses.len() - 1];
+    let prev_pr = if responses.len() >= 2 { Some(&responses[responses.len() - 2]) } else { None };
+    let unc = last_pr.unc;
+    let cac = last_pr.cac;
+    let cur_ctx = last_pr.ctx;
+    let hit_pct = 100.0 * (cac as f64) / (cur_ctx.max(1) as f64);
+    let cur_model = last_pr.model.as_str();
+    let prev_model = prev_pr.map(|p| p.model.as_str()).unwrap_or("");
+    let step_key = last_pr.step.clone().unwrap_or_else(|| format!("inv:{}:{}", cur_inv, sz));
+    let idle_secs: i64 = match (prev_pr.and_then(|p| p.ts_secs), last_pr.ts_secs) {
+        (Some(t0), Some(t1)) if t1 > t0 => t1 - t0,
+        _ => 0,
+    };
+
+    if checkpoints > state.epoch || cur_ctx < 90_000 {
+        state.warned_120k = false;
+        state.warned_200k = false;
+    }
+    state.epoch = state.epoch.max(checkpoints);
+
+    let is_cli = tp.contains("antigravity-cli");
+    let hud_cli_full = env::var("WM_LONGEVITY_HUD_CLI").ok().as_deref() == Some("1");
+    let flipped = !prev_model.is_empty() && !cur_model.is_empty() && prev_model != cur_model;
+    let mut alerts: Vec<String> = Vec::new();
+
+    if flipped && unc >= 50_000 && step_key != state.last_flip_step {
+        alerts.push(format!(
+            "⚡ **Model Flip Cache Eviction** (`{}` → `{}`): burned **~{:.0}k uncached tok** ({:.0}% hit). Pin a single model (`Gemini 4 Hydrogen`) on >80k sessions.",
+            prev_model,
+            cur_model,
+            (unc as f64) / 1000.0,
+            hit_pct
+        ));
+        state.last_flip_step = step_key;
+    }
+
+    if !is_cli || hud_cli_full {
+        if cur_ctx >= 200_000 && !state.warned_200k {
+            alerts.push(format!(
+                "🔴 **Context Cliff (~{:.0}k tok · {:.0}% cache hit):** High re-prefill cost on any idle gap. Run `/compact` or `wm-handoff` soon.",
+                (cur_ctx as f64) / 1000.0,
+                hit_pct
+            ));
+            state.warned_200k = true;
+            state.warned_120k = true;
+        } else if cur_ctx >= 120_000 && !state.warned_120k {
+            alerts.push(format!(
+                "🟡 **Context Watch (~{:.0}k tok · {:.0}% cache hit):** Run `/compact` or `wm-handoff` before stepping away >5m.",
+                (cur_ctx as f64) / 1000.0,
+                hit_pct
+            ));
+            state.warned_120k = true;
+        }
+
+        if !flipped && cur_ctx >= 80_000 && hit_pct < 50.0 && unc >= 50_000 && (cur_inv - state.last_cold_inv) >= 5 {
+            if idle_secs >= 300 {
+                let idle_mins = idle_secs / 60;
+                alerts.push(format!(
+                    "❄️ **Cold Resume After Idle (~{:.0}k tok · {:.0}% hit · idle {}m):** Re-prefilled ~{:.0}k uncached tok. Use `wm-handoff` before resuming idle sessions.",
+                    (cur_ctx as f64) / 1000.0,
+                    hit_pct,
+                    idle_mins,
+                    (unc as f64) / 1000.0
+                ));
+            } else {
+                alerts.push(format!(
+                    "❄️ **Cold Cache Miss (~{:.0}k tok · {:.0}% hit):** Re-prefilled ~{:.0}k uncached tok. Use `wm-handoff` before resuming idle sessions.",
+                    (cur_ctx as f64) / 1000.0,
+                    hit_pct,
+                    (unc as f64) / 1000.0
+                ));
+            }
+            state.last_cold_inv = cur_inv;
+        }
+    }
+
+    save_hud_state(&sf, &state);
+
+    if alerts.is_empty() {
+        println!("{{}}");
+    } else {
+        let md = format!("> {}", alerts.join("\n> "));
+        println!(
+            "{{\"injectSteps\":[{{\"systemMessage\":{{\"systemMessage\":\"\",\"metadata\":{{\"user_markdown\":\"{}\"}}}}}}],\"terminationBehavior\":\"\"}}",
+            json_escape(&md)
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!(
-            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --stats"
+            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --hud\n  wm-squeeze --stats"
         );
         std::process::exit(0);
     }
     if args[0] == "--stats" {
         print_stats();
+        return;
+    }
+    if args[0] == "--hud" {
+        run_hud();
         return;
     }
 
