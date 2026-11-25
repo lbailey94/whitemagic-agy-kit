@@ -9,6 +9,9 @@ Always returns `{"decision": "allow"}` so it never blocks or extends execution.
 
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -20,6 +23,10 @@ TELEM_PATH = Path(
         str(Path.home() / ".local" / "share" / "whitemagic" / "agy_telemetry.jsonl"),
     )
 )
+HANDOFF_CACHE_DIR = Path(
+    os.environ.get("WM_HANDOFF_CACHE_DIR") or str(Path.home() / ".cache" / "wm-handoff")
+)
+_CONV_ID_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
 def summarize_tail(transcript_path):
@@ -110,6 +117,76 @@ def summarize_tail(transcript_path):
     }
 
 
+def _resolve_handoff_bin() -> str | None:
+    env_bin = os.environ.get("WM_HANDOFF_BIN", "").strip()
+    if env_bin and Path(env_bin).is_file():
+        return env_bin
+    candidates = [
+        Path(__file__).resolve().parents[2] / "bin" / "wm-handoff",
+        Path.home() / ".local" / "bin" / "wm-handoff",
+    ]
+    which_bin = shutil.which("wm-handoff")
+    if which_bin:
+        candidates.append(Path(which_bin))
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return None
+
+
+def _maybe_auto_crystal(payload: dict, stats: dict, now: float) -> None:
+    if os.environ.get("WM_AUTO_CRYSTAL_OFF") == "1":
+        return
+    if payload.get("fullyIdle") is False:
+        return
+    reason = str(payload.get("terminationReason") or "")
+    if reason not in ("NO_TOOL_CALL", ""):
+        return
+    last_ctx = int(stats.get("last_ctx") or 0)
+    flips = int(stats.get("model_flips") or 0)
+    if not ((last_ctx >= 99_000 and flips >= 2) or last_ctx >= 130_000):
+        return
+    tp = str(payload.get("transcriptPath") or "")
+    if not tp or not Path(tp).is_file():
+        return
+    handoff_bin = _resolve_handoff_bin()
+    if not handoff_bin:
+        return
+
+    raw_conv = str(payload.get("conversationId") or "default")
+    san = _CONV_ID_SANITIZE_RE.sub("", raw_conv)[:20] or "default"
+    cache_dir = Path(os.environ.get("WM_HANDOFF_CACHE_DIR") or str(HANDOFF_CACHE_DIR))
+    crystal_out = cache_dir / f"latest_{san}.md"
+    receipt_out = cache_dir / f"latest_{san}.receipt.json"
+    tp_sz = Path(tp).stat().st_size
+
+    if receipt_out.is_file() and crystal_out.is_file():
+        try:
+            prev_rec = json.loads(receipt_out.read_text(encoding="utf-8"))
+            prev_mtime = receipt_out.stat().st_mtime
+            prev_tp_sz = int(prev_rec.get("transcript_bytes") or 0)
+            if (now - prev_mtime) < 120.0 and (tp_sz - prev_tp_sz) < 25_000:
+                return
+        except Exception:
+            pass
+
+    cmd = [
+        sys.executable,
+        "-S",
+        handoff_bin,
+        "--transcript",
+        tp,
+        "--out",
+        str(crystal_out),
+        "--emit-receipt",
+        str(receipt_out),
+    ]
+    cwd = str(payload.get("cwd") or "")
+    if cwd and Path(cwd).is_dir():
+        cmd.extend(["--cwd", cwd])
+    subprocess.run(cmd, capture_output=True, text=True, timeout=1.5)
+
+
 def main():
     if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
         sys.stdout.write(json.dumps({"decision": "allow"}))
@@ -132,6 +209,10 @@ def main():
             TELEM_PATH.parent.mkdir(parents=True, exist_ok=True)
             with open(TELEM_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            try:
+                _maybe_auto_crystal(payload, stats, now)
+            except Exception:
+                pass
     except Exception:
         pass
     sys.stdout.write(json.dumps({"decision": "allow"}))

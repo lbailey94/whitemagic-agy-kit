@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# WhiteMagic AGY Turbo Kit v4.4.2 — Idempotent Cross-Platform Installer (macOS + Linux)
+# WhiteMagic AGY Turbo Kit v4.5.0 — Idempotent Cross-Platform Installer (macOS + Linux)
 # Installs:
 #   1. Zero-dependency Rust binaries `wm-squeeze`, `wm-codegraph`, & Safe-Rust `muninn-engine` -> ~/.local/bin/
 #   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` & `tricameral_dispatch` MCPs; or `--sync-global`)
 #   3. Hardened `INK-Q/agy-fast` plugin (--auto-update off) if Node >= 20 is available (preserves existing valid installs)
 #   4. Disables 6 unused heavy official plugins (-10.4k tokens/session) if present
-#   5. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `wm-local-digest`, `wm-dream`, `wm-handoff`, `wm-models`, `wm-huginn`, `wm-muninn`, `wm-tricameral`, `wm-tricameral-mcp`, `statusline.py`)
+#   5. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `agy-token-audit`, `wm-local-digest`, `wm-dream`, `wm-handoff`, `wm-reset`, `wm-models`, `wm-huginn`, `wm-muninn`, `wm-tricameral`, `wm-tricameral-mcp`, `statusline.py`)
 #   6. Non-destructive `~/.gemini/antigravity-cli/settings.json` safe allowlist + statusLine tuning (timestamped backup; leaves model untouched)
 #   7. Selective `"eager": true` MCP promotion for locally detected `wm3` / `whitemagic_gen3` / `firecrawl-local-mcp`
 #   8. Optional Tricameral spore pull (`--with-huginn` | `--with-ravens` | `--with-tricameral`) via `wm-models`
@@ -102,9 +102,13 @@ hooks = {
         "enabled": True,
         "PreToolUse": [
             {
-                "matcher": "run_command|read_file|write_file|edit_file|manage_task|mcp_whitemagic-agy-kit_fast_run_checks|mcp_whitemagic-agy-kit_fast_apply_edits|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall|mcp_whitemagic_whitemagic_gen3_session_continuity|mcp_whitemagic_whitemagic_gen3_memory_recall|mcp_wm-research-engine_research_hunt|mcp_firecrawl_firecrawl_scrape",
+                "matcher": "run_command|read_file|write_file|edit_file|manage_task|swarm|post_message|invoke_subagent|mcp_whitemagic-agy-kit_fast_run_checks|mcp_whitemagic-agy-kit_fast_apply_edits|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall|mcp_whitemagic_whitemagic_gen3_session_continuity|mcp_whitemagic_whitemagic_gen3_memory_recall|mcp_wm-research-engine_research_hunt|mcp_firecrawl_firecrawl_scrape",
                 "hooks": [
-                    {"type": "command", "command": "python3 -S -B ~/.gemini/config/hooks/pre_tool_guard.py", "timeout": 5}
+                    {
+                        "type": "command",
+                        "command": 'if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze --pre-tool --py "$HOME/.gemini/config/hooks/pre_tool_guard.py"; elif [ -x "$HOME/.local/bin/wm-squeeze" ]; then exec "$HOME/.local/bin/wm-squeeze" --pre-tool --py "$HOME/.gemini/config/hooks/pre_tool_guard.py"; else exec python3 -S -B ~/.gemini/config/hooks/pre_tool_guard.py; fi',
+                        "timeout": 5,
+                    }
                 ],
             }
         ],
@@ -141,7 +145,7 @@ hp.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 print(f"Updated global {hp}")
 PY
 else
-    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.4.2 ==="
+    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.5.0 ==="
     # Build fused TS MCP & benchmark bundle if needed (probe PATH, ~/.local/bin, nvm, homebrew, volta, fnm)
     TURBO_MCP_DIR="${KIT_DIR}/tools/agy-turbo-mcp"
     NODE_BIN=""
@@ -303,7 +307,7 @@ if [ "$KEEP_HEAVY_PLUGINS" -eq 0 ] && command -v agy >/dev/null 2>&1; then
 fi
 
 echo "=== 5. Installing portable CLI tools, model manifest & cache-warmth statusline ==="
-for tool in wm-sim agy-bench agy-mode agy-token-audit wm-local-digest wm-dream wm-handoff wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-fleet wm-grok-mcp wm-vps wm-triage; do
+for tool in wm-sim agy-bench agy-mode agy-token-audit wm-local-digest wm-dream wm-handoff wm-reset wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-fleet wm-grok-mcp wm-vps wm-triage; do
     if [ -f "${KIT_DIR}/bin/${tool}" ]; then
         install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
     fi

@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+wm-reset — Zero-Paraphrase Fresh Session Launcher (v4.5.0).
+Resolves or generates the latest CliffCompaction handoff crystal + wm-receipt/1.2,
+and opens a fresh cache-warmed `agy` session pinned to a single model (`gemini-4-hydrogen`
+by default) so you break ping-pong cache thrashing and >120k cliffs cleanly.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+_CONV_ID_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _resolve_handoff_bin() -> str:
+    env_bin = os.environ.get("WM_HANDOFF_BIN", "").strip()
+    if env_bin and Path(env_bin).is_file():
+        return env_bin
+    sibling = Path(__file__).resolve().parent / "wm-handoff"
+    if sibling.is_file():
+        return str(sibling)
+    which_bin = shutil.which("wm-handoff")
+    if which_bin:
+        return which_bin
+    local_bin = Path.home() / ".local" / "bin" / "wm-handoff"
+    return str(local_bin)
+
+
+def _normalize_model(model: str, effort: str) -> str:
+    m = model.strip()
+    if not m:
+        return f"gemini-4-hydrogen-{effort}"
+    if m.startswith("gemini-") and not any(m.endswith(s) for s in ("-low", "-medium", "-high", "-xhigh", "-neon", "-argon")):
+        if m in ("gemini-4-hydrogen", "gemini-4-neon", "gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"):
+            return f"{m}-{effort}"
+    return m
+
+
+def _find_cached_crystal(cache_dir: Path, conv_prefix: str | None) -> tuple[Path | None, Path | None]:
+    if not cache_dir.is_dir():
+        return None, None
+    if conv_prefix:
+        san = _CONV_ID_SANITIZE_RE.sub("", conv_prefix)[:20]
+        if san:
+            exact_md = cache_dir / f"latest_{san}.md"
+            if exact_md.is_file():
+                rec = cache_dir / f"latest_{san}.receipt.json"
+                return exact_md, (rec if rec.is_file() else None)
+            matches = sorted(
+                glob.glob(str(cache_dir / f"latest_{san}*.md")),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+            if matches:
+                md = Path(matches[0])
+                rec = md.with_suffix(".receipt.json")
+                return md, (rec if rec.is_file() else None)
+        return None, None
+    all_mds = sorted(
+        glob.glob(str(cache_dir / "latest_*.md")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    if all_mds:
+        md = Path(all_mds[0])
+        rec = md.with_suffix(".receipt.json")
+        return md, (rec if rec.is_file() else None)
+    return None, None
+
+
+def load_or_build_crystal(args, cache_dir: Path) -> tuple[str, dict | None, Path]:
+    cached_md, cached_rec = _find_cached_crystal(cache_dir, args.conv)
+    stem_san = cached_md.stem.removeprefix("latest_") if cached_md else ""
+    raw_san = args.conv or stem_san or "default"
+    san = _CONV_ID_SANITIZE_RE.sub("", raw_san)[:20] or "default"
+
+    # Refresh via wm-handoff unless user explicitly targets an isolated cache-only conv or cache is fresh
+    refresh_needed = True
+    rec_data = None
+    cached_tp = ""
+    if cached_md and cached_rec:
+        try:
+            rec_data = json.loads(cached_rec.read_text(encoding="utf-8"))
+            cached_tp = str(rec_data.get("transcript_path") or "")
+            if rec_data.get("conv_id") and not args.conv:
+                san = _CONV_ID_SANITIZE_RE.sub("", str(rec_data["conv_id"]))[:20] or san
+            tp = Path(cached_tp) if cached_tp else Path()
+            if not cached_tp or not tp.is_file():
+                # Cache-only synthetic receipt/crystal (e.g. test fixtures)
+                refresh_needed = False
+            elif cached_md.stat().st_mtime >= tp.stat().st_mtime:
+                refresh_needed = False
+        except Exception:
+            refresh_needed = True
+
+    handoff_bin = _resolve_handoff_bin()
+    if refresh_needed and Path(handoff_bin).is_file():
+        out_md = cache_dir / f"latest_{san}.md"
+        out_rec = cache_dir / f"latest_{san}.receipt.json"
+        cmd = [
+            sys.executable,
+            "-S",
+            handoff_bin,
+            "--surface",
+            args.surface,
+            "--cwd",
+            args.cwd,
+            "--out",
+            str(out_md),
+            "--emit-receipt",
+            str(out_rec),
+        ]
+        if cached_tp and Path(cached_tp).is_file():
+            cmd.extend(["--transcript", cached_tp])
+        elif args.conv:
+            cmd.extend(["--conv", args.conv])
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if proc.returncode == 0 and out_md.is_file():
+            crystal = out_md.read_text(encoding="utf-8")
+            try:
+                rec_data = json.loads(out_rec.read_text(encoding="utf-8")) if out_rec.is_file() else None
+            except Exception:
+                rec_data = None
+            return crystal, rec_data, out_md
+        if cached_md and cached_md.is_file():
+            return cached_md.read_text(encoding="utf-8"), rec_data, cached_md
+        sys.stderr.write(proc.stderr or "wm-reset: failed to build handoff crystal.\n")
+        sys.exit(1)
+
+    if cached_md and cached_md.is_file():
+        return cached_md.read_text(encoding="utf-8"), rec_data, cached_md
+
+    sys.stderr.write("wm-reset: no cached crystal or AGY transcript found.\n")
+    sys.exit(1)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Reset into a clean cache-warmed AGY session from a verbatim handoff crystal.")
+    ap.add_argument("--conv", help="Source conversation ID prefix (defaults to newest crystal / transcript)")
+    ap.add_argument("--surface", choices=["all", "app", "ide", "cli"], default="all", help="AGY surface to scan (default: all)")
+    ap.add_argument("--model", default="gemini-4-hydrogen", help="Target model profile (default: gemini-4-hydrogen)")
+    ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"], default="high", help="Reasoning effort (default: high)")
+    ap.add_argument("--agent", help="Optional native agent name (e.g., hydrogen-builder)")
+    ap.add_argument("--cwd", default=os.getcwd(), help="Working directory for git snapshot and session launch")
+    ap.add_argument("--prompt", default="", help="Optional continuation instruction appended after the crystal")
+    ap.add_argument("--print-crystal", action="store_true", help="Print resolved crystal markdown and exit")
+    ap.add_argument("--dry-run", action="store_true", help="Print resolved launch command + receipt metadata without starting agy")
+    ap.add_argument("--print", dest="print_mode", action="store_true", help="Launch agy in non-interactive --print mode instead of -i")
+    args = ap.parse_args()
+
+    cache_dir = Path(os.environ.get("WM_HANDOFF_CACHE_DIR") or str(Path.home() / ".cache" / "wm-handoff"))
+    crystal, rec_data, crystal_path = load_or_build_crystal(args, cache_dir)
+
+    if args.print_crystal:
+        sys.stdout.write(crystal)
+        return
+
+    seed_parts = [
+        "Resume cleanly from this verbatim CliffCompaction handoff crystal (stay pinned on this single model; inspect files directly with bounded slices):",
+        "",
+        crystal.strip(),
+    ]
+    if args.prompt.strip():
+        seed_parts.extend(["", "## Continuation Task", args.prompt.strip()])
+    seed_prompt = "\n".join(seed_parts)
+
+    model_id = _normalize_model(args.model, args.effort)
+    agy_bin = os.environ.get("AGY_BIN") or shutil.which("agy") or "agy"
+    cmd = [agy_bin, "--model", model_id, "--effort", args.effort]
+    if args.agent:
+        cmd.extend(["--agent", args.agent])
+    cmd.extend(["-p" if args.print_mode else "-i", seed_prompt])
+
+    if args.dry_run:
+        summary = {
+            "crystal_path": str(crystal_path),
+            "crystal_bytes": len(crystal.encode("utf-8")),
+            "est_tokens": len(crystal) // 4,
+            "receipt_schema": (rec_data or {}).get("schema"),
+            "crystal_sha256": (rec_data or {}).get("crystal_sha256"),
+            "model": model_id,
+            "effort": args.effort,
+            "cwd": args.cwd,
+            "command_preview": " ".join(shlex.quote(c) for c in cmd[:-1]) + " <seed_prompt>",
+        }
+        sys.stdout.write(json.dumps(summary, indent=2) + "\n")
+        return
+
+    os.chdir(args.cwd)
+    os.execvp(cmd[0], cmd)
+
+
+if __name__ == "__main__":
+    main()

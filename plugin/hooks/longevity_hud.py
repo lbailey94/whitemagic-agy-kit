@@ -157,7 +157,12 @@ def main():
 
         # Reset context-threshold flags after compaction or context shrink
         prev_epoch = int(state.get("epoch") or 0)
-        if checkpoints > prev_epoch or cur_ctx < 90_000:
+        if checkpoints > prev_epoch:
+            state["warned_120k"] = False
+            state["warned_200k"] = False
+            state["flip_count"] = 0
+            state["flip_unc_total"] = 0
+        elif cur_ctx < 90_000:
             state["warned_120k"] = False
             state["warned_200k"] = False
         state["epoch"] = max(prev_epoch, checkpoints)
@@ -167,13 +172,30 @@ def main():
         flipped = bool(prev_model and cur_model and prev_model != cur_model)
         alerts = []
 
-        # 1. Model-flip cache eviction alert (all surfaces: App, IDE, CLI)
+        handoff_dir = Path(os.environ.get("WM_HANDOFF_CACHE_DIR") or str(Path.home() / ".cache" / "wm-handoff"))
+        san_id = _CONV_ID_SANITIZE_RE.sub("", conv_id)[:20] or "default"
+        crystal_path = handoff_dir / f"latest_{san_id}.md"
+        has_crystal = crystal_path.is_file()
+        crystal_hint = f" Crystal ready: `{crystal_path}` (`wm-reset`)." if has_crystal else ""
+        crystal_short = " Crystal ready (`wm-reset`)." if has_crystal else ""
+
+        # 1. Model-flip cache eviction / Orchestrator ping-pong alert (all surfaces)
         if flipped and unc >= 50_000 and step_key != state.get("last_flip_step"):
-            alerts.append(
-                f"⚡ **Model Flip Cache Eviction** (`{prev_model}` → `{cur_model}`): "
-                f"burned **~{unc / 1000:.0f}k uncached tok** ({hit_pct:.0f}% hit). "
-                "Pin a single model (`Gemini 4 Hydrogen`) on >80k sessions."
-            )
+            flip_count = int(state.get("flip_count") or 0) + 1
+            flip_unc_total = int(state.get("flip_unc_total") or 0) + unc
+            state["flip_count"] = flip_count
+            state["flip_unc_total"] = flip_unc_total
+            if flip_count >= 2 and (cur_ctx >= 99_000 or flip_unc_total >= 300_000):
+                alerts.append(
+                    f"⚡ **Orchestrator Ping-Pong Alert** ({flip_count} flips · ~{flip_unc_total / 1000:.0f}k uncached burned): "
+                    f"Pin single-model Hydrogen, run `/compact`, or reset via `wm-reset`.{crystal_hint}"
+                )
+            else:
+                alerts.append(
+                    f"⚡ **Model Flip Cache Eviction** (`{prev_model}` → `{cur_model}`): "
+                    f"burned **~{unc / 1000:.0f}k uncached tok** ({hit_pct:.0f}% hit). "
+                    "Pin a single model (`Gemini 4 Hydrogen`) on >80k sessions."
+                )
             state["last_flip_step"] = step_key
 
         # 2. App/IDE context thresholds & cold-resume misses (CLI already renders statusLine)
@@ -181,14 +203,14 @@ def main():
             if cur_ctx >= 200_000 and not state.get("warned_200k"):
                 alerts.append(
                     f"🔴 **Context Cliff (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% cache hit):** "
-                    "High re-prefill cost on any idle gap. Run `/compact` or `wm-handoff` soon."
+                    f"High re-prefill cost on any idle gap. Run `/compact` or `wm-handoff` soon.{crystal_short}"
                 )
                 state["warned_200k"] = True
                 state["warned_120k"] = True
             elif cur_ctx >= 120_000 and not state.get("warned_120k"):
                 alerts.append(
                     f"🟡 **Context Watch (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% cache hit):** "
-                    "Run `/compact` or `wm-handoff` before stepping away >5m."
+                    f"Run `/compact` or `wm-handoff` before stepping away >5m.{crystal_short}"
                 )
                 state["warned_120k"] = True
 
@@ -203,12 +225,12 @@ def main():
                 if idle_secs >= 300:
                     alerts.append(
                         f"❄️ **Cold Resume After Idle (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% hit · idle {idle_secs // 60}m):** "
-                        f"Re-prefilled ~{unc / 1000:.0f}k uncached tok. Use `wm-handoff` before resuming idle sessions."
+                        f"Re-prefilled ~{unc / 1000:.0f}k uncached tok. Use `wm-handoff` before resuming idle sessions.{crystal_short}"
                     )
                 else:
                     alerts.append(
                         f"❄️ **Cold Cache Miss (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% hit):** "
-                        f"Re-prefilled ~{unc / 1000:.0f}k uncached tok. Use `wm-handoff` before resuming idle sessions."
+                        f"Re-prefilled ~{unc / 1000:.0f}k uncached tok. Use `wm-handoff` before resuming idle sessions.{crystal_short}"
                     )
                 state["last_cold_inv"] = cur_inv
 

@@ -12,8 +12,10 @@ Strict CliffCompaction invariants:
 import argparse
 import glob
 import hashlib
+import hmac
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -80,6 +82,19 @@ def _unwrap_json_str(v):
     return v
 
 
+def _safe_conv_id(tp: Path) -> str:
+    if len(tp.parents) > 2 and tp.parent.name == "logs" and tp.parents[1].name == ".system_generated":
+        return tp.parents[2].name
+    return tp.parent.name or "default"
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def extract_verbatim_state(tp):
     user_goals = []
     edited_files = []
@@ -88,6 +103,8 @@ def extract_verbatim_state(tp):
     last_hit = None
     last_ts = None
     model = ""
+    prev_model = ""
+    model_flips = 0
 
     for line in tp.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -102,14 +119,19 @@ def extract_verbatim_state(tp):
         elif t == "PLANNER_RESPONSE":
             unc = int(o.get("input_tokens") or 0)
             cac = int(o.get("cache_read_tokens") or 0)
+            cur_m = str(o.get("model") or "")
             if unc + cac > 0:
                 last_ctx = unc + cac
                 last_hit = round(100.0 * cac / last_ctx, 1)
-            ts = parse_ts(o.get("created_at"))
+                if cur_m and prev_model and cur_m != prev_model:
+                    model_flips += 1
+                if cur_m:
+                    prev_model = cur_m
+            ts = parse_ts(o.get("created_at") or o.get("timestamp"))
             if ts:
                 last_ts = ts
-            if o.get("model"):
-                model = str(o["model"])
+            if cur_m:
+                model = cur_m
             for tc in (o.get("tool_calls") or []):
                 nm = tc.get("name", "")
                 args = tc.get("args") or tc.get("arguments") or {}
@@ -148,10 +170,11 @@ def extract_verbatim_state(tp):
                     recent_errors.append(" | ".join(err_lines)[:220])
 
     return {
-        "conv_id": tp.parents[2].name,
+        "conv_id": _safe_conv_id(tp),
         "model": model,
         "last_ctx": last_ctx,
         "last_hit": last_hit,
+        "model_flips": model_flips,
         "idle_sec": max(0, int(time.time() - last_ts)) if last_ts else None,
         "user_goals": user_goals[-3:],
         "edited_files": edited_files[-15:],
@@ -159,16 +182,106 @@ def extract_verbatim_state(tp):
     }
 
 
+def build_swarm_map(repo_dir: str) -> str:
+    """Build a compact <=600-token (<=2400 B) shared codemap for fresh swarm workers."""
+    root = Path(repo_dir).resolve()
+    gs = git_state(str(root))
+    manifests = [
+        name
+        for name in ("package.json", "Cargo.toml", "pyproject.toml", "go.mod", "plugin/plugin.json", "Makefile")
+        if (root / name).is_file()
+    ]
+    codegraph_bin = shutil.which("wm-codegraph") or str(Path.home() / ".local" / "bin" / "wm-codegraph")
+    cg_out = ""
+    if codegraph_bin and Path(codegraph_bin).is_file():
+        try:
+            r = subprocess.run([str(codegraph_bin), "overview", "--root", str(root)], capture_output=True, text=True, timeout=4)
+            if r.returncode == 0 and r.stdout.strip():
+                cg_out = r.stdout.strip()[:1200]
+        except Exception:
+            cg_out = ""
+    lines = [
+        f"# Swarm Shared Map ({root.name})",
+        f"- **Branch:** `{gs['branch']}`" if gs else f"- **Root:** `{root}`",
+    ]
+    if manifests:
+        lines.append("- **Manifests:** " + ", ".join(f"`{m}`" for m in manifests))
+    if gs and gs.get("recent_commits"):
+        lines.append("Recent commits:\n```\n" + gs["recent_commits"] + "\n```")
+    if gs and gs.get("status"):
+        lines.append("Modified files:\n```\n" + gs["status"][:450] + "\n```")
+    if cg_out:
+        lines.append("Symbol overview:\n```\n" + cg_out + "\n```")
+    body = "\n".join(lines)
+    if len(body) > 2280:
+        body = body[:2230] + "\n... [swarm-map cap 600 tok]"
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
+    return f"{body}\n\n`swarm_map_sha256={digest} | est_tokens~{len(body)//4}`\n"
+
+
+def build_receipt_v12(st: dict, gs, surf: str, digest: str, crystal: str, tp: Path, out_path: str | None) -> dict:
+    try:
+        tp_bytes = tp.stat().st_size if tp and tp.is_file() else 0
+    except Exception:
+        tp_bytes = 0
+    core = {
+        "schema": "wm-receipt/1.2",
+        "kind": "handoff_crystal",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "conv_id": st["conv_id"],
+        "surface": surf,
+        "model": st["model"],
+        "last_ctx": st["last_ctx"],
+        "last_hit_pct": st["last_hit"],
+        "model_flips": st["model_flips"],
+        "crystal_sha256": digest,
+        "crystal_bytes": len(crystal.encode("utf-8")),
+        "crystal_path": str(out_path or ""),
+        "transcript_path": str(tp),
+        "transcript_bytes": tp_bytes,
+        "edited_files": st["edited_files"],
+        "git_branch": gs.get("branch", "") if gs else "",
+    }
+    signing_key = os.environ.get("WM_CONFINEMENT_SIGNING_KEY", "").strip()
+    if signing_key:
+        canonical = json.dumps(core, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        sig = hmac.new(signing_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+        core["signature"] = {"alg": "hmac-sha256", "sig": sig}
+    else:
+        core["signature"] = None
+    return core
+
+
 def main():
     ap = argparse.ArgumentParser(description="Emit a zero-paraphrase CliffCompaction handoff crystal for clean session resets.")
     ap.add_argument("--conv", help="Conversation ID prefix (defaults to newest transcript)")
+    ap.add_argument("--transcript", help="Explicit transcript.jsonl path (skips brain scan)")
     ap.add_argument("--surface", choices=["all", "app", "ide", "cli"], default="all", help="AGY surface to scan (default: all)")
     ap.add_argument("--cwd", default=os.getcwd(), help="Git working directory to snapshot")
     ap.add_argument("--out", help="Optional output markdown file path")
+    ap.add_argument("--emit-receipt", help="Optional output path for canonical wm-receipt/1.2 JSON")
+    ap.add_argument("--swarm-map", metavar="REPO_DIR", help="Emit a <=600-token shared codemap for fresh swarm workers and exit")
     ap.add_argument("--save-wm3", action="store_true", help="Also persist handoff crystal to WhiteMagic Gen3 (wm3 / wm-gen3)")
     args = ap.parse_args()
 
-    tp, surf = latest_transcript(args.conv, surface=args.surface)
+    if args.swarm_map:
+        smap = build_swarm_map(args.swarm_map)
+        if args.out:
+            _write_text_atomic(Path(args.out), smap)
+            print(f"Wrote swarm map -> {args.out} ({len(smap)} B, ~{len(smap)//4} tok)")
+        else:
+            sys.stdout.write(smap)
+        return
+
+    if args.transcript:
+        tp = Path(args.transcript)
+        if not tp.is_file():
+            sys.stderr.write(f"wm-handoff: transcript not found: {tp}\n")
+            sys.exit(1)
+        tps = str(tp)
+        surf = "cli" if "antigravity-cli" in tps else ("ide" if "antigravity-ide" in tps else "app")
+    else:
+        tp, surf = latest_transcript(args.conv, surface=args.surface)
     if not tp:
         sys.stderr.write("wm-handoff: no AGY transcript found.\n")
         sys.exit(1)
@@ -178,11 +291,11 @@ def main():
 
     lines = [
         f"# Verbatim Handoff Crystal (CliffCompaction | source={st['conv_id'][:8]} | surface={surf})",
-        f"- **Prior Session:** `{st['conv_id'][:12]}` (`{surf}`) | model=`{st['model'] or '?'}` | ctx=`{st['last_ctx']:,}` tok | last_hit=`{st['last_hit']}%` | idle=`{st['idle_sec']}s`",
+        f"- **Prior Session:** `{st['conv_id'][:12]}` (`{surf}`) | model=`{st['model'] or '?'}` | ctx=`{st['last_ctx']:,}` tok | flips=`{st['model_flips']}` | last_hit=`{st['last_hit']}%` | idle=`{st['idle_sec']}s`",
     ]
-    if st["last_ctx"] >= 100_000 and (st["idle_sec"] or 0) >= 180:
+    if st["last_ctx"] >= 100_000 and ((st["idle_sec"] or 0) >= 180 or st["model_flips"] >= 2):
         est_save = max(0, st["last_ctx"] - 2000)
-        lines.append(f"- **Cache-Eviction Savings:** Fresh start with this crystal saves **~{est_save:,} uncached tokens** vs cold-resuming the stale session.")
+        lines.append(f"- **Cache-Eviction Savings:** Fresh start with this crystal saves **~{est_save:,} uncached tokens** vs resuming a cold or ping-ponging session.")
 
     if st["user_goals"]:
         lines.append("\n## Verbatim Recent User Objectives")
@@ -244,10 +357,14 @@ def main():
                 sys.stderr.write(f"Saved handoff crystal to WhiteMagic Gen3 ({wm_store})\n")
 
     if args.out:
-        Path(args.out).write_text(crystal, encoding="utf-8")
+        _write_text_atomic(Path(args.out), crystal)
         print(f"Wrote handoff crystal -> {args.out} ({len(crystal)} B, ~{len(crystal)//4} tok)")
     else:
         sys.stdout.write(crystal)
+
+    if args.emit_receipt:
+        receipt = build_receipt_v12(st, gs, surf, digest, crystal, tp, args.out)
+        _write_text_atomic(Path(args.emit_receipt), json.dumps(receipt, indent=2) + "\n")
 
 
 if __name__ == "__main__":

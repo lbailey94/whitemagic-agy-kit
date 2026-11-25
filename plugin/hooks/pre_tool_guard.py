@@ -185,14 +185,14 @@ def extract_commands(args):
     return cmds
 
 
-def latest_ctx_tokens(transcript_path):
-    """O(1) mtime/size-cached tail seek (last 24 KB) of transcript.jsonl for context tokens."""
+def latest_model_and_ctx(transcript_path):
+    """O(1) mtime/size-cached tail seek (last 24 KB) of transcript.jsonl for (model, ctx_tokens)."""
     if not transcript_path:
-        return 0
+        return "", 0
     try:
         st = os.stat(transcript_path)
         if (st.st_mode & 0o170000) != 0o100000:
-            return 0
+            return "", 0
         sz = st.st_size
         mtime_ns = st.st_mtime_ns
         state_dir = _state_dir()
@@ -205,8 +205,9 @@ def latest_ctx_tokens(transcript_path):
                     cached.get("path") == str(transcript_path)
                     and cached.get("sz") == sz
                     and cached.get("mtime_ns") == mtime_ns
+                    and "model" in cached
                 ):
-                    return int(cached.get("ctx") or 0)
+                    return str(cached.get("model") or ""), int(cached.get("ctx") or 0)
         except Exception:
             pass
         with open(transcript_path, "rb") as f:
@@ -214,6 +215,7 @@ def latest_ctx_tokens(transcript_path):
                 f.seek(sz - 24576)
             tail = f.read().decode("utf-8", errors="replace")
         ctx_found = 0
+        model_found = ""
         for line in reversed(tail.splitlines()):
             if '"PLANNER_RESPONSE"' not in line:
                 continue
@@ -225,18 +227,30 @@ def latest_ctx_tokens(transcript_path):
                 ctx = int(o.get("input_tokens") or 0) + int(o.get("cache_read_tokens") or 0)
                 if ctx > 0:
                     ctx_found = ctx
+                    model_found = str(o.get("model") or "")
                     break
         try:
             os.makedirs(state_dir, exist_ok=True)
             _write_json_atomic(
-                cf, {"path": str(transcript_path), "sz": sz, "mtime_ns": mtime_ns, "ctx": ctx_found}
+                cf,
+                {
+                    "path": str(transcript_path),
+                    "sz": sz,
+                    "mtime_ns": mtime_ns,
+                    "ctx": ctx_found,
+                    "model": model_found,
+                },
             )
         except Exception:
             pass
-        return ctx_found
+        return model_found, ctx_found
     except Exception:
         pass
-    return 0
+    return "", 0
+
+
+def latest_ctx_tokens(transcript_path):
+    return latest_model_and_ctx(transcript_path)[1]
 
 
 def find_wm_squeeze():
@@ -563,6 +577,16 @@ def _is_xargs_safe(cmd_args: list[str]) -> bool:
     return True
 
 
+def _is_safe_py_test_or_bench(arg: str) -> bool:
+    """Allow local test_*.py / *_test.py / bench_*.py scripts while leaving arbitrary python3 scripts untouched."""
+    if not arg or arg.startswith("-"):
+        return False
+    if any(ch in arg for ch in "$*?{}[]~;|&><`\n\r"):
+        return False
+    base = os.path.basename(arg)
+    return base.endswith(".py") and (base.startswith("test_") or base.startswith("bench_") or base.endswith("_test.py"))
+
+
 def _is_compound_segment_safe(seg: str) -> tuple[bool, str, list[str]]:
     """Validate one statement/pipe segment for read-only/diagnostic safety."""
     import re
@@ -621,6 +645,8 @@ def _is_compound_segment_safe(seg: str) -> tuple[bool, str, list[str]]:
         if rest[0] in ("-c", "-", "--version"):
             return True, cmd_base, cmd_args
         if len(rest) >= 2 and rest[0] == "-m" and rest[1] in ("pytest", "unittest", "mypy", "ruff", "json.tool"):
+            return True, cmd_base, cmd_args
+        if _is_safe_py_test_or_bench(rest[0]):
             return True, cmd_base, cmd_args
         return False, cmd_base, cmd_args
     if cmd_base == "sed":
@@ -862,6 +888,137 @@ def _maybe_wrap_python_dash_c(s: str):
     return f"set -o pipefail; {cleaned} 2>&1 | {shlex.quote(sq_bin)} --pipe --kind generic"
 
 
+def _maybe_wrap_safe_py_test_or_bench(s: str):
+    """Wrap standalone `[cd <dir> && ] [ENV=VAL ...] python3 test_*.py|bench_*.py` via `wm-squeeze --pipe`."""
+    import re
+    import shlex
+    cleaned = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
+    if not cleaned:
+        return None
+    s_norm = _strip_unquoted_line_continuations(cleaned)
+    parts = _split_top_level_and(s_norm)
+    if not parts:
+        return None
+    if len(parts) == 2:
+        left, right = parts[0], parts[1]
+        if not left or not right or _has_unsafe_shell_meta(left) or _has_unsafe_shell_meta(right):
+            return None
+        try:
+            ltoks = shlex.split(left)
+            rtoks = shlex.split(right)
+        except Exception:
+            return None
+        if len(ltoks) != 2 or ltoks[0] != "cd" or not rtoks:
+            return None
+        toks = rtoks
+    elif len(parts) == 1 and not _has_unsafe_shell_meta(s_norm):
+        try:
+            toks = shlex.split(s_norm)
+        except Exception:
+            return None
+    else:
+        return None
+
+    safe_env_keys = {"PYTHONPATH", "RUST_BACKTRACE", "RUST_LOG", "NO_COLOR", "CARGO_TERM_COLOR"}
+    while toks and "=" in toks[0]:
+        k, _, _ = toks[0].partition("=")
+        if k not in safe_env_keys:
+            return None
+        toks.pop(0)
+    if not toks or os.path.basename(toks[0]) not in ("python3", "python"):
+        return None
+    rest = [a for a in toks[1:] if a not in _PY_SAFE_FLAGS]
+    if not rest or not _is_safe_py_test_or_bench(rest[0]):
+        return None
+    sq_bin = find_wm_squeeze()
+    if not sq_bin:
+        return None
+    return f"set -o pipefail; {cleaned} 2>&1 | {shlex.quote(sq_bin)} --pipe --kind generic"
+
+
+def _maybe_wrap_safe_readonly_for_loop(s: str):
+    """Wrap single-level read-only `for <var> in ...; do ...; done` blocks via `wm-squeeze --pipe`."""
+    if os.environ.get("WM_SQUEEZE_COMPOUND_OFF") == "1":
+        return None
+    import re
+    import shlex
+    cleaned = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
+    if not cleaned:
+        return None
+    m_hdr = re.match(r"^for\s+[A-Za-z_][A-Za-z0-9_]*\s+in\b", cleaned)
+    if not m_hdr:
+        return None
+    m_done = re.search(r"(?:^|[;\n])\s*done\s*$", cleaned)
+    if not m_done:
+        return None
+
+    prefix = cleaned[: m_done.start()]
+    # Find `do` separator cleanly outside quotes
+    in_s = in_d = esc = False
+    do_split = None
+    i = m_hdr.end()
+    np = len(prefix)
+    while i < np:
+        ch = prefix[i]
+        if esc:
+            esc = False
+            i += 1
+            continue
+        if in_s:
+            if ch == "'":
+                in_s = False
+            i += 1
+            continue
+        if in_d:
+            if ch == "\\":
+                esc = True
+            elif ch == '"' :
+                in_d = False
+            elif ch == "`" or (ch == "$" and i + 1 < np and prefix[i + 1] == "("):
+                return None
+            i += 1
+            continue
+        if ch == "\\":
+            esc = True
+            i += 1
+            continue
+        if ch == "'":
+            in_s = True
+            i += 1
+            continue
+        if ch == '"':
+            in_d = True
+            i += 1
+            continue
+        if ch in ("`", "(", ")", "{", "}", "<", ">") or (ch == "$" and i + 1 < np and prefix[i + 1] == "("):
+            return None
+        if ch in (";", "\n"):
+            m_do = re.match(r"^[;\n\s]*do\b\s*", prefix[i:])
+            if m_do:
+                hdr_items = prefix[:i]
+                body = prefix[i + m_do.end() :].strip()
+                do_split = (hdr_items, body)
+                break
+        i += 1
+
+    if not do_split or in_s or in_d or esc:
+        return None
+    _, body = do_split
+    if not body:
+        return None
+
+    # Validate loop body through read-only compound statement scanner
+    # Reuse _maybe_wrap_safe_compound_readonly by verifying each statement/pipe in body
+    wrapped_body = _maybe_wrap_safe_compound_readonly(body + "\ntrue")
+    if not wrapped_body:
+        return None
+
+    sq_bin = find_wm_squeeze()
+    if not sq_bin:
+        return None
+    return f"set -o pipefail; (set +o pipefail\n{s}\n) 2>&1 | {shlex.quote(sq_bin)} --pipe --kind generic"
+
+
 def maybe_squeeze_command(cmd_line):
     if os.environ.get("WM_SQUEEZE_OFF") == "1":
         return None
@@ -896,6 +1053,11 @@ def maybe_squeeze_command(cmd_line):
         wrapped_py = _maybe_wrap_python_dash_c(s)
         if wrapped_py:
             return wrapped_py
+
+    # Safe standalone local test_*.py / *_test.py / bench_*.py runners
+    wrapped_tb = _maybe_wrap_safe_py_test_or_bench(s)
+    if wrapped_tb:
+        return wrapped_tb
 
     # Strip harmless trailing 2>&1 / 2>/dev/null and unquoted backslash-newline line continuations
     s_single = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
@@ -948,8 +1110,11 @@ def maybe_squeeze_command(cmd_line):
                         out.extend(toks)
                         return " ".join(shlex.quote(x) for x in out)
 
-    # Safe compound / multiline / uncapped pipeline / complex heredoc fallback
-    return _maybe_wrap_safe_compound_readonly(s)
+    # Safe compound / multiline / uncapped pipeline / complex heredoc fallback, then safe read-only for-loop
+    wrapped_comp = _maybe_wrap_safe_compound_readonly(s)
+    if wrapped_comp:
+        return wrapped_comp
+    return _maybe_wrap_safe_readonly_for_loop(s)
 
 
 def is_wide_line_file(path_obj, size: int) -> bool:
@@ -1266,8 +1431,12 @@ def handle_read_file(args, payload):
         already_compact = (not inverted) and (span is not None) and span <= (50 if wide_lines else 150)
         if not already_compact:
             cur_ctx = latest_ctx_tokens(transcript)
-            max_span = 150 if cur_ctx >= 120_000 else 200
-            clamp_trigger = 200 if cur_ctx >= 120_000 else 250
+            if cur_ctx >= 160_000:
+                max_span, clamp_trigger = 100, 150
+            elif cur_ctx >= 120_000:
+                max_span, clamp_trigger = 150, 200
+            else:
+                max_span, clamp_trigger = 200, 250
             if wide_lines:
                 max_span = min(max_span, 50)
                 clamp_trigger = min(clamp_trigger, 60)
@@ -1447,6 +1616,80 @@ def check_env_write_guard(tool_name, args):
     return None
 
 
+def handle_swarm_and_subagent(tool_name, args, payload):
+    """Enforce Orchestrator & /swarm cost/bloat guardrails."""
+    if os.environ.get("WM_SWARM_GUARD_OFF") == "1":
+        return {"decision": "allow"}
+    transcript = payload.get("transcriptPath") or ""
+
+    if tool_name == "swarm":
+        action = str(args.get("action") or "").strip().lower()
+        if action == "add":
+            fork_arg = str(args.get("fork") or "").strip()
+            model_arg = str(args.get("model") or "").strip()
+            brief_txt = str(args.get("brief") or "")
+            if fork_arg:
+                _, cur_ctx = latest_model_and_ctx(transcript)
+                if cur_ctx >= 80_000:
+                    return {
+                        "decision": "force_ask",
+                        "reason": (
+                            f"[Swarm Fork Guard] Coordinator context is ~{cur_ctx // 1000}k tokens. "
+                            "Forking copies this context onto every worker. Omit `fork` and pass a compact fresh brief + shared codemap (`wm-handoff --swarm-map`), or confirm to fork anyway."
+                        ),
+                    }
+            if not model_arg:
+                cur_model, _ = latest_model_and_ctx(transcript)
+                if "neon" in cur_model.lower():
+                    return {
+                        "decision": "force_ask",
+                        "reason": (
+                            "[Swarm Model Guard] Coordinator is on Neon and `model` is omitted — spawned worker would inherit Neon (~3.1x burn). "
+                            "Pass `model: \"gemini-4-hydrogen-high\"` (or `xhigh` for complex debugging), or confirm to spawn on Neon."
+                        ),
+                    }
+            if len(brief_txt) > 6000:
+                return {
+                    "decision": "force_ask",
+                    "reason": (
+                        f"[Swarm Brief Guard] Brief is {len(brief_txt) / 1024:.1f} KB (>6 KB), bloating the shared board for every member. "
+                        "Write details to a file and pass a <=150-token pointer brief, or confirm to post inline."
+                    ),
+                }
+        return {"decision": "allow"}
+
+    if tool_name == "post_message":
+        msg_txt = str(args.get("message") or args.get("content") or args.get("body") or "")
+        if len(msg_txt) > 4000:
+            return {
+                "decision": "force_ask",
+                "reason": (
+                    f"[Board Bloat Guard] Board message is {len(msg_txt) / 1024:.1f} KB (>4 KB). "
+                    "Write full logs/tables to a file and post a <=150-token CPR pointer receipt, or confirm to post inline."
+                ),
+            }
+        return {"decision": "allow"}
+
+    if tool_name == "invoke_subagent":
+        tname = str(args.get("TypeName") or "").strip().lower()
+        m_arg = str(args.get("Model") or "").strip().lower()
+        if tname == "research" and m_arg in ("", "inherit"):
+            cur_model, _ = latest_model_and_ctx(transcript)
+            if "neon" in cur_model.lower():
+                if os.environ.get("WM_SUBAGENT_AUTO_FLASH") == "1":
+                    return {"decision": "allow", "overwrite": {"Model": "flash"}}
+                return {
+                    "decision": "force_ask",
+                    "reason": (
+                        "[Subagent Model Guard] Parent is on Neon and `research` subagent uses `Model=\"inherit\"` (would run read-only research on Neon). "
+                        "Pass `Model=\"flash\"` (or set `WM_SUBAGENT_AUTO_FLASH=1`), or confirm to run on Neon."
+                    ),
+                }
+        return {"decision": "allow"}
+
+    return {"decision": "allow"}
+
+
 def main():
     if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
         emit({"decision": "allow"})
@@ -1505,6 +1748,11 @@ def main():
     # 3b. manage_task(status) anti-poll loop breaker
     if tool_name == "manage_task":
         emit(handle_manage_task(args, payload))
+        return
+
+    # 3c. Orchestrator & /swarm guardrails
+    if tool_name in ("swarm", "post_message", "invoke_subagent"):
+        emit(handle_swarm_and_subagent(tool_name, args, payload))
         return
 
     # 4. WhiteMagic, Research Engine & Firecrawl MCP auto-budget enforcement

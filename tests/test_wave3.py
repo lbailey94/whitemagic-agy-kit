@@ -1792,6 +1792,162 @@ def test_v442_self_heal_and_rust_post_tool():
         )
 
 
+def test_v450_rust_pretool_crystal_and_swarm_guards():
+    print("\n12. v4.5.0 Rust --pre-tool, Ping-Pong Auto-Crystal, wm-reset & Orchestration:")
+    hud_hook = _HOOKS_DIR / "longevity_hud.py"
+    handoff_bin = LOCAL_BIN / "wm-handoff"
+    reset_bin = LOCAL_BIN / "wm-reset"
+    audit_bin = LOCAL_BIN / "agy-token-audit"
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        tp = td_path / "conv_v450_pingpong" / ".system_generated" / "logs" / "transcript.jsonl"
+        tp.parent.mkdir(parents=True)
+        rows = [
+            {"type": "USER_INPUT", "content": "Harden v4.5.0 pipeline"},
+            {"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-high", "input_tokens": 45000, "cache_read_tokens": 15000, "step_index": 1},
+            {"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-high", "input_tokens": 90000, "cache_read_tokens": 20000, "step_index": 2},
+            {"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-high", "input_tokens": 115000, "cache_read_tokens": 50000, "step_index": 3,
+             "tool_calls": [{"name": "edit_file", "args": {"Path": str(td_path / "edited.py")}}]},
+        ]
+        tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        big400 = td_path / "big400.py"
+        big400.write_text("\n".join(f"line_{i} = {i}" for i in range(400)) + "\n", encoding="utf-8")
+
+        # 12a) Rust --pre-tool parity vs Python + >=160k <=100L clamp + swarm/subagent/for/test guards
+        parity_cases = [
+            ("read_165k", {"toolCall": {"name": "read_file", "args": {"Path": str(big400)}}, "transcriptPath": str(tp), "conversationId": "v450-r1"}),
+            ("write_env", {"toolCall": {"name": "write_file", "args": {"Path": str(td_path / ".env"), "Content": "KEY=1"}}, "conversationId": "v450-w1"}),
+            ("swarm_fork", {"toolCall": {"name": "swarm", "args": {"action": "add", "name": "w1", "fork": "coordinator", "model": "gemini-4-hydrogen-high", "brief": "do x"}}, "transcriptPath": str(tp), "conversationId": "v450-s1"}),
+            ("swarm_nomodel", {"toolCall": {"name": "swarm", "args": {"action": "add", "name": "w2", "workspace": "share", "brief": "do y"}}, "transcriptPath": str(tp), "conversationId": "v450-s2"}),
+            ("swarm_bloat", {"toolCall": {"name": "swarm", "args": {"action": "add", "name": "w3", "model": "gemini-4-hydrogen-high", "brief": "Z" * 6200}}, "transcriptPath": str(tp), "conversationId": "v450-s3"}),
+            ("post_bloat", {"toolCall": {"name": "post_message", "args": {"to": "w1", "body": "B" * 4200}}, "conversationId": "v450-p1"}),
+            ("subagent_res", {"toolCall": {"name": "invoke_subagent", "args": {"TypeName": "research", "Model": "inherit", "Prompt": "scan"}}, "transcriptPath": str(tp), "conversationId": "v450-i1"}),
+            ("cmd_test", {"toolCall": {"name": "run_command", "args": {"CommandLine": "python3 tests/test_wave3.py"}}, "conversationId": "v450-c1"}),
+            ("cmd_bench", {"toolCall": {"name": "run_command", "args": {"CommandLine": "python3 benchmarks/bench_v44_longevity.py"}}, "conversationId": "v450-c2"}),
+            ("cmd_other", {"toolCall": {"name": "run_command", "args": {"CommandLine": "python3 scratch/custom.py"}}, "conversationId": "v450-c3"}),
+            ("cmd_for_ro", {"toolCall": {"name": "run_command", "args": {"CommandLine": 'for f in *.md; do head -n 5 "$f"; done'}}, "conversationId": "v450-c4"}),
+            ("cmd_for_rm", {"toolCall": {"name": "run_command", "args": {"CommandLine": 'for f in *; do rm "$f"; done'}}, "conversationId": "v450-c5"}),
+            ("cmd_for_redir", {"toolCall": {"name": "run_command", "args": {"CommandLine": 'for f in *.md; do head -n 5 "$f" > out.txt; done'}}, "conversationId": "v450-c6"}),
+            ("wm_recall", {"toolCall": {"name": "mcp_whitemagic_memory_recall", "args": {"query": "test"}}, "conversationId": "v450-m1"}),
+        ]
+        py_res = {}
+        rs_res = {}
+        for label, pl in parity_cases:
+            s_in = json.dumps(pl)
+            p1 = subprocess.run(["python3", "-S", "-B", str(PRE_HOOK)], input=s_in, capture_output=True, text=True, env={**os.environ, "WM_HOOK_STATE_DIR": str(td_path / "st_py")}, timeout=5)
+            p2 = subprocess.run([str(WM_SQUEEZE), "--pre-tool", "--py", str(PRE_HOOK)], input=s_in, capture_output=True, text=True, env={**os.environ, "WM_HOOK_STATE_DIR": str(td_path / "st_rs")}, timeout=5)
+            py_res[label] = json.loads(p1.stdout)
+            rs_res[label] = json.loads(p2.stdout)
+        parity_all = all(
+            py_res[k].get("decision") == rs_res[k].get("decision") and py_res[k].get("overwrite") == rs_res[k].get("overwrite")
+            for k in py_res
+        )
+        check("Rust wm-squeeze --pre-tool 14-case exact parity vs Python", parity_all)
+        check(">=160k ctx read_file clamps to EndLine=100", rs_res["read_165k"].get("overwrite") == {"StartLine": 1, "EndLine": 100}, str(rs_res["read_165k"]))
+        check("swarm(add) fork>=80k / Neon omitted-model / >6KB brief force_ask", all(rs_res[k].get("decision") == "force_ask" for k in ("swarm_fork", "swarm_nomodel", "swarm_bloat")))
+        check("post_message >4KB & invoke_subagent(research, inherit on Neon) force_ask", rs_res["post_bloat"].get("decision") == "force_ask" and rs_res["subagent_res"].get("decision") == "force_ask")
+
+        p_auto = subprocess.run(
+            [str(WM_SQUEEZE), "--pre-tool", "--py", str(PRE_HOOK)],
+            input=json.dumps({"toolCall": {"name": "invoke_subagent", "args": {"TypeName": "research", "Model": "inherit", "Prompt": "scan"}}, "transcriptPath": str(tp), "conversationId": "v450-i2"}),
+            capture_output=True, text=True, env={**os.environ, "WM_SUBAGENT_AUTO_FLASH": "1"}, timeout=5,
+        )
+        check("WM_SUBAGENT_AUTO_FLASH=1 rewrites research Model=flash", json.loads(p_auto.stdout).get("overwrite") == {"Model": "flash"}, p_auto.stdout)
+        check("safe python3 tests/bench & read-only for squeezed; other/unsafe for untouched",
+              "--pipe" in (rs_res["cmd_test"].get("overwrite") or {}).get("CommandLine", "")
+              and "--pipe" in (rs_res["cmd_bench"].get("overwrite") or {}).get("CommandLine", "")
+              and "overwrite" not in rs_res["cmd_other"]
+              and "--pipe" in (rs_res["cmd_for_ro"].get("overwrite") or {}).get("CommandLine", "")
+              and "overwrite" not in rs_res["cmd_for_rm"]
+              and "overwrite" not in rs_res["cmd_for_redir"])
+
+        hot_pl = json.dumps({"toolCall": {"name": "read_file", "args": {"Path": str(big400), "StartLine": 1, "EndLine": 80}}, "conversationId": "v450-hot"})
+        pre_lats = []
+        for _ in range(15):
+            t0 = time.perf_counter()
+            subprocess.run([str(WM_SQUEEZE), "--pre-tool", "--py", str(PRE_HOOK)], input=hot_pl, capture_output=True, text=True, timeout=5)
+            pre_lats.append((time.perf_counter() - t0) * 1000.0)
+        pre_lats.sort()
+        pre_med = pre_lats[len(pre_lats) // 2]
+        check(f"Rust wm-squeeze --pre-tool hot-path latency < 15ms ({pre_med:.1f}ms)", pre_med < 15.0)
+
+        # 12b) Multi-turn HUD Ping-Pong Alert + crystal hint parity
+        hcache = td_path / "hcache"
+        hcache.mkdir()
+        (hcache / "latest_hud_v450.md").write_text("# Crystal\n", encoding="utf-8")
+        hp_tp = td_path / "hud_tp.jsonl"
+        env_hp = {**os.environ, "WM_HOOK_STATE_DIR": str(td_path / "hp_py"), "WM_HANDOFF_CACHE_DIR": str(hcache)}
+        env_hr = {**os.environ, "WM_HOOK_STATE_DIR": str(td_path / "hp_rs"), "WM_HANDOFF_CACHE_DIR": str(hcache)}
+        hp_last = hr_last = {}
+        for idx in range(1, 4):
+            hp_tp.write_text("\n".join(json.dumps(r) for r in rows[1 : idx + 1]) + "\n", encoding="utf-8")
+            h_in = json.dumps({"transcriptPath": str(hp_tp), "conversationId": "hud_v450"})
+            hp_last = json.loads(subprocess.run(["python3", "-S", "-B", str(hud_hook)], input=h_in, capture_output=True, text=True, env=env_hp, timeout=5).stdout)
+            hr_last = json.loads(subprocess.run([str(WM_SQUEEZE), "--hud"], input=h_in, capture_output=True, text=True, env=env_hr, timeout=5).stdout)
+        hr_md = ((hr_last.get("injectSteps") or [{}])[0].get("systemMessage") or {}).get("metadata", {}).get("user_markdown", "")
+        check("Multi-turn HUD Ping-Pong + Crystal hint Python/Rust byte parity", hp_last == hr_last and "Orchestrator Ping-Pong Alert" in hr_md and "wm-reset" in hr_md, hr_md[:140])
+
+        # 12c) wm-handoff --transcript --emit-receipt (HMAC) & --swarm-map
+        import hashlib, hmac
+        c_md = td_path / "crystal_test.md"
+        c_rec = td_path / "crystal_test.receipt.json"
+        r_ho = subprocess.run(
+            [str(handoff_bin), "--transcript", str(tp), "--cwd", str(KIT), "--out", str(c_md), "--emit-receipt", str(c_rec)],
+            capture_output=True, text=True, env={**os.environ, "WM_CONFINEMENT_SIGNING_KEY": "v450_hmac_secret"}, timeout=10,
+        )
+        rec_j = json.loads(c_rec.read_text(encoding="utf-8"))
+        sig_j = dict(rec_j)
+        sig_obj = sig_j.pop("signature", {})
+        exp_hmac = hmac.new(b"v450_hmac_secret", json.dumps(sig_j, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
+        check("wm-handoff wm-receipt/1.2 + HMAC-SHA256 signature valid", r_ho.returncode == 0 and rec_j.get("schema") == "wm-receipt/1.2" and rec_j.get("model_flips") == 2 and sig_obj.get("sig") == exp_hmac)
+
+        r_sm = subprocess.run([str(handoff_bin), "--swarm-map", str(KIT)], capture_output=True, text=True, timeout=10)
+        check("wm-handoff --swarm-map <=600 tok (<=2450B) with SHA", r_sm.returncode == 0 and len(r_sm.stdout.encode("utf-8")) <= 2450 and "swarm_map_sha256=" in r_sm.stdout)
+
+        # 12d) stop_telemetry auto-crystal, fullyIdle=False skip, rate-limit skip, & wm-reset
+        stop_cache = td_path / "stop_cache"
+        env_st = {**os.environ, "WM_AGY_TELEMETRY": str(td_path / "tel.jsonl"), "WM_HANDOFF_CACHE_DIR": str(stop_cache), "WM_HANDOFF_BIN": str(handoff_bin)}
+        run_hook(STOP_HOOK, {"transcriptPath": str(tp), "conversationId": "conv_v450_pingpong", "cwd": str(KIT), "fullyIdle": False, "terminationReason": "NO_TOOL_CALL"}, env_extra=env_st)
+        check("stop_telemetry skips auto-crystal when fullyIdle=False", not (stop_cache / "latest_conv_v450_pingpong.md").exists())
+        run_hook(STOP_HOOK, {"transcriptPath": str(tp), "conversationId": "conv_v450_pingpong", "cwd": str(KIT), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"}, env_extra=env_st)
+        sc_rec = stop_cache / "latest_conv_v450_pingpong.receipt.json"
+        m1 = sc_rec.stat().st_mtime_ns if sc_rec.is_file() else 0
+        time.sleep(0.03)
+        run_hook(STOP_HOOK, {"transcriptPath": str(tp), "conversationId": "conv_v450_pingpong", "cwd": str(KIT), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"}, env_extra=env_st)
+        check("stop_telemetry auto-crystal + 120s/25KB rate-limit skip", sc_rec.is_file() and sc_rec.stat().st_mtime_ns == m1)
+
+        r_rst = subprocess.run([str(reset_bin), "--cwd", str(KIT), "--dry-run"], capture_output=True, text=True, env=env_st, timeout=10)
+        r_pc = subprocess.run([str(reset_bin), "--cwd", str(KIT), "--print-crystal"], capture_output=True, text=True, env=env_st, timeout=10)
+        rst_j = json.loads(r_rst.stdout)
+        check("wm-reset --dry-run & --print-crystal PASS", r_rst.returncode == 0 and rst_j.get("model") == "gemini-4-hydrogen-high" and rst_j.get("receipt_schema") == "wm-receipt/1.2" and "crystal_sha256=" in r_pc.stdout)
+
+        # 12e) agy-token-audit --json orchestration metrics + 3 native agents
+        fake_home = td_path / "home_aud"
+        for cid, m_name, extra in [
+            ("aud_1111", "gemini-4-neon-high", [{"name": "read_file", "args": {"Path": "/tmp/shared.py"}}, {"name": "exit_plan_mode", "args": {}}]),
+            ("aud_2222", "gemini-4-hydrogen-high", [{"name": "read_file", "args": {"Path": "/tmp/shared.py"}}, {"name": "enter_plan_mode", "args": {}}]),
+        ]:
+            ltp = fake_home / ".gemini" / "antigravity" / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+            ltp.parent.mkdir(parents=True)
+            ltp.write_text(json.dumps({"type": "PLANNER_RESPONSE", "model": m_name, "input_tokens": 12000, "cache_read_tokens": 30000, "output_tokens": 500, "tool_calls": extra}) + "\n")
+        r_aud = subprocess.run([str(audit_bin), "--recent", "5", "--json"], capture_output=True, text=True, env={**os.environ, "HOME": str(fake_home)}, timeout=10)
+        aud_j = json.loads(r_aud.stdout)
+        agg = aud_j.get("aggregate", {})
+        check(
+            "agy-token-audit --json orchestration metrics & no _read_files leak",
+            r_aud.returncode == 0
+            and agg.get("exit_plan_count") == 1
+            and agg.get("one_turn_neon_plans") == 1
+            and agg.get("enter_plan_count") == 1
+            and agg.get("cross_session_dup_reads") == 1
+            and all("_read_files" not in s for s in aud_j.get("sessions", [])),
+            json.dumps(agg),
+        )
+        check("3 native plugin agents present", all((KIT / "plugin" / "agents" / f).is_file() for f in ("hydrogen-builder.md", "fresh-verifier.md", "swarm-coordinator.md")))
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="agy_hook_state_") as state_td:
         os.environ["WM_HOOK_STATE_DIR"] = state_td
@@ -1807,7 +1963,8 @@ def main():
         test_v44_ide_longevity_shield()
         test_v441_spill_cap_and_rust_hud()
         test_v442_self_heal_and_rust_post_tool()
-    print(f"\n=== Wave 3/4/v4.4.2 Test Summary: {PASS} passed, {FAIL} failed ===")
+        test_v450_rust_pretool_crystal_and_swarm_guards()
+    print(f"\n=== Wave 3/4/v4.5.0 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

@@ -13,11 +13,11 @@
     "enabled": true,
     "PreToolUse": [
       {
-        "matcher": "run_command|read_file|write_file|edit_file|manage_task|mcp_whitemagic-agy-kit_fast_run_checks|mcp_whitemagic-agy-kit_fast_apply_edits|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall|mcp_whitemagic_whitemagic_gen3_session_continuity|mcp_whitemagic_whitemagic_gen3_memory_recall|mcp_wm-research-engine_research_hunt|mcp_firecrawl_firecrawl_scrape",
+        "matcher": "run_command|read_file|write_file|edit_file|manage_task|swarm|post_message|invoke_subagent|mcp_whitemagic-agy-kit_fast_run_checks|mcp_whitemagic-agy-kit_fast_apply_edits|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall|mcp_whitemagic_whitemagic_gen3_session_continuity|mcp_whitemagic_whitemagic_gen3_memory_recall|mcp_wm-research-engine_research_hunt|mcp_firecrawl_firecrawl_scrape",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -S -B ./hooks/pre_tool_guard.py",
+            "command": "if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze --pre-tool --py ./hooks/pre_tool_guard.py; elif [ -x \"$HOME/.local/bin/wm-squeeze\" ]; then exec \"$HOME/.local/bin/wm-squeeze\" --pre-tool --py ./hooks/pre_tool_guard.py; else exec python3 -S -B ./hooks/pre_tool_guard.py; fi",
             "timeout": 5
           }
         ]

@@ -139,6 +139,11 @@ def audit_transcript(label: str, conv_id: str, surface: str = "all") -> dict[str
     hook_hits = 0
     spills = 0
     think_chars = 0
+    exit_plan_count = 0
+    enter_plan_count = 0
+    one_turn_neon_plans = 0
+    neon_streak = 0
+    read_files: set[str] = set()
     models: Counter[str] = Counter()
     tools: Counter[str] = Counter()
     prev_model = ""
@@ -157,10 +162,35 @@ def audit_transcript(label: str, conv_id: str, surface: str = "all") -> dict[str
             m = str(o.get("model") or "")
             th = o.get("thinking") or ""
             think_chars += len(str(th))
+            has_toks = (u + c + ot) > 0
+            if m:
+                if "neon" in m.lower():
+                    neon_streak += 1
+                elif has_toks:
+                    neon_streak = 0
             for tc in o.get("tool_calls") or []:
                 tn = str(tc.get("name") or tc.get("tool") or "unknown")
                 tools[tn] += 1
-            if u + c + ot > 0:
+                if tn == "enter_plan_mode":
+                    enter_plan_count += 1
+                    neon_streak = 0
+                elif tn == "exit_plan_mode":
+                    exit_plan_count += 1
+                    if "neon" in m.lower() and neon_streak <= 1:
+                        one_turn_neon_plans += 1
+                    neon_streak = 0
+                elif tn == "read_file":
+                    targs = tc.get("args") or tc.get("arguments") or {}
+                    if isinstance(targs, str):
+                        try:
+                            targs = json.loads(targs)
+                        except Exception:
+                            targs = {}
+                    if isinstance(targs, dict):
+                        rp = targs.get("Path") or targs.get("path")
+                        if rp:
+                            read_files.add(str(_unwrap_json_str(rp)))
+            if has_toks:
                 turns += 1
                 if turns == 1:
                     t0_unc = u
@@ -219,6 +249,11 @@ def audit_transcript(label: str, conv_id: str, surface: str = "all") -> dict[str
         "hook_hits": hook_hits,
         "spills": spills,
         "thinking_tok_est": think_chars // 4,
+        "exit_plan_count": exit_plan_count,
+        "enter_plan_count": enter_plan_count,
+        "one_turn_neon_plans": one_turn_neon_plans,
+        "unique_reads": len(read_files),
+        "_read_files": read_files,
         "models": dict(models),
         "tools": dict(tools),
     }
@@ -228,9 +263,12 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     active = [r for r in rows if not r.get("missing")]
     tot_tools: Counter[str] = Counter()
     tot_models: Counter[str] = Counter()
+    path_sessions: Counter[str] = Counter()
     for r in active:
         tot_tools.update(r["tools"])
         tot_models.update(r["models"])
+        for p in r.get("_read_files") or ():
+            path_sessions[p] += 1
     tot_unc = sum(r["tot_unc"] for r in active)
     tot_cac = sum(r["tot_cac"] for r in active)
     tot_out = sum(r["tot_out"] for r in active)
@@ -251,6 +289,10 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "hook_hits": sum(r["hook_hits"] for r in active),
         "spills": sum(r["spills"] for r in active),
         "thinking_tok_est": sum(r["thinking_tok_est"] for r in active),
+        "exit_plan_count": sum(r.get("exit_plan_count", 0) for r in active),
+        "enter_plan_count": sum(r.get("enter_plan_count", 0) for r in active),
+        "one_turn_neon_plans": sum(r.get("one_turn_neon_plans", 0) for r in active),
+        "cross_session_dup_reads": sum(1 for cnt in path_sessions.values() if cnt >= 2),
         "top_tools": tot_tools.most_common(15),
         "models": dict(tot_models),
     }
@@ -283,6 +325,10 @@ def format_table(rows: list[dict[str, Any]], agg: dict[str, Any]) -> str:
         f">=30s idle gaps={agg['gaps30']} ({agg['gap_unc']/1e6:.2f}M unc) | "
         f"compactions={agg['compactions']} | thinking_est={agg['thinking_tok_est']/1000:.1f}k tok | spills={agg['spills']}"
     )
+    lines.append(
+        f"Orchestration Telemetry: exit_plan={agg['exit_plan_count']} (1-turn Neon={agg['one_turn_neon_plans']}) | "
+        f"enter_plan={agg['enter_plan_count']} | cross-session dup reads={agg['cross_session_dup_reads']}"
+    )
     if agg["top_tools"]:
         lines.append("Top Tools: " + ", ".join(f"{k}={v}" for k, v in agg["top_tools"][:10]))
     return "\n".join(lines)
@@ -298,6 +344,7 @@ def build_markdown_report(rows: list[dict[str, Any]], agg: dict[str, Any], targe
         f"- **Total Output Tokens:** `{agg['tot_out']/1000:.1f}k` (`~{agg['thinking_tok_est']/1000:.1f}k` estimated thinking tokens)",
         f"- **Cross-Model Flips:** `{agg['flips']}` (`{agg['flip_unc']/1e6:.2f}M` uncached input tokens on flip turns)",
         f"- **>=30s Inter-Turn Gaps:** `{agg['gaps30']}` (`{agg['gap_unc']/1e6:.2f}M` non-flip uncached input tokens)",
+        f"- **Orchestration Cadence:** `exit_plan_mode={agg['exit_plan_count']}` (`1-turn Neon={agg['one_turn_neon_plans']}`) | `enter_plan_mode={agg['enter_plan_count']}` | **Cross-Session Dup Reads:** `{agg['cross_session_dup_reads']}`",
         f"- **Auto-Compactions (`CHECKPOINT`):** `{agg['compactions']}` | **Spills:** `{agg['spills']}` | **PreToolUse Squeeze/Hook Hits:** `{agg['hook_hits']}`",
         "",
         "## Per-Session Breakdown",
@@ -373,16 +420,17 @@ def main() -> int:
 
     rows = [audit_transcript(lbl, cid, surface=args.surface) for lbl, cid in targets]
     agg = aggregate(rows)
+    clean_rows = [{k: v for k, v in r.items() if k != "_read_files"} for r in rows]
 
     if args.report_md:
         rp = Path(args.report_md)
         rp.parent.mkdir(parents=True, exist_ok=True)
-        rp.write_text(build_markdown_report(rows, agg, target_label), encoding="utf-8")
+        rp.write_text(build_markdown_report(clean_rows, agg, target_label), encoding="utf-8")
 
     if args.json:
-        print(json.dumps({"target": target_label, "aggregate": agg, "sessions": rows}, indent=2))
+        print(json.dumps({"target": target_label, "aggregate": agg, "sessions": clean_rows}, indent=2))
     else:
-        print(format_table(rows, agg))
+        print(format_table(clean_rows, agg))
         if args.report_md:
             print(f"\nWrote Zero-PII Markdown report -> {args.report_md}")
     return 0

@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -462,72 +463,211 @@ def benchmark_post_tool_and_read_heal() -> dict:
     }
 
 
+def benchmark_v450_orchestration_and_rust_pretool(app_limit: int = 10, cli_limit: int = 10) -> dict:
+    """Measure Rust wm-squeeze --pre-tool speedup, --swarm-map footprint, and ping-pong/orchestration corpus metrics."""
+    sq_bin = shutil.which("wm-squeeze") or str(HOME / ".local" / "bin" / "wm-squeeze")
+    py_pre = str(KIT_DIR / "plugin" / "hooks" / "pre_tool_guard.py")
+    handoff_bin = str(KIT_DIR / "bin" / "wm-handoff")
+    sample_file = str(KIT_DIR / "plugin" / "hooks" / "longevity_hud.py")
+
+    with tempfile.TemporaryDirectory() as td:
+        tp_fake = Path(td) / "tp.jsonl"
+        tp_fake.write_text(
+            "\n".join([
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-high", "input_tokens": 50000, "cache_read_tokens": 40000}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-high", "input_tokens": 55000, "cache_read_tokens": 110000}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        scenarios = {
+            "read_file": json.dumps({"toolCall": {"name": "read_file", "args": {"Path": sample_file, "StartLine": 1, "EndLine": 80}}, "transcriptPath": str(tp_fake)}),
+            "mcp_noop": json.dumps({"toolCall": {"name": "mcp_whitemagic-agy-kit_fast_batch_search", "args": {"queries": []}}}),
+            "swarm_add": json.dumps({"toolCall": {"name": "swarm", "args": {"action": "add", "name": "w1", "model": "gemini-4-hydrogen-high", "workspace": "share", "brief": "do x"}}, "transcriptPath": str(tp_fake)}),
+            "run_command": json.dumps({"toolCall": {"name": "run_command", "args": {"CommandLine": "python3 tests/test_wave3.py"}}}),
+        }
+        pre_rust_vs_py = {}
+        for label, pl in scenarios.items():
+            py_lats, rs_lats = [], []
+            py_out = rs_out = {}
+            for _ in range(30):
+                t0 = time.perf_counter()
+                p1 = subprocess.run(["python3", "-S", "-B", py_pre], input=pl, capture_output=True, text=True, timeout=5)
+                py_lats.append((time.perf_counter() - t0) * 1000.0)
+                t0 = time.perf_counter()
+                p2 = subprocess.run([sq_bin, "--pre-tool", "--py", py_pre], input=pl, capture_output=True, text=True, timeout=5)
+                rs_lats.append((time.perf_counter() - t0) * 1000.0)
+                py_out = json.loads(p1.stdout)
+                rs_out = json.loads(p2.stdout)
+            py_lats.sort()
+            rs_lats.sort()
+            py_med = statistics.median(py_lats)
+            rs_med = statistics.median(rs_lats)
+            pre_rust_vs_py[label] = {
+                "py_med_ms": round(py_med, 1),
+                "rust_med_ms": round(rs_med, 1),
+                "rust_p95_ms": round(rs_lats[int(len(rs_lats) * 0.95) - 1], 1),
+                "speedup_x": round(py_med / max(rs_med, 0.1), 1),
+                "parity": py_out.get("decision") == rs_out.get("decision") and py_out.get("overwrite") == rs_out.get("overwrite"),
+            }
+
+    r_sm = subprocess.run([handoff_bin, "--swarm-map", str(KIT_DIR)], capture_output=True, text=True, timeout=10)
+    swarm_map_bytes = len(r_sm.stdout.encode("utf-8"))
+
+    # Corpus replay across newest App + CLI transcripts for flips >=2 / exit_plan / 1-turn Neon / auto-crystal eligibility
+    sessions = collect_transcripts("app", app_limit) + collect_transcripts("cli", cli_limit)
+    pingpong_sessions = 0
+    auto_crystal_eligible = 0
+    total_flips = 0
+    total_flip_unc = 0
+    total_exit_plan = 0
+    total_one_turn_neon = 0
+    seen_paths_sessions: Counter[str] = Counter()
+
+    for tp in sessions:
+        prev_m = ""
+        flips = 0
+        flip_unc = 0
+        last_ctx = 0
+        neon_streak = 0
+        tp_reads: set[str] = set()
+        for line in tp.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith("{"):
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "PLANNER_RESPONSE":
+                continue
+            u = int(o.get("input_tokens") or 0)
+            c = int(o.get("cache_read_tokens") or 0)
+            m = str(o.get("model") or "")
+            has_toks = (u + c) > 0
+            if m:
+                if "neon" in m.lower():
+                    neon_streak += 1
+                elif has_toks:
+                    neon_streak = 0
+            for tc in o.get("tool_calls") or []:
+                nm = tc.get("name") or ""
+                if nm == "exit_plan_mode":
+                    total_exit_plan += 1
+                    if "neon" in m.lower() and neon_streak <= 1:
+                        total_one_turn_neon += 1
+                    neon_streak = 0
+                elif nm == "read_file":
+                    args = tc.get("args") or tc.get("arguments") or {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    if isinstance(args, dict) and args.get("Path"):
+                        tp_reads.add(str(args["Path"]))
+            if has_toks:
+                last_ctx = u + c
+                if m and prev_m and m != prev_m:
+                    flips += 1
+                    flip_unc += u
+                if m:
+                    prev_m = m
+        for rp in tp_reads:
+            seen_paths_sessions[rp] += 1
+        total_flips += flips
+        total_flip_unc += flip_unc
+        if flips >= 2:
+            pingpong_sessions += 1
+        if (last_ctx >= 99_000 and flips >= 2) or last_ctx >= 130_000:
+            auto_crystal_eligible += 1
+
+    return {
+        "pre_rust_vs_py": pre_rust_vs_py,
+        "swarm_map_bytes": swarm_map_bytes,
+        "swarm_map_est_tokens": swarm_map_bytes // 4,
+        "corpus_sessions": len(sessions),
+        "pingpong_sessions": pingpong_sessions,
+        "auto_crystal_eligible_sessions": auto_crystal_eligible,
+        "total_flips": total_flips,
+        "total_flip_unc_tokens": total_flip_unc,
+        "total_exit_plan": total_exit_plan,
+        "total_one_turn_neon": total_one_turn_neon,
+        "cross_session_dup_reads": sum(1 for v in seen_paths_sessions.values() if v >= 2),
+    }
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Benchmark whitemagic-agy-kit v4.4.2 longevity, self-heal, and Rust hooks")
-    ap.add_argument("--out", default=str(KIT_DIR / "benchmarks" / "RESULTS_2026-11-25_v442.md"), help="Output Markdown receipt path")
+    ap = argparse.ArgumentParser(description="Benchmark whitemagic-agy-kit v4.5.0 longevity, self-heal, and Rust hooks")
+    ap.add_argument("--out", default=str(KIT_DIR / "benchmarks" / "RESULTS_2026-11-25_v450.md"), help="Output Markdown receipt path")
     args = ap.parse_args()
 
     spills = replay_pre_tool_spills()
     post_heal = benchmark_post_tool_and_read_heal()
     prefix = measure_prefix_footprint()
     hud = replay_longevity_hud()
+    v450 = benchmark_v450_orchestration_and_rust_pretool()
 
     report = {
         "spills_replay": spills,
         "post_tool_and_read_heal": post_heal,
         "prefix_footprint": prefix,
         "hud_replay": hud,
+        "v450_rust_pretool_and_orchestration": v450,
     }
     print(json.dumps(report, indent=2))
 
     lat = spills["latency_v441_vs_v442"]
+    v45_lat = v450["pre_rust_vs_py"]
     md = [
-        "# WhiteMagic AGY Turbo Kit `v4.4.2` — Self-Healing `read_file`, Sub-3ms Rust `--post-tool` & 4-Way Spill Replay",
+        "# WhiteMagic AGY Turbo Kit `v4.5.0` — Rust `PreToolUse`, Ping-Pong Auto-Crystal & Orchestrator Guards",
         "",
-        "## 1. Historical `run_command` Spill & Squeeze Replay (`v4.3.0` → `v4.4.0` → `v4.4.1` → `v4.4.2`)",
+        "## 1. Historical `run_command` Spill & Squeeze Replay (`v4.3.0` → `v4.4.0` → `v4.4.1` → `v4.5.0`)",
         "",
         f"- **Commands replayed (`10` App + `12` CLI newest sessions):** `{spills['commands_scanned']}`",
-        f"- **Commands intercepted by `wm-squeeze`:** `{spills['v43_squeezed']}` (`v4.3.0`) → `{spills['v440_squeezed']}` (`v4.4.0`) → `{spills['v441_squeezed']}` (`v4.4.1`) → **`{spills['v442_squeezed']}` (`v4.4.2`, `+{spills['delta_vs_v43_pct']}%` vs `v4.3.0`)**",
-        f"- **Historical `output.txt` spill commands caught:** `{spills['v43_spills_caught']}/{spills['spill_commands_total']}` (`v4.3.0`) → `{spills['v440_spills_caught']}/{spills['spill_commands_total']}` (`v4.4.0`) → `{spills['v441_spills_caught']}/{spills['spill_commands_total']}` (`v4.4.1`) → **`{spills['v442_spills_caught']}/{spills['spill_commands_total']}` (`v4.4.2`, `{spills['v442_spill_capture_pct']}%`)**",
-        f"- **Newly squeezed roots (`v4.4.2` vs `v4.4.1`):** `{json.dumps(spills['newly_caught_v442'])}`",
+        f"- **Commands intercepted by `wm-squeeze`:** `{spills['v43_squeezed']}` (`v4.3.0`) → `{spills['v440_squeezed']}` (`v4.4.0`) → `{spills['v441_squeezed']}` (`v4.4.1`) → **`{spills['v442_squeezed']}` (`v4.4.2+`, `+{spills['delta_vs_v43_pct']}%` vs `v4.3.0`)**",
+        f"- **Historical `output.txt` spill commands caught:** `{spills['v43_spills_caught']}/{spills['spill_commands_total']}` (`v4.3.0`) → `{spills['v440_spills_caught']}/{spills['spill_commands_total']}` (`v4.4.0`) → `{spills['v441_spills_caught']}/{spills['spill_commands_total']}` (`v4.4.1`) → **`{spills['v442_spills_caught']}/{spills['spill_commands_total']}` (`v4.4.2+`, `{spills['v442_spill_capture_pct']}%`)**",
         "",
-        "### `PreToolUse` Latency (`v4.4.1` vs `v4.4.2` Lazy-Import Refactor, 30 runs each)",
+        "### `PreToolUse` Latency: Python `pre_tool_guard.py` vs Compiled Rust `wm-squeeze --pre-tool` (30 runs each)",
         "",
-        "| Tool Scenario | `v4.4.1` Median | `v4.4.2` Median | `v4.4.2` p95 | Delta |",
-        "| :--- | ---: | ---: | ---: | ---: |",
-        f"| `read_file` (bounded slice) | {lat['read_file']['v441_med_ms']} ms | **{lat['read_file']['v442_med_ms']} ms** | {lat['read_file']['v442_p95_ms']} ms | {lat['read_file']['delta_ms']} ms ({lat['read_file']['delta_pct']}%) |",
-        f"| `mcp_noop` (`batch_search`) | {lat['mcp_noop']['v441_med_ms']} ms | **{lat['mcp_noop']['v442_med_ms']} ms** | {lat['mcp_noop']['v442_p95_ms']} ms | {lat['mcp_noop']['delta_ms']} ms ({lat['mcp_noop']['delta_pct']}%) |",
-        f"| `run_command` (`rg`) | {lat['run_command']['v441_med_ms']} ms | **{lat['run_command']['v442_med_ms']} ms** | {lat['run_command']['v442_p95_ms']} ms | {lat['run_command']['delta_ms']} ms ({lat['run_command']['delta_pct']}%) |",
-        "",
-        "## 2. Historical `read_file` Self-Heal Replay & Sub-3ms Rust `wm-squeeze --post-tool`",
-        "",
-        f"- **Historical `invalid line range` failures self-healed:** **`{post_heal['historical_invalid_range_healed']}/{post_heal['historical_invalid_range_total']}` (`{post_heal['historical_heal_pct']}%`)**",
-        f"- **Python `post_tool_sim.py` clean latency (30 runs):** median `{post_heal['post_py_median_ms']} ms` · p95 `{post_heal['post_py_p95_ms']} ms`",
-        f"- **Rust `wm-squeeze --post-tool` clean latency (30 runs):** median **`{post_heal['post_rust_median_ms']} ms`** · p95 **`{post_heal['post_rust_p95_ms']} ms`** (**`{post_heal['post_rust_speedup_x']}×` faster**, parity=`{post_heal['post_parity_ok']}`)",
-        "",
-        "## 3. Turn-0 Rule & Plugin Frontmatter Footprint",
-        "",
-        f"- **Plugin `AGENTS.md`:** `{prefix['agents_v43_bytes']:,} B` (`v4.3.0`) → **`{prefix['agents_v441_bytes']:,} B` (`v4.4.2`, `{prefix['agents_delta_pct']}%`)**",
-        f"- **Global `GEMINI.md` (local user rules):** `{prefix['gemini_md_bytes']:,} B`",
-        f"- **Enabled plugins skill frontmatter:** `{prefix['enabled_skills_total']}` skills across `{len(prefix['enabled_plugins'])}` plugins = `{prefix['enabled_frontmatter_bytes']:,} B` (~`{prefix['enabled_frontmatter_est_tokens']:,}` tok)",
-        "",
-        "| Enabled Plugin | Skills | Frontmatter Bytes | Est. Tokens |",
-        "| :--- | ---: | ---: | ---: |",
+        "| Tool Scenario | Python (`v4.4.2`) | Rust `--pre-tool` (`v4.5.0`) | Rust p95 | Speedup | Exact Parity |",
+        "| :--- | ---: | ---: | ---: | ---: | :---: |",
     ]
+    for sc in ("read_file", "mcp_noop", "swarm_add", "run_command"):
+        d = v45_lat[sc]
+        md.append(f"| `{sc}` | {d['py_med_ms']} ms | **{d['rust_med_ms']} ms** | {d['rust_p95_ms']} ms | **{d['speedup_x']}×** | `{d['parity']}` |")
+
+    md.extend(
+        [
+            "",
+            "## 2. Historical `read_file` Self-Heal Replay & Sub-3ms Rust `wm-squeeze --post-tool`",
+            "",
+            f"- **Historical `invalid line range` failures self-healed:** **`{post_heal['historical_invalid_range_healed']}/{post_heal['historical_invalid_range_total']}` (`{post_heal['historical_heal_pct']}%`)**",
+            f"- **Python `post_tool_sim.py` clean latency (30 runs):** median `{post_heal['post_py_median_ms']} ms` · p95 `{post_heal['post_py_p95_ms']} ms`",
+            f"- **Rust `wm-squeeze --post-tool` clean latency (30 runs):** median **`{post_heal['post_rust_median_ms']} ms`** · p95 **`{post_heal['post_rust_p95_ms']} ms`** (**`{post_heal['post_rust_speedup_x']}×` faster**, parity=`{post_heal['post_parity_ok']}`)",
+            "",
+            "## 3. Turn-0 Rule & Plugin Frontmatter Footprint",
+            "",
+            f"- **Plugin `AGENTS.md`:** `{prefix['agents_v43_bytes']:,} B` (`v4.3.0`) → **`{prefix['agents_v441_bytes']:,} B` (`v4.5.0`, `{prefix['agents_delta_pct']}%`)**",
+            f"- **Global `GEMINI.md` (local user rules):** `{prefix['gemini_md_bytes']:,} B`",
+            f"- **Enabled plugins skill frontmatter:** `{prefix['enabled_skills_total']}` skills across `{len(prefix['enabled_plugins'])}` plugins = `{prefix['enabled_frontmatter_bytes']:,} B` (~`{prefix['enabled_frontmatter_est_tokens']:,}` tok)",
+            "",
+            "| Enabled Plugin | Skills | Frontmatter Bytes | Est. Tokens |",
+            "| :--- | ---: | ---: | ---: |",
+        ]
+    )
     for pb in prefix["enabled_plugins"]:
         md.append(f"| `{pb['plugin']}` | {pb['skills']} | {pb['bytes']:,} B | ~{pb['est_tokens']:,} |")
 
     md.extend(
         [
             "",
-            "## 4. Zero-Token `PostInvocation` Rust HUD (`wm-squeeze --hud`) vs Python Fallback",
+            "## 4. Zero-Token `PostInvocation` Rust HUD (`wm-squeeze --hud`) & Ping-Pong Auto-Crystal Corpus Replay",
             "",
             f"- **Turns replayed (`8` App + `12` CLI sessions):** `{hud['turns_replayed']}` across `{hud['sessions_replayed']}` sessions",
             f"- **Alerts emitted (`user_markdown` only):** `{hud['alerts_fired']}` (`{hud['alert_rate_pct']}%` of turns across `{hud['sessions_with_alerts']}` sessions)",
             f"- **Alert breakdown:** `{json.dumps(hud['alerts_by_kind'])}`",
-            f"- **Model tokens added (`systemMessage`):** **`{hud['model_tokens_added']}`** (`0` prefix-cache impact)",
-            f"- **Python `longevity_hud.py` latency (30 runs):** median `{hud['hud_py_median_ms']} ms` · p95 `{hud['hud_py_p95_ms']} ms`",
-            f"- **Rust `wm-squeeze --hud` latency (30 runs):** median **`{hud['hud_rust_median_ms']} ms`** · p95 **`{hud['hud_rust_p95_ms']} ms`** (**`{hud['hud_rust_speedup_x']}×` faster**, exact output parity=`{hud['hud_py_rust_parity']}`)",
+            f"- **Rust `wm-squeeze --hud` vs Python (30 runs):** median **`{hud['hud_rust_median_ms']} ms`** (p95 `{hud['hud_rust_p95_ms']} ms`) vs `{hud['hud_py_median_ms']} ms` (**`{hud['hud_rust_speedup_x']}×` faster**, parity=`{hud['hud_py_rust_parity']}`)",
+            f"- **Orchestration & Auto-Crystal Corpus Replay (`{v450['corpus_sessions']}` newest sessions):** `{v450['total_flips']}` cross-model flips (**`{v450['total_flip_unc_tokens']:,}` uncached tokens** burned on flips), `{v450['pingpong_sessions']}` ping-pong sessions (`>=2` flips), `{v450['auto_crystal_eligible_sessions']}` eligible for `Stop` auto-crystal (`wm-receipt/1.2`), `{v450['total_exit_plan']}` `exit_plan_mode` transitions (`{v450['total_one_turn_neon']}` 1-turn Neon plans), `{v450['cross_session_dup_reads']}` cross-session duplicate read paths",
+            f"- **Shared Swarm Map (`wm-handoff --swarm-map .`):** **`{v450['swarm_map_bytes']:,} B` (~`{v450['swarm_map_est_tokens']}` tokens)**",
             "",
         ]
     )

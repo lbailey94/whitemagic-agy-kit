@@ -995,6 +995,8 @@ struct HudState {
     warned_200k: bool,
     last_flip_step: String,
     last_cold_inv: i64,
+    flip_count: u64,
+    flip_unc_total: u64,
 }
 
 fn load_hud_state(sf: &Path) -> HudState {
@@ -1002,7 +1004,18 @@ fn load_hud_state(sf: &Path) -> HudState {
     let Ok(txt) = fs::read_to_string(sf) else { return st };
     let fields = extract_top_level_fields(
         &txt,
-        &["path", "sz", "mtime_ns", "epoch", "warned_120k", "warned_200k", "last_flip_step", "last_cold_inv"],
+        &[
+            "path",
+            "sz",
+            "mtime_ns",
+            "epoch",
+            "warned_120k",
+            "warned_200k",
+            "last_flip_step",
+            "last_cold_inv",
+            "flip_count",
+            "flip_unc_total",
+        ],
     );
     if let Some(v) = fields.get("path") { st.path = v.clone(); }
     if let Some(v) = fields.get("sz") { st.sz = v.parse().unwrap_or(0); }
@@ -1012,12 +1025,14 @@ fn load_hud_state(sf: &Path) -> HudState {
     if let Some(v) = fields.get("warned_200k") { st.warned_200k = v == "true"; }
     if let Some(v) = fields.get("last_flip_step") { st.last_flip_step = v.clone(); }
     if let Some(v) = fields.get("last_cold_inv") { st.last_cold_inv = v.parse().unwrap_or(-99); }
+    if let Some(v) = fields.get("flip_count") { st.flip_count = v.parse().unwrap_or(0); }
+    if let Some(v) = fields.get("flip_unc_total") { st.flip_unc_total = v.parse().unwrap_or(0); }
     st
 }
 
 fn save_hud_state(sf: &Path, st: &HudState) {
     let body = format!(
-        "{{\"path\":\"{}\",\"sz\":{},\"mtime_ns\":{},\"epoch\":{},\"warned_120k\":{},\"warned_200k\":{},\"last_flip_step\":\"{}\",\"last_cold_inv\":{}}}",
+        "{{\"path\":\"{}\",\"sz\":{},\"mtime_ns\":{},\"epoch\":{},\"warned_120k\":{},\"warned_200k\":{},\"last_flip_step\":\"{}\",\"last_cold_inv\":{},\"flip_count\":{},\"flip_unc_total\":{}}}",
         json_escape(&st.path),
         st.sz,
         st.mtime_ns,
@@ -1025,7 +1040,9 @@ fn save_hud_state(sf: &Path, st: &HudState) {
         if st.warned_120k { "true" } else { "false" },
         if st.warned_200k { "true" } else { "false" },
         json_escape(&st.last_flip_step),
-        st.last_cold_inv
+        st.last_cold_inv,
+        st.flip_count,
+        st.flip_unc_total
     );
     if let Some(parent) = sf.parent() {
         let _ = fs::create_dir_all(parent);
@@ -1185,7 +1202,12 @@ fn run_hud() {
         _ => 0,
     };
 
-    if checkpoints > state.epoch || cur_ctx < 90_000 {
+    if checkpoints > state.epoch {
+        state.warned_120k = false;
+        state.warned_200k = false;
+        state.flip_count = 0;
+        state.flip_unc_total = 0;
+    } else if cur_ctx < 90_000 {
         state.warned_120k = false;
         state.warned_200k = false;
     }
@@ -1196,31 +1218,64 @@ fn run_hud() {
     let flipped = !prev_model.is_empty() && !cur_model.is_empty() && prev_model != cur_model;
     let mut alerts: Vec<String> = Vec::new();
 
+    let handoff_dir = env::var("WM_HANDOFF_CACHE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+                .join(".cache/wm-handoff")
+        });
+    let crystal_path = handoff_dir.join(format!("latest_{}.md", san));
+    let crystal_hint = if crystal_path.is_file() {
+        format!(" Crystal ready: `{}` (`wm-reset`).", crystal_path.display())
+    } else {
+        String::new()
+    };
+    let crystal_short = if crystal_path.is_file() {
+        " Crystal ready (`wm-reset`)."
+    } else {
+        ""
+    };
+
     if flipped && unc >= 50_000 && step_key != state.last_flip_step {
-        alerts.push(format!(
-            "⚡ **Model Flip Cache Eviction** (`{}` → `{}`): burned **~{:.0}k uncached tok** ({:.0}% hit). Pin a single model (`Gemini 4 Hydrogen`) on >80k sessions.",
-            prev_model,
-            cur_model,
-            (unc as f64) / 1000.0,
-            hit_pct
-        ));
+        state.flip_count += 1;
+        state.flip_unc_total += unc;
+        if state.flip_count >= 2 && (cur_ctx >= 99_000 || state.flip_unc_total >= 300_000) {
+            alerts.push(format!(
+                "⚡ **Orchestrator Ping-Pong Alert** ({} flips · ~{:.0}k uncached burned): Pin single-model Hydrogen, run `/compact`, or reset via `wm-reset`.{}",
+                state.flip_count,
+                (state.flip_unc_total as f64) / 1000.0,
+                crystal_hint
+            ));
+        } else {
+            alerts.push(format!(
+                "⚡ **Model Flip Cache Eviction** (`{}` → `{}`): burned **~{:.0}k uncached tok** ({:.0}% hit). Pin a single model (`Gemini 4 Hydrogen`) on >80k sessions.",
+                prev_model,
+                cur_model,
+                (unc as f64) / 1000.0,
+                hit_pct
+            ));
+        }
         state.last_flip_step = step_key;
     }
 
     if !is_cli || hud_cli_full {
         if cur_ctx >= 200_000 && !state.warned_200k {
             alerts.push(format!(
-                "🔴 **Context Cliff (~{:.0}k tok · {:.0}% cache hit):** High re-prefill cost on any idle gap. Run `/compact` or `wm-handoff` soon.",
+                "🔴 **Context Cliff (~{:.0}k tok · {:.0}% cache hit):** High re-prefill cost on any idle gap. Run `/compact` or `wm-handoff` soon.{}",
                 (cur_ctx as f64) / 1000.0,
-                hit_pct
+                hit_pct,
+                crystal_short
             ));
             state.warned_200k = true;
             state.warned_120k = true;
         } else if cur_ctx >= 120_000 && !state.warned_120k {
             alerts.push(format!(
-                "🟡 **Context Watch (~{:.0}k tok · {:.0}% cache hit):** Run `/compact` or `wm-handoff` before stepping away >5m.",
+                "🟡 **Context Watch (~{:.0}k tok · {:.0}% cache hit):** Run `/compact` or `wm-handoff` before stepping away >5m.{}",
                 (cur_ctx as f64) / 1000.0,
-                hit_pct
+                hit_pct,
+                crystal_short
             ));
             state.warned_120k = true;
         }
@@ -1229,18 +1284,20 @@ fn run_hud() {
             if idle_secs >= 300 {
                 let idle_mins = idle_secs / 60;
                 alerts.push(format!(
-                    "❄️ **Cold Resume After Idle (~{:.0}k tok · {:.0}% hit · idle {}m):** Re-prefilled ~{:.0}k uncached tok. Use `wm-handoff` before resuming idle sessions.",
+                    "❄️ **Cold Resume After Idle (~{:.0}k tok · {:.0}% hit · idle {}m):** Re-prefilled ~{:.0}k uncached tok. Use `wm-handoff` before resuming idle sessions.{}",
                     (cur_ctx as f64) / 1000.0,
                     hit_pct,
                     idle_mins,
-                    (unc as f64) / 1000.0
+                    (unc as f64) / 1000.0,
+                    crystal_short
                 ));
             } else {
                 alerts.push(format!(
-                    "❄️ **Cold Cache Miss (~{:.0}k tok · {:.0}% hit):** Re-prefilled ~{:.0}k uncached tok. Use `wm-handoff` before resuming idle sessions.",
+                    "❄️ **Cold Cache Miss (~{:.0}k tok · {:.0}% hit):** Re-prefilled ~{:.0}k uncached tok. Use `wm-handoff` before resuming idle sessions.{}",
                     (cur_ctx as f64) / 1000.0,
                     hit_pct,
-                    (unc as f64) / 1000.0
+                    (unc as f64) / 1000.0,
+                    crystal_short
                 ));
             }
             state.last_cold_inv = cur_inv;
@@ -1688,11 +1745,1658 @@ fn run_post_tool() {
     println!("{{}}");
 }
 
+fn pretool_state_dir() -> PathBuf {
+    PathBuf::from(
+        env::var("WM_HOOK_STATE_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/tmp/agy-hook-state".to_string()),
+    )
+}
+
+fn pretool_san_id(conv_id: &str) -> String {
+    conv_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(20)
+        .collect()
+}
+
+fn write_bytes_atomic(path: &Path, body: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("st.json");
+    let tmp = path.with_file_name(format!(".{}.tmp.{}", name, std::process::id()));
+    if fs::write(&tmp, body).is_ok() {
+        if fs::rename(&tmp, path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+fn extract_json_object_entries(txt: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = txt.trim().as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return out;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        i = skip_json_ws(bytes, i);
+        if i >= bytes.len() || bytes[i] == b'}' {
+            break;
+        }
+        if bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] != b'"' {
+            break;
+        }
+        let Some((key, after_key)) = parse_json_str_at(bytes, i) else { break };
+        i = skip_json_ws(bytes, after_key);
+        if i >= bytes.len() || bytes[i] != b':' {
+            break;
+        }
+        i = skip_json_ws(bytes, i + 1);
+        if i < bytes.len() && bytes[i] == b'"' {
+            let Some((val, end)) = parse_json_str_at(bytes, i) else { break };
+            out.push((key, val));
+            i = end;
+        } else {
+            let end = skip_json_value(bytes, i);
+            if end > i {
+                if let Ok(tok) = std::str::from_utf8(&bytes[i..end]) {
+                    out.push((key, tok.trim().to_string()));
+                }
+            }
+            i = end.max(i + 1);
+        }
+    }
+    out
+}
+
+fn pretool_allow() {
+    println!("{{\"decision\":\"allow\"}}");
+}
+
+fn pretool_decision(decision: &str, reason: &str) {
+    println!(
+        "{{\"decision\":\"{}\",\"reason\":\"{}\"}}",
+        json_escape(decision),
+        json_escape(reason)
+    );
+}
+
+fn pretool_latest_model_and_ctx(tp: &str) -> (String, u64) {
+    if tp.is_empty() {
+        return (String::new(), 0);
+    }
+    let Ok(meta) = fs::metadata(tp) else { return (String::new(), 0); };
+    if !meta.is_file() {
+        return (String::new(), 0);
+    }
+    let sz = meta.len();
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let sd = pretool_state_dir();
+    let cf = sd.join("ctx_stat_cache.json");
+    if let Ok(ctxt) = fs::read_to_string(&cf) {
+        let f = extract_top_level_fields(&ctxt, &["path", "sz", "mtime_ns", "ctx", "model"]);
+        if f.get("path").map(|s| s.as_str()) == Some(tp)
+            && f.get("sz").and_then(|s| s.parse::<u64>().ok()) == Some(sz)
+            && f.get("mtime_ns").and_then(|s| s.parse::<u128>().ok()) == Some(mtime_ns)
+            && f.contains_key("model")
+        {
+            return (
+                f.get("model").cloned().unwrap_or_default(),
+                f.get("ctx").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+            );
+        }
+    }
+    let Ok(mut fh) = File::open(tp) else { return (String::new(), 0); };
+    let start = sz.saturating_sub(24_576);
+    if start > 0 {
+        let _ = fh.seek(SeekFrom::Start(start));
+    }
+    let mut buf = Vec::new();
+    if fh.read_to_end(&mut buf).is_err() {
+        return (String::new(), 0);
+    }
+    let tail = String::from_utf8_lossy(&buf);
+    let mut ctx_found = 0u64;
+    let mut model_found = String::new();
+    for line in tail.lines().rev() {
+        if !line.contains("\"PLANNER_RESPONSE\"") {
+            continue;
+        }
+        let f = extract_top_level_fields(line, &["type", "input_tokens", "cache_read_tokens", "model"]);
+        if f.get("type").map(|s| s.as_str()) != Some("PLANNER_RESPONSE") {
+            continue;
+        }
+        let unc = f.get("input_tokens").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let cac = f.get("cache_read_tokens").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        if unc + cac > 0 {
+            ctx_found = unc + cac;
+            model_found = f.get("model").cloned().unwrap_or_default();
+            break;
+        }
+    }
+    let cache_body = format!(
+        "{{\"path\":\"{}\",\"sz\":{},\"mtime_ns\":{},\"ctx\":{},\"model\":\"{}\"}}",
+        json_escape(tp),
+        sz,
+        mtime_ns,
+        ctx_found,
+        json_escape(&model_found)
+    );
+    write_bytes_atomic(&cf, cache_body.as_bytes());
+    (model_found, ctx_found)
+}
+
+fn is_env_secret_basename(base: &str) -> bool {
+    let b = base.trim();
+    if b.eq_ignore_ascii_case(".env") {
+        return true;
+    }
+    if b.len() > 5 && b[..5].eq_ignore_ascii_case(".env.") {
+        let suffix = &b[5..];
+        if suffix.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-')) {
+            let low = suffix.to_ascii_lowercase();
+            return !matches!(low.as_str(), "example" | "sample" | "template" | "dist" | "schema");
+        }
+    }
+    false
+}
+
+fn is_token_word_sep(b: u8) -> bool {
+    !(b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn has_ascii_word_ci(hay: &[u8], word: &[u8]) -> Option<usize> {
+    if hay.len() < word.len() {
+        return None;
+    }
+    let mut i = 0usize;
+    while i + word.len() <= hay.len() {
+        let prev_ok = i == 0 || is_token_word_sep(hay[i - 1]);
+        let next_ok = i + word.len() == hay.len() || is_token_word_sep(hay[i + word.len()]);
+        if prev_ok && next_ok && hay[i..i + word.len()].eq_ignore_ascii_case(word) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_rm_root_or_home_target(tok: &str) -> bool {
+    if matches!(tok, "/" | "/*" | "~" | "$HOME") {
+        return true;
+    }
+    for pref in ["/home/", "/Users/", "/home\\", "/Users\\"] {
+        if let Some(rest) = tok.strip_prefix(pref) {
+            if !rest.is_empty() && !rest.contains('/') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_rm_rf_root_or_home(cmd: &str) -> bool {
+    // Check command boundaries (start, ;, &, |, newline)
+    let bytes = cmd.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        let at_start = i == 0 || matches!(bytes[i - 1], b';' | b'&' | b'|' | b'\n');
+        let skip_ws = if at_start {
+            let mut j = i;
+            while j < n && matches!(bytes[j], b' ' | b'\t') {
+                j += 1;
+            }
+            j
+        } else {
+            i += 1;
+            continue;
+        };
+        if skip_ws + 2 <= n && &bytes[skip_ws..skip_ws + 2] == b"rm" && (skip_ws + 2 == n || bytes[skip_ws + 2].is_ascii_whitespace()) {
+            let mut j = skip_ws + 2;
+            let mut has_r = false;
+            let mut has_f = false;
+            let mut end_opts = false;
+            while j < n {
+                while j < n && matches!(bytes[j], b' ' | b'\t') {
+                    j += 1;
+                }
+                if j >= n || matches!(bytes[j], b';' | b'&' | b'|' | b'\n') {
+                    break;
+                }
+                let tstart = j;
+                while j < n && !matches!(bytes[j], b' ' | b'\t' | b';' | b'&' | b'|' | b'\n') {
+                    j += 1;
+                }
+                let tok = &cmd[tstart..j];
+                if !end_opts && tok == "--" {
+                    end_opts = true;
+                    continue;
+                }
+                if !end_opts && tok.starts_with('-') && tok.len() > 1 && !tok.starts_with("--") {
+                    for ch in tok[1..].bytes() {
+                        if matches!(ch, b'r' | b'R') { has_r = true; }
+                        if matches!(ch, b'f' | b'F') { has_f = true; }
+                    }
+                    continue;
+                }
+                if !end_opts && tok == "--recursive" { has_r = true; continue; }
+                if !end_opts && tok == "--force" { has_f = true; continue; }
+                if has_r && has_f && is_rm_root_or_home_target(tok) {
+                    return true;
+                }
+            }
+        }
+        i = skip_ws + 1;
+    }
+    false
+}
+
+fn check_destructive_cmd(cmd: &str) -> Option<&'static str> {
+    if has_rm_rf_root_or_home(cmd) {
+        return Some("Recursive force-delete targeting root or home directory");
+    }
+    let low = cmd.to_ascii_lowercase();
+    let lb = low.as_bytes();
+    // SQL DROP TABLE/DATABASE/SCHEMA/VIEW or TRUNCATE TABLE
+    for seg in low.split(|c: char| matches!(c, ';' | '\n' | '|' | '&')) {
+        let toks: Vec<&str> = seg.split_whitespace().collect();
+        for w in toks.windows(2) {
+            if w[0] == "drop" && matches!(w[1], "table" | "database" | "schema" | "view") {
+                return Some("SQL DROP statement detected");
+            }
+            if w[0] == "truncate" && w[1] == "table" {
+                return Some("SQL TRUNCATE TABLE detected");
+            }
+            if w[0] == "gcloud" && toks.windows(3).any(|t3| t3 == ["gcloud", "projects", "delete"]) {
+                return Some("Destructive gcloud project deletion detected");
+            }
+            if w[0] == "gsutil" && w[1] == "rm" {
+                return Some("Cloud Storage deletion command detected");
+            }
+            if w[0] == "diskutil" && matches!(w[1], "erasedisk" | "erasevolume" | "partitiondisk") {
+                return Some("Raw disk/block device formatting or overwrite detected");
+            }
+        }
+        if toks.windows(3).any(|t3| t3 == ["gcloud", "storage", "rm"]) {
+            return Some("Cloud Storage deletion command detected");
+        }
+        if toks.contains(&"git") && toks.contains(&"push") && (toks.contains(&"--force") || toks.contains(&"-f")) && (toks.contains(&"main") || toks.contains(&"master")) {
+            return Some("Force-push to main/master branch detected");
+        }
+        if toks.iter().any(|t| t.starts_with("mkfs.") && t.len() > 5) {
+            return Some("Raw disk/block device formatting or overwrite detected");
+        }
+        if toks.contains(&"dd") && toks.iter().any(|t| t.starts_with("if=")) && toks.iter().any(|t| t.starts_with("of=/dev/")) {
+            return Some("Raw disk/block device formatting or overwrite detected");
+        }
+    }
+    let _ = (lb, has_ascii_word_ci as fn(&[u8], &[u8]) -> Option<usize>);
+    None
+}
+
+fn contains_kekkai_sensitive(cmd: &str) -> bool {
+    if env::var("WM_HUGINN_KEKKAI_OFF").ok().as_deref() == Some("1") {
+        return false;
+    }
+    let sock = PathBuf::from(
+        env::var("WM_TRICAMERAL_SOCK_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/tmp".to_string()),
+    )
+    .join("wm_huginn.sock");
+    if !sock.exists() {
+        return false;
+    }
+    let low = cmd.to_ascii_lowercase();
+    [".ssh/", "id_ed25519", "id_rsa", ".aws/credentials", "/etc/shadow", "curl", "wget", "landlock", "seccomp"]
+        .iter()
+        .any(|pat| low.contains(pat))
+}
+
+fn posix_normpath(path: &str) -> String {
+    let is_abs = path.starts_with('/');
+    let mut comps: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            if !comps.is_empty() && comps.last() != Some(&"..") {
+                comps.pop();
+            } else if !is_abs {
+                comps.push("..");
+            }
+        } else {
+            comps.push(part);
+        }
+    }
+    if is_abs {
+        format!("/{}", comps.join("/"))
+    } else if comps.is_empty() {
+        ".".to_string()
+    } else {
+        comps.join("/")
+    }
+}
+
+fn expand_tilde(raw: &str) -> String {
+    let s = raw.trim();
+    if s == "~" {
+        return env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return format!("{}/{}", home.trim_end_matches('/'), rest);
+        }
+    }
+    s.to_string()
+}
+
+fn is_wide_line_file_rs(path: &Path, size: u64) -> bool {
+    if size <= 24_576 {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else { return false; };
+    let mut buf = vec![0u8; 8192];
+    let Ok(n) = f.read(&mut buf) else { return false; };
+    if n == 0 || buf[..n.min(1024)].contains(&0) {
+        return false;
+    }
+    let nl = buf[..n].iter().filter(|&&b| b == b'\n').count();
+    nl == 0 || (n as f64 / nl.max(1) as f64) > 400.0
+}
+
+fn file_exceeds_lines_rs(path: &Path, threshold: usize, size: u64) -> bool {
+    if size <= 4096 {
+        return false;
+    }
+    if size > 32_768 {
+        return true;
+    }
+    let Ok(mut f) = File::open(path) else { return false; };
+    let mut buf = vec![0u8; 32_768];
+    let Ok(n) = f.read(&mut buf) else { return false; };
+    if buf[..n.min(1024)].contains(&0) {
+        return false;
+    }
+    buf[..n].iter().filter(|&&b| b == b'\n').count() > threshold
+}
+
+fn parse_burst_entries(raw: &str) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    let trim = raw.trim();
+    if !trim.starts_with('[') {
+        return out;
+    }
+    for elem in extract_json_array_elements(trim, 64) {
+        let items = extract_json_array_elements(&elem, 2);
+        if items.len() == 2 {
+            if let Ok(step) = items[1].trim().parse::<i64>() {
+                out.push((items[0].clone(), step));
+            }
+        }
+    }
+    out
+}
+
+fn track_and_check_burst_rs(conv_id: &str, abs_path: &str, step_idx: i64) -> bool {
+    if conv_id.is_empty() || step_idx <= 0 {
+        return false;
+    }
+    let san = pretool_san_id(conv_id);
+    let bf = pretool_state_dir().join(format!("burst_{}.json", san));
+    let mut kept = Vec::new();
+    if let Ok(txt) = fs::read_to_string(&bf) {
+        for (p, s) in parse_burst_entries(&txt) {
+            if step_idx >= s && (step_idx - s) <= 10 {
+                kept.push((p, s));
+            }
+        }
+    }
+    let mut distinct: Vec<&str> = kept.iter().map(|(p, _)| p.as_str()).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let triggered = distinct.len() >= 4;
+    kept.push((abs_path.to_string(), step_idx));
+    if kept.len() > 32 {
+        kept.drain(0..kept.len() - 32);
+    }
+    let body = format!(
+        "[{}]",
+        kept.iter()
+            .map(|(p, s)| format!("[\"{}\",{}]", json_escape(p), s))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    write_bytes_atomic(&bf, body.as_bytes());
+    triggered
+}
+
+fn check_and_record_read_dedup_rs(
+    conv_id: &str,
+    abs_path: &str,
+    s_key: &str,
+    e_key: &str,
+    step_idx: i64,
+    cur_ctx: u64,
+    mtime_ns: u128,
+    size: u64,
+) -> Option<String> {
+    if conv_id.is_empty() || env::var("WM_READ_DEDUP_OFF").ok().as_deref() == Some("1") {
+        return None;
+    }
+    let san = pretool_san_id(conv_id);
+    let sf = pretool_state_dir().join(format!("{}.json", san));
+    let mut entries: Vec<(String, u128, u64, i64, u64)> = Vec::new();
+    if let Ok(txt) = fs::read_to_string(&sf) {
+        for (k, v) in extract_json_object_entries(&txt) {
+            let f = extract_top_level_fields(&v, &["mtime_ns", "size", "step", "ctx"]);
+            let m = f.get("mtime_ns").and_then(|x| x.parse::<u128>().ok()).unwrap_or(0);
+            let sz = f.get("size").and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+            let st = f.get("step").and_then(|x| x.parse::<i64>().ok()).unwrap_or(-999);
+            let cx = f.get("ctx").and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+            entries.push((k, m, sz, st, cx));
+        }
+    }
+    let key = format!("{}|{}|{}", abs_path, s_key, e_key);
+    let mut reason: Option<String> = None;
+    if let Some((_, pm, psz, pstep, pctx)) = entries.iter().find(|e| e.0 == key) {
+        let unchanged = *pm == mtime_ns && *psz == size;
+        let not_compacted = *pctx == 0 || cur_ctx == 0 || cur_ctx >= (*pctx * 85) / 100;
+        let recent = (step_idx - *pstep) <= 20 && step_idx > *pstep;
+        if unchanged && not_compacted && recent {
+            let base = Path::new(abs_path).file_name().and_then(|s| s.to_str()).unwrap_or(abs_path);
+            let s_disp = if s_key == "None" { "1" } else { s_key };
+            let e_disp = if e_key == "None" { "EOF" } else { e_key };
+            reason = Some(format!(
+                "[Read-Dedup Guard] `{}` (L{}-{}) was already read unchanged at step {}. Reuse from existing context or pass a different StartLine/EndLine.",
+                base, s_disp, e_disp, pstep
+            ));
+        }
+    }
+    entries.retain(|e| e.0 != key);
+    entries.push((key, mtime_ns, size, step_idx, cur_ctx));
+    if entries.len() > 128 {
+        entries.sort_by_key(|e| e.3);
+        let drop = entries.len() - 96;
+        entries.drain(0..drop);
+    }
+    let serialized = format!(
+        "{{{}}}",
+        entries
+            .iter()
+            .map(|(k, m, sz, st, cx)| format!(
+                "\"{}\":{{\"mtime_ns\":{},\"size\":{},\"step\":{},\"ctx\":{}}}",
+                json_escape(k),
+                m,
+                sz,
+                st,
+                cx
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    write_bytes_atomic(&sf, serialized.as_bytes());
+    reason
+}
+
+fn split_ext_lower(name: &str) -> (String, String) {
+    let low = name.to_ascii_lowercase();
+    if let Some(dot) = low.rfind('.') {
+        if dot > 0 {
+            return (low[..dot].to_string(), low[dot..].to_string());
+        }
+    }
+    (low, String::new())
+}
+
+fn split_name_tokens_rs(stem: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in stem.chars() {
+        if ch.is_alphanumeric() {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn score_filename_rs(cand: &str, target: &str) -> f64 {
+    let cl = cand.to_ascii_lowercase();
+    let tl = target.to_ascii_lowercase();
+    if cl == tl {
+        return 100.0;
+    }
+    let (c_stem, c_ext) = split_ext_lower(&cl);
+    let (t_stem, t_ext) = split_ext_lower(&tl);
+    let mut score = 0.0;
+    if !t_ext.is_empty() && c_ext == t_ext {
+        score += 10.0;
+    }
+    if !t_stem.is_empty() && !c_stem.is_empty() {
+        if c_stem.contains(&t_stem) || t_stem.contains(&c_stem) {
+            score += 22.0;
+        }
+        let pref = c_stem.bytes().zip(t_stem.bytes()).take_while(|(a, b)| a == b).count();
+        if pref >= 2 {
+            score += (pref.min(12) as f64) * 3.0;
+        }
+        let t_toks: Vec<String> = split_name_tokens_rs(&t_stem).into_iter().filter(|t| t.len() >= 2).collect();
+        if !t_toks.is_empty() {
+            let c_toks = split_name_tokens_rs(&c_stem);
+            let mut hits = 0usize;
+            for tt in &t_toks {
+                if c_toks.contains(tt) {
+                    hits += 1;
+                }
+            }
+            score += 8.0 * (hits as f64);
+        }
+        let mut c_chars: Vec<char> = c_stem.chars().collect();
+        c_chars.sort_unstable();
+        c_chars.dedup();
+        let mut t_chars: Vec<char> = t_stem.chars().collect();
+        t_chars.sort_unstable();
+        t_chars.dedup();
+        let inter = c_chars.iter().filter(|c| t_chars.contains(c)).count();
+        let uni = c_chars.len() + t_chars.len() - inter;
+        if uni > 0 {
+            score += 8.0 * (inter as f64) / (uni as f64);
+        }
+    }
+    score
+}
+
+fn missing_path_hint_rs(p_str: &str, raw_path: &str) -> String {
+    let p = Path::new(p_str);
+    let ignored = |name: &str| matches!(name, ".git" | "node_modules" | "__pycache__" | ".DS_Store");
+    if p.is_dir() {
+        let mut items = Vec::new();
+        if let Ok(rd) = fs::read_dir(p) {
+            for (idx, ent) in rd.enumerate() {
+                if idx >= 80 { break; }
+                if let Ok(e) = ent {
+                    let nm = e.file_name().to_string_lossy().into_owned();
+                    if ignored(&nm) { continue; }
+                    let is_d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    items.push(if is_d { format!("{}/", nm) } else { nm });
+                }
+            }
+        }
+        items.sort();
+        let total = items.len();
+        let shown: Vec<String> = items.into_iter().take(10).collect();
+        let base = p.file_name().and_then(|s| s.to_str()).unwrap_or(p_str);
+        return if shown.is_empty() {
+            format!("[Path Hint] `{}` is a directory, not a file. Directory is empty.", base)
+        } else {
+            let suffix = if total > 10 { format!(" (+{} more)", total - 10) } else { String::new() };
+            format!("[Path Hint] `{}` is a directory, not a file. Entries: {}{}.", base, shown.join(", "), suffix)
+        };
+    }
+
+    let parent = p.parent();
+    let target_name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let gp = parent.and_then(|par| par.parent()).filter(|g| !g.as_os_str().is_empty());
+    let gp_hit = gp.and_then(|g| {
+        if g.is_dir() && !target_name.is_empty() {
+            let cand = g.join(target_name);
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+        None
+    });
+
+    if let Some(par) = parent.filter(|par| !par.as_os_str().is_empty() && par.is_dir()) {
+        let mut scored: Vec<(i64, String, String)> = Vec::new();
+        if let Ok(rd) = fs::read_dir(par) {
+            for (idx, ent) in rd.enumerate() {
+                if idx >= 100 { break; }
+                if let Ok(e) = ent {
+                    let nm = e.file_name().to_string_lossy().into_owned();
+                    if ignored(&nm) { continue; }
+                    let is_d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let disp = if is_d { format!("{}/", nm) } else { nm.clone() };
+                    let sc = (score_filename_rs(&nm, target_name) * 1000.0) as i64;
+                    scored.push((-sc, disp.to_ascii_lowercase(), disp));
+                }
+            }
+        }
+        scored.sort();
+        let best: Vec<String> = scored.into_iter().take(4).map(|x| x.2).collect();
+        let p_disp = par.file_name().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or_else(|| par.to_str().unwrap_or(""));
+        let mut msg = format!("[Path Hint] File does not exist: `{}`.", raw_path);
+        if best.is_empty() {
+            let _ = write!(msg, " `{}/` has no matching entries.", p_disp);
+        } else {
+            let _ = write!(msg, " Closest in `{}/`: {}.", p_disp, best.join(", "));
+        }
+        if let Some(gh) = gp_hit {
+            let _ = write!(msg, " Found `{}` in parent dir: `{}`.", target_name, gh);
+        }
+        return msg;
+    }
+
+    if let Some(g) = gp.filter(|g| g.is_dir()) {
+        let p_base = parent.and_then(|par| par.file_name()).and_then(|s| s.to_str()).unwrap_or("");
+        let mut scored: Vec<(i64, String, String)> = Vec::new();
+        if let Ok(rd) = fs::read_dir(g) {
+            for (idx, ent) in rd.enumerate() {
+                if idx >= 60 { break; }
+                if let Ok(e) = ent {
+                    let nm = e.file_name().to_string_lossy().into_owned();
+                    if ignored(&nm) { continue; }
+                    let is_d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let disp = if is_d { format!("{}/", nm) } else { nm.clone() };
+                    let sc = (score_filename_rs(&nm, p_base) * 1000.0) as i64;
+                    scored.push((-sc, disp.to_ascii_lowercase(), disp));
+                }
+            }
+        }
+        scored.sort();
+        let gp_best: Vec<String> = scored.into_iter().take(4).map(|x| x.2).collect();
+        let par_s = parent.and_then(|x| x.to_str()).unwrap_or("");
+        let mut msg = format!("[Path Hint] Parent directory does not exist: `{}`.", par_s);
+        if let Some(gh) = gp_hit {
+            let _ = write!(msg, " Found `{}` at `{}`.", target_name, gh);
+        } else if !gp_best.is_empty() {
+            let _ = write!(msg, " Closest in `{}/`: {}.", g.display(), gp_best.join(", "));
+        }
+        return msg;
+    }
+
+    format!("[Path Hint] File and parent directory do not exist: `{}`.", raw_path)
+}
+
+fn handle_read_file_rs(args: &HashMap<String, String>, transcript: &str, conv_id: &str, step_idx: i64, cwd: &str) {
+    let raw_path = args.get("Path").or_else(|| args.get("path")).map(|s| s.as_str()).unwrap_or("");
+    if raw_path.is_empty() {
+        pretool_allow();
+        return;
+    }
+    let low = raw_path.to_ascii_lowercase();
+    let media_exts = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".pdf"];
+    if media_exts.iter().any(|ext| low.ends_with(ext)) {
+        let (_, cur_ctx) = pretool_latest_model_and_ctx(transcript);
+        if cur_ctx >= 150_000 {
+            let reason = format!(
+                "[Multimodal Cache Guard] Session context is ~{}k tokens. Loading media inline invalidates Gemini 4 prompt cache (3-7x TTFT spike). Prefer delegating visual inspection to a read-only subagent, or approve to load inline.",
+                cur_ctx / 1000
+            );
+            pretool_decision("force_ask", &reason);
+            return;
+        }
+        pretool_allow();
+        return;
+    }
+
+    let binary_exts = [
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".pdf", ".zip", ".gz", ".tar",
+        ".zst", ".xz", ".bz2", ".bin", ".exe", ".so", ".dylib", ".dll", ".o", ".a",
+        ".wasm", ".sqlite", ".db", ".gguf", ".safetensors", ".pt", ".pth", ".mp3", ".mp4", ".wav",
+    ];
+    if raw_path.contains("/.system_generated/") || binary_exts.iter().any(|ext| low.ends_with(ext)) {
+        pretool_allow();
+        return;
+    }
+
+    let p_exp = expand_tilde(raw_path);
+    let p_str = if Path::new(&p_exp).is_absolute() {
+        posix_normpath(&p_exp)
+    } else if !cwd.is_empty() && Path::new(cwd).is_dir() {
+        posix_normpath(&format!("{}/{}", cwd.trim_end_matches('/'), p_exp))
+    } else if Path::new(&p_exp).exists() {
+        fs::canonicalize(&p_exp)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| p_exp.clone())
+    } else {
+        pretool_allow();
+        return;
+    };
+
+    let p_obj = Path::new(&p_str);
+    if !p_obj.is_file() {
+        if env::var("WM_READ_HINT_OFF").ok().as_deref() == Some("1") {
+            pretool_allow();
+            return;
+        }
+        let hint = missing_path_hint_rs(&p_str, raw_path);
+        pretool_decision("deny", &hint);
+        return;
+    }
+
+    let Ok(st) = fs::metadata(p_obj) else { pretool_allow(); return; };
+    let size = st.len();
+    let mtime_ns = st.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
+    let abs_p = fs::canonicalize(p_obj).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| p_str.clone());
+
+    let mut s_int = args.get("StartLine").and_then(|v| v.trim().parse::<i64>().ok());
+    let mut e_int = args.get("EndLine").and_then(|v| v.trim().parse::<i64>().ok());
+    let has_byte_offset = args.contains_key("ByteOffset");
+    let mut ow_start: Option<i64> = None;
+    let mut ow_end: Option<i64> = None;
+    let mut cur_ctx = 0u64;
+
+    if !has_byte_offset && env::var("WM_READ_CLAMP_OFF").ok().as_deref() != Some("1") {
+        if let Some(s) = s_int {
+            if s < 1 {
+                s_int = Some(1);
+                ow_start = Some(1);
+            }
+        }
+        let inverted = matches!((s_int, e_int), (Some(s), Some(e)) if e < s);
+        let span = match (s_int, e_int, inverted) {
+            (Some(s), Some(e), false) => Some(e - s + 1),
+            _ => None,
+        };
+        let wide_lines = (inverted || span.map(|sp| sp > 50).unwrap_or(true)) && is_wide_line_file_rs(p_obj, size);
+        let compact_lim = if wide_lines { 50 } else { 150 };
+        let already_compact = !inverted && span.map(|sp| sp <= compact_lim).unwrap_or(false);
+
+        if !already_compact {
+            cur_ctx = pretool_latest_model_and_ctx(transcript).1;
+            let (mut max_span, mut clamp_trigger) = if cur_ctx >= 160_000 {
+                (100i64, 150i64)
+            } else if cur_ctx >= 120_000 {
+                (150i64, 200i64)
+            } else {
+                (200i64, 250i64)
+            };
+            if wide_lines {
+                max_span = max_span.min(50);
+                clamp_trigger = clamp_trigger.min(60);
+            }
+            let is_large = wide_lines || file_exceeds_lines_rs(p_obj, clamp_trigger as usize, size);
+            if is_large && !conv_id.is_empty() && step_idx > 0 {
+                if track_and_check_burst_rs(conv_id, &abs_p, step_idx) {
+                    max_span = max_span.min(if wide_lines { 50 } else { 120 });
+                }
+            }
+
+            if inverted {
+                let s = s_int.unwrap();
+                let e = e_int.unwrap();
+                if (1..=250).contains(&e) {
+                    let ne = s + e.min(max_span) - 1;
+                    e_int = Some(ne);
+                    ow_end = Some(ne);
+                } else if e > 250 {
+                    let new_s = e;
+                    let new_e = s.min(new_s + max_span - 1);
+                    s_int = Some(new_s);
+                    e_int = Some(new_e);
+                    ow_start = Some(new_s);
+                    ow_end = Some(new_e);
+                } else {
+                    let ne = s + max_span - 1;
+                    e_int = Some(ne);
+                    ow_end = Some(ne);
+                }
+            } else if s_int.is_none() && e_int.is_none() {
+                if is_large {
+                    s_int = Some(1);
+                    e_int = Some(max_span);
+                    ow_start = Some(1);
+                    ow_end = Some(max_span);
+                }
+            } else if s_int.is_some() && e_int.is_none() {
+                if is_large {
+                    let ne = s_int.unwrap() + max_span - 1;
+                    e_int = Some(ne);
+                    ow_end = Some(ne);
+                }
+            } else if let (Some(s), Some(e)) = (s_int, e_int) {
+                if (e - s + 1) > clamp_trigger {
+                    let ne = s + max_span - 1;
+                    e_int = Some(ne);
+                    ow_end = Some(ne);
+                }
+            } else if s_int.is_none() && e_int.is_some() {
+                let e = e_int.unwrap();
+                if e < 1 {
+                    e_int = Some(max_span);
+                    ow_end = Some(max_span);
+                } else if is_large && e > clamp_trigger {
+                    s_int = Some(1);
+                    e_int = Some(max_span);
+                    ow_start = Some(1);
+                    ow_end = Some(max_span);
+                }
+            }
+        }
+    }
+
+    if !conv_id.is_empty() && step_idx > 0 {
+        if cur_ctx == 0 && !transcript.is_empty() {
+            cur_ctx = pretool_latest_model_and_ctx(transcript).1;
+        }
+        let s_key = s_int.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string());
+        let e_key = e_int.map(|v| v.to_string()).unwrap_or_else(|| "None".to_string());
+        if let Some(reason) = check_and_record_read_dedup_rs(conv_id, &abs_p, &s_key, &e_key, step_idx, cur_ctx, mtime_ns, size) {
+            pretool_decision("deny", &reason);
+            return;
+        }
+    }
+
+    match (ow_start, ow_end) {
+        (Some(s), Some(e)) => println!("{{\"decision\":\"allow\",\"overwrite\":{{\"StartLine\":{},\"EndLine\":{}}}}}", s, e),
+        (Some(s), None) => println!("{{\"decision\":\"allow\",\"overwrite\":{{\"StartLine\":{}}}}}", s),
+        (None, Some(e)) => println!("{{\"decision\":\"allow\",\"overwrite\":{{\"EndLine\":{}}}}}", e),
+        (None, None) => pretool_allow(),
+    }
+}
+
+fn handle_manage_task_rs(args: &HashMap<String, String>, conv_id: &str, step_idx: i64) {
+    if env::var("WM_POLL_GUARD_OFF").ok().as_deref() == Some("1") {
+        pretool_allow();
+        return;
+    }
+    let action = args.get("Action").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let task_id = args.get("TaskId").map(|s| s.trim()).unwrap_or("");
+    if action != "status" || task_id.is_empty() || conv_id.is_empty() {
+        pretool_allow();
+        return;
+    }
+    let san = pretool_san_id(conv_id);
+    let pf = pretool_state_dir().join(format!("poll_{}.json", san));
+    let mut entries: Vec<(String, i64, i64)> = Vec::new();
+    if let Ok(txt) = fs::read_to_string(&pf) {
+        for (k, v) in extract_json_object_entries(&txt) {
+            let f = extract_top_level_fields(&v, &["count", "last_step"]);
+            let c = f.get("count").and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+            let ls = f.get("last_step").and_then(|x| x.parse::<i64>().ok()).unwrap_or(-999);
+            entries.push((k, c, ls));
+        }
+    }
+    let mut cnt = 1i64;
+    if let Some((_, prev_c, prev_step)) = entries.iter().find(|e| e.0 == task_id) {
+        if step_idx > 0 && (step_idx - *prev_step) <= 12 && step_idx > *prev_step {
+            cnt = *prev_c + 1;
+        }
+    }
+    entries.retain(|e| e.0 != task_id);
+    entries.push((task_id.to_string(), cnt, step_idx));
+    if entries.len() > 32 {
+        entries.sort_by_key(|e| e.2);
+        let drop = entries.len() - 24;
+        entries.drain(0..drop);
+    }
+    let serialized = format!(
+        "{{{}}}",
+        entries
+            .iter()
+            .map(|(k, c, ls)| format!("\"{}\":{{\"count\":{},\"last_step\":{}}}", json_escape(k), c, ls))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    write_bytes_atomic(&pf, serialized.as_bytes());
+    if cnt >= 3 {
+        let reason = format!(
+            "[Anti-Poll Guard] Checked status of {} {} times within 12 steps. Stop polling in a loop — end your turn or do other work; background tasks notify you automatically on completion.",
+            task_id, cnt
+        );
+        pretool_decision("deny", &reason);
+    } else {
+        pretool_allow();
+    }
+}
+
+fn handle_swarm_and_subagent_rs(tool_name: &str, args: &HashMap<String, String>, transcript: &str) {
+    if env::var("WM_SWARM_GUARD_OFF").ok().as_deref() == Some("1") {
+        pretool_allow();
+        return;
+    }
+    if tool_name == "swarm" {
+        let action = args.get("action").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+        if action == "add" {
+            let fork_arg = args.get("fork").map(|s| s.trim()).unwrap_or("");
+            let model_arg = args.get("model").map(|s| s.trim()).unwrap_or("");
+            let brief_txt = args.get("brief").map(|s| s.as_str()).unwrap_or("");
+            if !fork_arg.is_empty() {
+                let (_, cur_ctx) = pretool_latest_model_and_ctx(transcript);
+                if cur_ctx >= 80_000 {
+                    let reason = format!(
+                        "[Swarm Fork Guard] Coordinator context is ~{}k tokens. Forking copies this context onto every worker. Omit `fork` and pass a compact fresh brief + shared codemap (`wm-handoff --swarm-map`), or confirm to fork anyway.",
+                        cur_ctx / 1000
+                    );
+                    pretool_decision("force_ask", &reason);
+                    return;
+                }
+            }
+            if model_arg.is_empty() {
+                let (cur_model, _) = pretool_latest_model_and_ctx(transcript);
+                if cur_model.to_ascii_lowercase().contains("neon") {
+                    pretool_decision(
+                        "force_ask",
+                        "[Swarm Model Guard] Coordinator is on Neon and `model` is omitted — spawned worker would inherit Neon (~3.1x burn). Pass `model: \"gemini-4-hydrogen-high\"` (or `xhigh` for complex debugging), or confirm to spawn on Neon.",
+                    );
+                    return;
+                }
+            }
+            if brief_txt.chars().count() > 6000 {
+                let reason = format!(
+                    "[Swarm Brief Guard] Brief is {:.1} KB (>6 KB), bloating the shared board for every member. Write details to a file and pass a <=150-token pointer brief, or confirm to post inline.",
+                    brief_txt.len() as f64 / 1024.0
+                );
+                pretool_decision("force_ask", &reason);
+                return;
+            }
+        }
+        pretool_allow();
+        return;
+    }
+    if tool_name == "post_message" {
+        let msg = args
+            .get("message")
+            .or_else(|| args.get("content"))
+            .or_else(|| args.get("body"))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if msg.chars().count() > 4000 {
+            let reason = format!(
+                "[Board Bloat Guard] Board message is {:.1} KB (>4 KB). Write full logs/tables to a file and post a <=150-token CPR pointer receipt, or confirm to post inline.",
+                msg.len() as f64 / 1024.0
+            );
+            pretool_decision("force_ask", &reason);
+            return;
+        }
+        pretool_allow();
+        return;
+    }
+    if tool_name == "invoke_subagent" {
+        let tname = args.get("TypeName").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+        let marg = args.get("Model").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+        if tname == "research" && (marg.is_empty() || marg == "inherit") {
+            let (cur_model, _) = pretool_latest_model_and_ctx(transcript);
+            if cur_model.to_ascii_lowercase().contains("neon") {
+                if env::var("WM_SUBAGENT_AUTO_FLASH").ok().as_deref() == Some("1") {
+                    println!("{{\"decision\":\"allow\",\"overwrite\":{{\"Model\":\"flash\"}}}}");
+                    return;
+                }
+                pretool_decision(
+                    "force_ask",
+                    "[Subagent Model Guard] Parent is on Neon and `research` subagent uses `Model=\"inherit\"` (would run read-only research on Neon). Pass `Model=\"flash\"` (or set `WM_SUBAGENT_AUTO_FLASH=1`), or confirm to run on Neon.",
+                );
+                return;
+            }
+        }
+        pretool_allow();
+        return;
+    }
+    pretool_allow();
+}
+
+fn handle_whitemagic_mcp_rs(tool_name: &str, args: &HashMap<String, String>) {
+    match tool_name {
+        "mcp_whitemagic_session_continuity" | "mcp_whitemagic_whitemagic_gen3_session_continuity" => {
+            let tb = args.get("token_budget").and_then(|v| v.trim().parse::<f64>().ok());
+            if tb.is_none() || tb.map(|v| v > 2000.0).unwrap_or(false) {
+                println!("{{\"decision\":\"allow\",\"overwrite\":{{\"token_budget\":1200}}}}");
+            } else {
+                pretool_allow();
+            }
+        }
+        "mcp_whitemagic_memory_recall" => {
+            let lim = args.get("limit").and_then(|v| v.trim().parse::<f64>().ok());
+            let mcb = args.get("max_content_bytes").and_then(|v| v.trim().parse::<f64>().ok());
+            let set_lim = lim.is_none() || lim.map(|v| v > 6.0).unwrap_or(false);
+            let set_mcb = mcb.is_none() || mcb.map(|v| v > 1200.0).unwrap_or(false);
+            match (set_lim, set_mcb) {
+                (true, true) => println!("{{\"decision\":\"allow\",\"overwrite\":{{\"limit\":5,\"max_content_bytes\":900}}}}"),
+                (true, false) => println!("{{\"decision\":\"allow\",\"overwrite\":{{\"limit\":5}}}}"),
+                (false, true) => println!("{{\"decision\":\"allow\",\"overwrite\":{{\"max_content_bytes\":900}}}}"),
+                (false, false) => pretool_allow(),
+            }
+        }
+        "mcp_whitemagic_whitemagic_gen3_memory_recall" => {
+            let lim = args.get("limit").and_then(|v| v.trim().parse::<f64>().ok());
+            if lim.is_none() || lim.map(|v| v > 6.0).unwrap_or(false) {
+                println!("{{\"decision\":\"allow\",\"overwrite\":{{\"limit\":5}}}}");
+            } else {
+                pretool_allow();
+            }
+        }
+        "mcp_wm-research-engine_research_hunt" => {
+            let lim = args.get("limit").and_then(|v| v.trim().parse::<f64>().ok());
+            if lim.map(|v| v > 8.0).unwrap_or(false) {
+                println!("{{\"decision\":\"allow\",\"overwrite\":{{\"limit\":8}}}}");
+            } else {
+                pretool_allow();
+            }
+        }
+        "mcp_firecrawl_firecrawl_scrape" => {
+            if !args.contains_key("markdown_only") && !args.contains_key("format") {
+                println!("{{\"decision\":\"allow\",\"overwrite\":{{\"markdown_only\":true}}}}");
+            } else {
+                pretool_allow();
+            }
+        }
+        _ => pretool_allow(),
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-')) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn strip_trailing_redirs_rs(s: &str) -> &str {
+    let mut cur = s.trim();
+    loop {
+        let mut stripped = false;
+        for suf in ["2>&1", "2>/dev/null"] {
+            if let Some(pref) = cur.strip_suffix(suf) {
+                if pref.is_empty() || pref.ends_with(|c: char| c.is_whitespace()) {
+                    cur = pref.trim_end();
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    cur
+}
+
+fn strip_unquoted_line_cont_rs(s: &str) -> String {
+    if !s.contains("\\\n") && !s.contains("\\\r\n") {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut in_s = false;
+    let mut in_d = false;
+    let mut i = 0usize;
+    while i < n {
+        let ch = b[i];
+        if in_s {
+            if ch == b'\'' { in_s = false; }
+            if let Some(c) = s[i..].chars().next() { out.push(c); i += c.len_utf8(); } else { break; }
+            continue;
+        }
+        if ch == b'\\' {
+            if i + 1 < n && b[i + 1] == b'\n' { out.push(' '); i += 2; continue; }
+            if i + 2 < n && b[i + 1] == b'\r' && b[i + 2] == b'\n' { out.push(' '); i += 3; continue; }
+            if i + 1 < n {
+                out.push('\\');
+                if let Some(c) = s[i + 1..].chars().next() { out.push(c); i += 1 + c.len_utf8(); } else { i += 1; }
+                continue;
+            }
+        }
+        if ch == b'\'' && !in_d { in_s = true; }
+        else if ch == b'"' { in_d = !in_d; }
+        if let Some(c) = s[i..].chars().next() { out.push(c); i += c.len_utf8(); } else { break; }
+    }
+    out
+}
+
+fn has_unsafe_shell_meta_rs(s: &str) -> bool {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut in_s = false;
+    let mut in_d = false;
+    let mut esc = false;
+    for i in 0..n {
+        let ch = b[i];
+        if esc { esc = false; continue; }
+        if in_s { if ch == b'\'' { in_s = false; } continue; }
+        if in_d {
+            if ch == b'\\' { esc = true; }
+            else if ch == b'"' { in_d = false; }
+            else if matches!(ch, b'\n' | b'$' | b'`') { return true; }
+            continue;
+        }
+        match ch {
+            b'\\' => esc = true,
+            b'\'' => in_s = true,
+            b'"' => in_d = true,
+            b'|' | b'>' | b'<' | b';' | b'`' | b'\n' | b'$' | b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b'(' | b')' => return true,
+            b'&' => {
+                let prev = i > 0 && b[i - 1] == b'&';
+                let next = i + 1 < n && b[i + 1] == b'&';
+                if !(prev ^ next) { return true; }
+            }
+            b'~' => {
+                if i == 0 || b[i - 1].is_ascii_whitespace() { return true; }
+            }
+            _ => {}
+        }
+    }
+    in_s || in_d || esc
+}
+
+fn split_top_level_and_rs(s: &str) -> Option<Vec<String>> {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_s = false;
+    let mut in_d = false;
+    let mut esc = false;
+    let mut i = 0usize;
+    while i < n {
+        let ch = b[i];
+        if esc {
+            if let Some(c) = s[i..].chars().next() { cur.push(c); esc = false; i += c.len_utf8(); } else { break; }
+            continue;
+        }
+        if in_s {
+            if ch == b'\'' { in_s = false; }
+            if let Some(c) = s[i..].chars().next() { cur.push(c); i += c.len_utf8(); } else { break; }
+            continue;
+        }
+        if in_d {
+            if ch == b'\\' { esc = true; cur.push('\\'); i += 1; continue; }
+            if ch == b'"' { in_d = false; }
+            if let Some(c) = s[i..].chars().next() { cur.push(c); i += c.len_utf8(); } else { break; }
+            continue;
+        }
+        if ch == b'\\' { esc = true; cur.push('\\'); i += 1; continue; }
+        if ch == b'\'' { in_s = true; cur.push('\''); i += 1; continue; }
+        if ch == b'"' { in_d = true; cur.push('"'); i += 1; continue; }
+        if ch == b'&' && i + 1 < n && b[i + 1] == b'&' {
+            if i + 2 < n && b[i + 2] == b'&' { return None; }
+            parts.push(cur.trim().to_string());
+            cur.clear();
+            i += 2;
+            continue;
+        }
+        if let Some(c) = s[i..].chars().next() { cur.push(c); i += c.len_utf8(); } else { break; }
+    }
+    if in_s || in_d || esc {
+        return None;
+    }
+    parts.push(cur.trim().to_string());
+    Some(parts)
+}
+
+fn posix_shlex_split(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut has_tok = false;
+    let mut in_s = false;
+    let mut in_d = false;
+    let mut esc = false;
+    for ch in s.chars() {
+        if esc {
+            if in_d && !matches!(ch, '$' | '`' | '"' | '\\' | '\n') {
+                cur.push('\\');
+            }
+            cur.push(ch);
+            has_tok = true;
+            esc = false;
+            continue;
+        }
+        if in_s {
+            if ch == '\'' { in_s = false; } else { cur.push(ch); }
+            has_tok = true;
+            continue;
+        }
+        if in_d {
+            match ch {
+                '\\' => { esc = true; has_tok = true; }
+                '"' => { in_d = false; has_tok = true; }
+                _ => { cur.push(ch); has_tok = true; }
+            }
+            continue;
+        }
+        match ch {
+            '\\' => { esc = true; has_tok = true; }
+            '\'' => { in_s = true; has_tok = true; }
+            '"' => { in_d = true; has_tok = true; }
+            c if c.is_whitespace() => {
+                if has_tok {
+                    out.push(std::mem::take(&mut cur));
+                    has_tok = false;
+                }
+            }
+            _ => { cur.push(ch); has_tok = true; }
+        }
+    }
+    if esc || in_s || in_d {
+        return None;
+    }
+    if has_tok {
+        out.push(cur);
+    }
+    Some(out)
+}
+
+fn is_pretool_safe_squeezable(cmd_base: &str, cmd_args: &[String]) -> bool {
+    match cmd_base {
+        "git" => {
+            let mut i = 0;
+            while i < cmd_args.len() {
+                let a = cmd_args[i].as_str();
+                if a == "-c" || a == "--paginate" || a.starts_with("-c") || a.starts_with("--exec-path") || a.starts_with("--config-env") || a.starts_with("--upload-pack") {
+                    return false;
+                }
+                if a == "-C" { i += 2; continue; }
+                if a.starts_with('-') { i += 1; continue; }
+                let nxt = cmd_args.get(i + 1).map(|x| x.as_str()).unwrap_or("");
+                if matches!(a, "status" | "diff" | "log" | "show" | "ls-files" | "blame" | "shortlog") {
+                    return true;
+                }
+                if a == "branch" && !cmd_args[i + 1..].iter().any(|x| matches!(x.as_str(), "-d" | "-D" | "-m" | "-M" | "--delete")) {
+                    return true;
+                }
+                if (a == "stash" || a == "worktree") && nxt == "list" {
+                    return true;
+                }
+                return false;
+            }
+            false
+        }
+        "cargo" => {
+            if cmd_args.iter().any(|a| a == "--config" || a.starts_with("--config=")) {
+                return false;
+            }
+            let sub = cmd_args.iter().find(|a| !a.starts_with('-') && !a.starts_with('+')).map(|s| s.as_str()).unwrap_or("");
+            matches!(sub, "check" | "test" | "clippy" | "build" | "tree")
+        }
+        "pytest" | "grep" | "ls" | "tree" | "du" | "ruff" | "mypy" | "eslint" | "tsc" => true,
+        "go" => matches!(cmd_args.first().map(|s| s.as_str()).unwrap_or(""), "test" | "vet" | "list" | "build"),
+        "python3" | "python" => {
+            cmd_args.len() >= 2 && cmd_args[0] == "-m" && matches!(cmd_args[1].as_str(), "pytest" | "unittest" | "mypy" | "ruff")
+        }
+        "npm" | "pnpm" | "yarn" => {
+            let s0 = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
+            let s1 = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("");
+            matches!(s0, "test" | "ls" | "outdated") || (s0 == "run" && matches!(s1, "typecheck" | "lint" | "build" | "test" | "check"))
+        }
+        "rg" => !cmd_args.iter().any(|a| a == "--pre" || a.starts_with("--pre=")),
+        "find" => !cmd_args.iter().any(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls" | "-fprint" | "-fprint0" | "-fprintf")),
+        "wm3" | "wm-gen3" => {
+            let mut sub = "";
+            let mut i = 0;
+            while i < cmd_args.len() {
+                let a = cmd_args[i].as_str();
+                if a == "--store" || a == "--galaxy" { i += 2; continue; }
+                if a.starts_with('-') { i += 1; continue; }
+                sub = a;
+                break;
+            }
+            matches!(sub, "recall" | "evidence-recall" | "stats" | "status" | "session" | "list" | "build-info" | "inspect")
+                || cmd_args.iter().any(|a| a == "--version")
+        }
+        "gh" => {
+            let s0 = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
+            let s1 = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("");
+            matches!(s0, "pr" | "issue" | "repo" | "run" | "workflow" | "release")
+                && matches!(s1, "list" | "view" | "status" | "diff" | "checks")
+        }
+        _ => false,
+    }
+}
+
+fn is_safe_py_test_or_bench_rs(arg: &str) -> bool {
+    if arg.is_empty() || arg.starts_with('-') {
+        return false;
+    }
+    if arg.chars().any(|c| "$*?{}[]~;|&><`\n\r".contains(c)) {
+        return false;
+    }
+    let base = Path::new(arg).file_name().and_then(|s| s.to_str()).unwrap_or("");
+    base.ends_with(".py") && (base.starts_with("test_") || base.starts_with("bench_") || base.ends_with("_test.py"))
+}
+
+fn find_wm_squeeze_rs() -> Option<String> {
+    if let Ok(exe) = env::current_exe() {
+        if exe.is_file() {
+            return Some(exe.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn run_py_fallback(fallback_py: Option<&str>, stdin_buf: &str) {
+    let Some(py_path) = fallback_py.filter(|p| Path::new(p).is_file()) else {
+        pretool_allow();
+        return;
+    };
+    let mut cmd = Command::new("python3");
+    cmd.args(["-S", "-B", py_path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let Ok(mut child) = cmd.spawn() else {
+        pretool_allow();
+        return;
+    };
+    if let Some(mut child_in) = child.stdin.take() {
+        let _ = child_in.write_all(stdin_buf.as_bytes());
+    }
+    if let Ok(out) = child.wait_with_output() {
+        let txt = String::from_utf8_lossy(&out.stdout);
+        let t = txt.trim();
+        if !t.is_empty() && t.starts_with('{') {
+            println!("{}", t);
+            return;
+        }
+    }
+    pretool_allow();
+}
+
+enum SimpleCmdOutcome {
+    Rewrite(String),
+    AllowAsIs,
+    DelegatePy,
+}
+
+fn classify_run_command_rs(cmd_line: &str) -> SimpleCmdOutcome {
+    if env::var("WM_SQUEEZE_OFF").ok().as_deref() == Some("1") {
+        return SimpleCmdOutcome::AllowAsIs;
+    }
+    let s = cmd_line.trim();
+    if s.is_empty() || s.contains("wm-squeeze") {
+        return SimpleCmdOutcome::AllowAsIs;
+    }
+    if s.contains('\n') || s.contains("<<") {
+        return SimpleCmdOutcome::DelegatePy;
+    }
+    let clean_tail = strip_trailing_redirs_rs(s);
+    if clean_tail.is_empty() {
+        return SimpleCmdOutcome::AllowAsIs;
+    }
+    let s_norm = strip_unquoted_line_cont_rs(clean_tail);
+    let Some(parts) = split_top_level_and_rs(&s_norm) else {
+        return SimpleCmdOutcome::AllowAsIs;
+    };
+    let mut cwd_arg: Option<String> = None;
+    let mut toks: Option<Vec<String>> = None;
+    if parts.len() == 2 {
+        let (left, right) = (&parts[0], &parts[1]);
+        if !left.is_empty() && !right.is_empty() && !has_unsafe_shell_meta_rs(left) && !has_unsafe_shell_meta_rs(right) {
+            if let (Some(lt), Some(rt)) = (posix_shlex_split(left), posix_shlex_split(right)) {
+                if lt.len() == 2 && lt[0] == "cd" && !rt.is_empty() {
+                    cwd_arg = Some(lt[1].clone());
+                    toks = Some(rt);
+                }
+            }
+        } else {
+            return SimpleCmdOutcome::DelegatePy;
+        }
+    } else if parts.len() == 1 {
+        if has_unsafe_shell_meta_rs(&s_norm) {
+            return SimpleCmdOutcome::DelegatePy;
+        }
+        toks = posix_shlex_split(&s_norm);
+    } else {
+        return SimpleCmdOutcome::DelegatePy;
+    }
+
+    let Some(mut tv) = toks else {
+        return SimpleCmdOutcome::AllowAsIs;
+    };
+    if tv.is_empty() {
+        return SimpleCmdOutcome::AllowAsIs;
+    }
+
+    let mut env_args: Vec<String> = Vec::new();
+    while !tv.is_empty() && tv[0].contains('=') {
+        let (k, _) = tv[0].split_once('=').unwrap();
+        if !matches!(k, "PYTHONPATH" | "RUST_BACKTRACE" | "RUST_LOG" | "NO_COLOR" | "CARGO_TERM_COLOR") {
+            return SimpleCmdOutcome::AllowAsIs;
+        }
+        env_args.push(tv.remove(0));
+    }
+    if tv.is_empty() {
+        return SimpleCmdOutcome::AllowAsIs;
+    }
+    let cmd_base = Path::new(&tv[0]).file_name().and_then(|x| x.to_str()).unwrap_or(&tv[0]).to_string();
+    let cmd_args = &tv[1..];
+
+    let resolve_sq = || -> String {
+        env::var("WM_SQUEEZE_BIN")
+            .ok()
+            .filter(|x| !x.is_empty())
+            .or_else(|| {
+                if env::var("PATH")
+                    .ok()
+                    .map(|p| p.split(':').any(|d| Path::new(d).join("wm-squeeze").is_file()))
+                    .unwrap_or(false)
+                {
+                    Some("wm-squeeze".to_string())
+                } else {
+                    find_wm_squeeze_rs()
+                }
+            })
+            .unwrap_or_else(|| "wm-squeeze".to_string())
+    };
+
+    if cmd_base == "python3" || cmd_base == "python" {
+        let rest: Vec<&str> = cmd_args
+            .iter()
+            .map(|x| x.as_str())
+            .filter(|a| !matches!(*a, "-u" | "-B" | "-S" | "-O" | "-E" | "-s" | "-q"))
+            .collect();
+        if let Some(&first_r) = rest.first() {
+            if is_safe_py_test_or_bench_rs(first_r) {
+                let sq = resolve_sq();
+                return SimpleCmdOutcome::Rewrite(format!(
+                    "set -o pipefail; {} 2>&1 | {} --pipe --kind generic",
+                    clean_tail,
+                    shell_quote(&sq)
+                ));
+            }
+        }
+    }
+
+    if is_pretool_safe_squeezable(&cmd_base, cmd_args) {
+        let sq = resolve_sq();
+        let mut parts_out = vec![sq, "--safe".to_string()];
+        if let Some(cw) = cwd_arg {
+            parts_out.push("--cwd".to_string());
+            parts_out.push(cw);
+        }
+        for ev in env_args {
+            parts_out.push("--env".to_string());
+            parts_out.push(ev);
+        }
+        parts_out.push("--".to_string());
+        parts_out.extend(tv);
+        let joined = parts_out.iter().map(|x| shell_quote(x)).collect::<Vec<_>>().join(" ");
+        return SimpleCmdOutcome::Rewrite(joined);
+    }
+
+    SimpleCmdOutcome::AllowAsIs
+}
+
+fn run_pre_tool(fallback_py: Option<&str>) {
+    if env::var("WM_AGY_BENCH_VANILLA").ok().as_deref() == Some("1") {
+        pretool_allow();
+        return;
+    }
+    let mut stdin_buf = String::new();
+    if io::stdin().read_to_string(&mut stdin_buf).is_err() || stdin_buf.trim().is_empty() {
+        pretool_allow();
+        return;
+    }
+
+    let payload = extract_top_level_fields(&stdin_buf, &["toolCall", "conversationId", "stepIdx", "transcriptPath", "cwd"]);
+    let tc_raw = payload.get("toolCall").map(|s| s.as_str()).unwrap_or("");
+    let tc_fields = extract_top_level_fields(tc_raw, &["name", "args", "arguments"]);
+    let tool_name = tc_fields.get("name").map(|s| s.as_str()).unwrap_or("");
+    let args_raw = tc_fields.get("args").or_else(|| tc_fields.get("arguments")).map(|s| s.as_str()).unwrap_or("");
+    let args = if args_raw.trim_start().starts_with('{') {
+        extract_top_level_fields(
+            args_raw,
+            &[
+                "CommandLine", "command", "verify", "commands",
+                "Path", "path", "StartLine", "EndLine", "ByteOffset",
+                "edits", "Action", "TaskId", "token_budget", "limit",
+                "max_content_bytes", "markdown_only", "format",
+                "action", "fork", "model", "brief", "message", "content", "body", "TypeName", "Model",
+            ],
+        )
+    } else if !args_raw.is_empty() {
+        let mut m = HashMap::new();
+        m.insert("command".to_string(), args_raw.to_string());
+        m
+    } else {
+        HashMap::new()
+    };
+
+    // 1. Env-Write Guard
+    if tool_name == "write_file" || tool_name == "edit_file" {
+        if let Some(p) = args.get("Path").or_else(|| args.get("path")) {
+            let base = Path::new(p.trim()).file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if is_env_secret_basename(base) {
+                let reason = format!("[Env-Write Guard] Modifying secrets file `{}` requires explicit user confirmation.", base);
+                pretool_decision("force_ask", &reason);
+                return;
+            }
+        }
+    } else if tool_name.ends_with("_apply_edits") {
+        if let Some(edits_raw) = args.get("edits") {
+            for el in extract_json_array_elements(edits_raw, 64) {
+                if el.trim_start().starts_with('{') {
+                    if let Some(p) = extract_top_level_fields(&el, &["path"]).get("path") {
+                        let base = Path::new(p.trim()).file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        if is_env_secret_basename(base) {
+                            let reason = format!("[Env-Write Guard] Modifying secrets file `{}` requires explicit user confirmation.", base);
+                            pretool_decision("force_ask", &reason);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 1b. Destructive shell & Kekkai checks on any shell command arguments
+    let mut cmds: Vec<String> = Vec::new();
+    for k in ["CommandLine", "command", "verify"] {
+        if let Some(v) = args.get(k) {
+            if !v.is_empty() {
+                cmds.push(v.clone());
+            }
+        }
+    }
+    if let Some(raw_cmds) = args.get("commands") {
+        for el in extract_json_array_elements(raw_cmds, 32) {
+            if el.trim_start().starts_with('{') {
+                if let Some(c) = extract_top_level_fields(&el, &["command"]).get("command") {
+                    if !c.is_empty() {
+                        cmds.push(c.clone());
+                    }
+                }
+            } else if !el.is_empty() {
+                cmds.push(el);
+            }
+        }
+    }
+    for c in &cmds {
+        if let Some(reason) = check_destructive_cmd(c) {
+            let msg = format!("[Data-Loss Guard] {}. Confirm explicitly before proceeding.", reason);
+            pretool_decision("force_ask", &msg);
+            return;
+        }
+        if contains_kekkai_sensitive(c) {
+            run_py_fallback(fallback_py, &stdin_buf);
+            return;
+        }
+    }
+
+    let conv_id = payload.get("conversationId").map(|s| s.as_str()).unwrap_or("");
+    let step_idx = payload.get("stepIdx").and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
+    let transcript = payload.get("transcriptPath").map(|s| s.as_str()).unwrap_or("");
+    let cwd = payload.get("cwd").map(|s| s.as_str()).unwrap_or("");
+
+    // 2. run_command compression or compound delegation
+    if tool_name == "run_command" {
+        if let Some(cmd_line) = args.get("CommandLine").filter(|s| !s.is_empty()) {
+            match classify_run_command_rs(cmd_line) {
+                SimpleCmdOutcome::Rewrite(rewritten) => {
+                    println!("{{\"decision\":\"allow\",\"overwrite\":{{\"CommandLine\":\"{}\"}}}}", json_escape(&rewritten));
+                    return;
+                }
+                SimpleCmdOutcome::DelegatePy => {
+                    run_py_fallback(fallback_py, &stdin_buf);
+                    return;
+                }
+                SimpleCmdOutcome::AllowAsIs => {
+                    pretool_allow();
+                    return;
+                }
+            }
+        }
+        pretool_allow();
+        return;
+    }
+
+    // 3. Native fast-paths
+    if tool_name == "read_file" {
+        handle_read_file_rs(&args, transcript, conv_id, step_idx, cwd);
+        return;
+    }
+    if tool_name == "manage_task" {
+        handle_manage_task_rs(&args, conv_id, step_idx);
+        return;
+    }
+    if matches!(tool_name, "swarm" | "post_message" | "invoke_subagent") {
+        handle_swarm_and_subagent_rs(tool_name, &args, transcript);
+        return;
+    }
+    if matches!(
+        tool_name,
+        "mcp_whitemagic_session_continuity"
+            | "mcp_whitemagic_memory_recall"
+            | "mcp_whitemagic_whitemagic_gen3_session_continuity"
+            | "mcp_whitemagic_whitemagic_gen3_memory_recall"
+            | "mcp_wm-research-engine_research_hunt"
+            | "mcp_firecrawl_firecrawl_scrape"
+    ) {
+        handle_whitemagic_mcp_rs(tool_name, &args);
+        return;
+    }
+
+    pretool_allow();
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!(
-            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --hud\n  wm-squeeze --post-tool\n  wm-squeeze --stats"
+            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --pre-tool [--py FALLBACK_SCRIPT]\n  wm-squeeze --hud\n  wm-squeeze --post-tool\n  wm-squeeze --stats"
         );
         std::process::exit(0);
     }
@@ -1706,6 +3410,20 @@ fn main() {
     }
     if args[0] == "--post-tool" {
         run_post_tool();
+        return;
+    }
+    if args[0] == "--pre-tool" {
+        let mut py_fb: Option<&str> = None;
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "--py" && i + 1 < args.len() {
+                py_fb = Some(args[i + 1].as_str());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        run_pre_tool(py_fb);
         return;
     }
 

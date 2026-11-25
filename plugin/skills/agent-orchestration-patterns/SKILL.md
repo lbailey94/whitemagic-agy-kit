@@ -34,8 +34,10 @@ Invoke `run_workflow` with `ScriptPath` pointing to one of the scripts in `./scr
 - `council_of_models.py`: `{"prompt": "...", "criteria": ["correctness", "simplicity", "sovereignty"]}`
 - `reviewer_team.py`: `{"target": "git diff HEAD~1", "roles": ["security", "edge_cases", "performance", "simplicity"]}`
 
-## Gemini 4 Prefix-Cache & Quota Discipline
+## Gemini 4 Prefix-Cache & Orchestrator Discipline (v4.5.0)
 
-Read [references/gemini4_cache_discipline.md](./references/gemini4_cache_discipline.md) before running
-long tool chains on Gemini 4 Neon/Carbon (implicit caching drops sharply past 30s inter-turn delays;
-batch independent reads/commands in parallel and keep long-running commands asynchronous).
+1. **`<80k` Plan / `>100k` Pin (`Orchestrator -> Hydrogen`):** Use `/model` or `agy-mode orchestrator` for bounded planning below `80k` context; switch/pin directly to a single model (`gemini-4-hydrogen-high` or `/compact` -> `wm-reset`) once context crosses `100k` or after `>=2` ping-pong flips.
+2. **Use `/btw` for Side-Channel Checks:** Ask clarification or status questions with `/btw` so ephemeral asides never mutate or bust the main prefix cache.
+3. **Shared Codemap & Pointer Receipts (`<=150` tok):** Generate one shared codebase map with `wm-handoff --swarm-map .` (`<=600` tok), assign workers `workspace="share"` + explicit `model: "gemini-4-hydrogen-high"` (never `fork` at `>=80k`), and post `<=150`-token CPR pointers on the board instead of inline logs (`>4 KB`).
+4. **Native Plugin Agents (`plugin/agents/`):** Dispatch `hydrogen-builder` for cache-pinned coding, `fresh-verifier` for unbiased read-only diff/test checks (`<60k` ctx, never forked), and `swarm-coordinator` for multi-worker swarm orchestration.
+5. **Inter-Turn Gaps:** Implicit caching drops sharply past `30s` idle gaps on Neon/Carbon; batch independent reads/commands in parallel and run `>10s` commands asynchronously. See [references/gemini4_cache_discipline.md](./references/gemini4_cache_discipline.md).
