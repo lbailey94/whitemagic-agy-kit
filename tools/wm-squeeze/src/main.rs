@@ -3505,7 +3505,41 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str) {
         return;
     }
 
-    // 1b. Cursor Read bounding: clamp unbounded huge text/wide-JSONL reads (>400L / wide >60L) via updated_input
+fn parse_json_usize_key(raw: &str, key: &str) -> Option<usize> {
+    let needle = format!("\"{}\"", key);
+    let idx = raw.find(&needle)?;
+    let rest = &raw[idx + needle.len()..];
+    let colon = rest.find(':')?;
+    let after = rest[colon + 1..].trim_start();
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<usize>().ok()
+}
+
+fn load_grimoire_read_limits() -> (usize, usize, usize) {
+    let path = env::var("WM_GRIMOIRE_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var("HOME").unwrap_or_default())
+                .join(".local/share/whitemagic/grimoire_profile.json")
+        });
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return (400, 250, 50);
+    };
+    let max_unbounded = parse_json_usize_key(&raw, "max_unbounded_read_lines")
+        .filter(|&v| (50..=2000).contains(&v))
+        .unwrap_or(400);
+    let clamp_to = parse_json_usize_key(&raw, "clamp_read_lines")
+        .filter(|&v| (20..=1000).contains(&v))
+        .unwrap_or(250);
+    let wide_jsonl = parse_json_usize_key(&raw, "wide_jsonl_lines")
+        .filter(|&v| (10..=500).contains(&v))
+        .unwrap_or(50);
+    (max_unbounded, clamp_to, wide_jsonl)
+}
+
+    // 1b. Cursor Read bounding: clamp unbounded huge text/wide-JSONL reads via adaptive grimoire_profile.json
     if host == HostKind::Cursor && matches!(tool_name, "Read" | "read_file") {
         let has_explicit_limit = ti_fields
             .get("limit")
@@ -3528,11 +3562,12 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str) {
                 if !is_media && p_obj.is_file() {
                     if let Ok(meta) = fs::metadata(p_obj) {
                         let sz = meta.len();
+                        let (max_unbounded, clamp_lines, wide_lines) = load_grimoire_read_limits();
                         let wide = is_wide_line_file_rs(p_obj, sz);
                         let clamp_to = if wide {
-                            Some(50usize)
-                        } else if file_exceeds_lines_rs(p_obj, 400, sz) {
-                            Some(250usize)
+                            Some(wide_lines)
+                        } else if file_exceeds_lines_rs(p_obj, max_unbounded, sz) {
+                            Some(clamp_lines)
                         } else {
                             None
                         };

@@ -2202,6 +2202,22 @@ def test_v460_multihost_codex_cursor_and_cpr_translate():
             and rc_r2 == 0 and "updated_input" not in cu_r2,
             f"r1={cu_r1} r2={cu_r2}",
         )
+        # Adaptive grimoire_profile.json overrides Read clamp thresholds dynamically
+        med_file = td_path / "med.txt"
+        med_file.write_text("\n".join(f"med_{i:04d} realistic source code line padding text" for i in range(220)) + "\n", encoding="utf-8")
+        prof_file = td_path / "grimoire_profile.json"
+        prof_file.write_text(json.dumps({"model_tuning": {"max_unbounded_read_lines": 180, "clamp_read_lines": 120, "wide_jsonl_lines": 30}}), encoding="utf-8")
+        r_prof = subprocess.run(
+            [str(SQ_BIN), "--pre-tool", "--host", "cursor", "--event", "preToolUse"],
+            input=json.dumps({"tool_name": "Read", "tool_input": {"path": str(med_file)}}),
+            capture_output=True, text=True, env={**os.environ, "WM_GRIMOIRE_PROFILE": str(prof_file)}, timeout=5,
+        )
+        cu_prof = json.loads(r_prof.stdout.strip() or "{}")
+        check(
+            "wm-squeeze --host cursor preToolUse Read adapts clamp dynamically from grimoire_profile.json",
+            r_prof.returncode == 0 and cu_prof.get("updated_input", {}).get("limit") == 120,
+            f"prof={cu_prof}",
+        )
         # Cursor postToolUseFailure (error_message) -> sim_ledger.jsonl & postToolUse spill -> agy_telemetry.jsonl
         cu_sim = td_path / "cursor_sim.jsonl"
         cu_tel = td_path / "cursor_tel.jsonl"
