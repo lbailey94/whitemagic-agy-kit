@@ -1993,7 +1993,7 @@ def test_v451_sidecar_cpr_bridge_and_plugin_scoping():
 
             with urllib.request.urlopen(f"{url}/healthz", timeout=2) as r:
                 hz = json.loads(r.read())
-                check("sidecar GET /healthz 200 ok", r.status == 200 and hz.get("ok") is True and hz.get("version") == "4.5.1")
+                check("sidecar GET /healthz 200 ok", r.status == 200 and hz.get("ok") is True and hz.get("version") == "4.6.0")
             with urllib.request.urlopen(f"{url}/", timeout=2) as r:
                 html = r.read().decode("utf-8")
                 check("sidecar GET / serves no-store UI", r.status == 200 and "WhiteMagic AGY Telemetry" in html and r.headers.get("Cache-Control") == "no-store")
@@ -2113,6 +2113,196 @@ def test_v451_sidecar_cpr_bridge_and_plugin_scoping():
         check("wm-sim audit --scope-plugins --write emits web .agents/plugins.json", r_web.returncode == 0 and pj_path.is_file() and "chrome-devtools-plugin" in inc and "modern-web-guidance-plugin" in inc and "google-antigravity-sdk" in web_j.get("unmatched_enabled_plugins", []))
 
 
+def test_v460_multihost_codex_cursor_and_cpr_translate():
+    import hashlib
+    import hmac as _hmac
+    import signal
+    import urllib.request
+
+    print("\n14. v4.6.0 Multi-Host (Codex + Cursor), Mandala CPR Translate, Multi-Launcher wm-reset & Installer:")
+    SQ_BIN = LOCAL_BIN / "wm-squeeze"
+    bridge_bin = KIT / "bin" / "wm-cpr-bridge"
+    reset_bin = KIT / "bin" / "wm-reset"
+    sidecar_py = KIT / "plugin" / "sidecars" / "wm-sidecar" / "server.py"
+
+    # 14a) wm-squeeze --pre-tool --host codex
+    def run_sq(args, payload, env_extra=None):
+        env = os.environ.copy()
+        if env_extra:
+            env.update(env_extra)
+        p = subprocess.run([str(SQ_BIN), *args], input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=5)
+        return p.returncode, json.loads(p.stdout.strip()) if p.stdout.strip().startswith("{") else p.stdout.strip()
+
+    rc, cr = run_sq(["--pre-tool", "--host", "codex"], {"tool_name": "Bash", "tool_input": {"command": "git status"}, "session_id": "cx-1"})
+    check(
+        "wm-squeeze --host codex rewrites Bash git status -> hookSpecificOutput.updatedInput",
+        rc == 0 and cr.get("hookSpecificOutput", {}).get("permissionDecision") == "allow" and "wm-squeeze --safe -- git status" in cr.get("hookSpecificOutput", {}).get("updatedInput", {}).get("command", ""),
+        str(cr),
+    )
+    rc, cd = run_sq(["--pre-tool", "--host", "codex"], {"tool_name": "Bash", "tool_input": {"command": "git push --force origin main"}})
+    check(
+        "wm-squeeze --host codex destructive git push --force origin main -> permissionDecision=ask",
+        rc == 0 and cd.get("hookSpecificOutput", {}).get("permissionDecision") == "ask",
+        str(cd),
+    )
+    rc, ck = run_sq(["--pre-tool", "--host", "codex"], {"tool_name": "Bash", "tool_input": {"command": "cat ~/.ssh/id_rsa"}})
+    check(
+        "wm-squeeze --host codex Kekkai .ssh/id_rsa -> ask (never AGY JSON)",
+        rc == 0 and ck.get("hookSpecificOutput", {}).get("permissionDecision") == "ask" and "force_ask" not in json.dumps(ck),
+        str(ck),
+    )
+    rc, ce = run_sq(["--pre-tool", "--host", "codex"], {"tool_name": "apply_patch", "tool_input": "*** Begin Patch\n*** Update File: app/.env\n+KEY=1\n"})
+    check(
+        "wm-squeeze --host codex apply_patch .env -> permissionDecision=ask",
+        rc == 0 and ce.get("hookSpecificOutput", {}).get("permissionDecision") == "ask",
+        str(ce),
+    )
+
+    # 14b) wm-squeeze --pre-tool --host cursor across events + --post-tool
+    rc, cu1 = run_sq(["--pre-tool", "--host", "cursor", "--event", "beforeShellExecution"], {"command": "git diff --stat", "conversation_id": "cur-1"})
+    check(
+        "wm-squeeze --host cursor beforeShellExecution -> permission=allow + updated_input",
+        rc == 0 and cu1.get("permission") == "allow" and "wm-squeeze --safe -- git diff --stat" in cu1.get("updated_input", {}).get("command", ""),
+        str(cu1),
+    )
+    rc, cu2 = run_sq(["--pre-tool", "--host", "cursor", "--event", "preToolUse"], {"tool_name": "Edit", "tool_input": {"file_path": "/tmp/sub/.env.local"}})
+    check(
+        "wm-squeeze --host cursor preToolUse Edit .env.local -> permission=ask",
+        rc == 0 and cu2.get("permission") == "ask" and "agent_message" in cu2,
+        str(cu2),
+    )
+    rc, cu3 = run_sq(["--pre-tool", "--host", "cursor", "--event", "beforeMCPExecution"], {"tool_name": "memory_recall", "tool_input": {"query": "cat ~/.ssh/id_ed25519"}})
+    check("wm-squeeze --host cursor beforeMCPExecution Kekkai -> permission=ask", rc == 0 and cu3.get("permission") == "ask", str(cu3))
+    rc, p1 = run_sq(["--post-tool", "--host", "codex"], {"tool_name": "Bash", "tool_input": {"command": "ls"}})
+    rc2, p2 = run_sq(["--post-tool", "--host", "cursor"], {"tool_name": "Shell", "tool_input": {"command": "ls"}})
+    check("wm-squeeze --post-tool --host codex|cursor -> {}", rc == 0 and p1 == {} and rc2 == 0 and p2 == {})
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        # 14c) wm-reset --launcher codex & cursor --dry-run
+        cache_dir = td_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "latest_abc12345.md").write_text("# Handoff\nok\n", encoding="utf-8")
+        (cache_dir / "latest_abc12345.receipt.json").write_text(json.dumps({"schema": "wm-receipt/1.2", "crystal_sha256": "deadbeef1234"}), encoding="utf-8")
+        env_rs = {**os.environ, "WM_HANDOFF_CACHE_DIR": str(cache_dir)}
+        r_cx = subprocess.run([str(reset_bin), "--launcher", "codex", "--conv", "abc12345", "--dry-run"], capture_output=True, text=True, env=env_rs, timeout=5)
+        j_cx = json.loads(r_cx.stdout) if r_cx.returncode == 0 else {}
+        r_cu = subprocess.run([str(reset_bin), "--launcher", "cursor", "--conv", "abc12345", "--print", "--dry-run"], capture_output=True, text=True, env=env_rs, timeout=5)
+        j_cu = json.loads(r_cu.stdout) if r_cu.returncode == 0 else {}
+        check(
+            "wm-reset --launcher codex & cursor --dry-run resolve expected CLI flags",
+            r_cx.returncode == 0 and j_cx.get("launcher") == "codex" and "-C " in j_cx.get("command_preview", "") and "gemini" not in j_cx.get("command_preview", "")
+            and r_cu.returncode == 0 and j_cu.get("launcher") == "cursor" and "--workspace " in j_cu.get("command_preview", "") and " -p " in j_cu.get("command_preview", ""),
+            f"codex={j_cx} cursor={j_cu}",
+        )
+
+        # 14d) wm-cpr-bridge verify & translate for mandala-cpr-pointer/0.5 + HMAC tamper fail-closed
+        key = "unit-hmac-secret"
+        ptr_core = {
+            "schema": "mandala-cpr-pointer/0.5",
+            "job_id": "job-1",
+            "worker_id": "w1",
+            "action": "mandala.exec",
+            "slot_id": "slot-123456",
+            "task_id": "urn:uuid:task-1",
+            "sandbox_class": "landlock",
+            "exit": 0,
+            "stdout_hash": "sha256:" + ("a" * 64),
+            "head_receipt_id": "urn:uuid:rcpt-4",
+            "receipt_count": 4,
+            "bundle_sha256": "sha256:" + ("b" * 64),
+            "verdict": "TRUSTED",
+        }
+        canon = json.dumps(ptr_core, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ptr_signed = {**ptr_core, "hmac_sha256": "hmac-sha256:" + _hmac.new(key.encode("utf-8"), canon, hashlib.sha256).hexdigest()}
+        ptr_file = td_path / "mandala_ptr.json"
+        ptr_file.write_text(json.dumps(ptr_signed), encoding="utf-8")
+        env_hmac = {**os.environ, "WM_CPR_HMAC_KEY": key}
+
+        rv_ok = subprocess.run([str(bridge_bin), "verify", str(ptr_file)], capture_output=True, text=True, env=env_hmac, timeout=5)
+        rt_ok = subprocess.run([str(bridge_bin), "translate", str(ptr_file)], capture_output=True, text=True, env=env_hmac, timeout=5)
+        translated = json.loads(rt_ok.stdout) if rt_ok.returncode == 0 else {}
+        check(
+            "wm-cpr-bridge verify & translate mandala-cpr-pointer/0.5 -> wm-receipt/1.2",
+            rv_ok.returncode == 0 and json.loads(rv_ok.stdout).get("sig_status") == "verified"
+            and rt_ok.returncode == 0 and translated.get("schema") == "wm-receipt/1.2" and translated.get("sandbox_class") == "landlock",
+        )
+
+        bad_ptr_file = td_path / "mandala_ptr_bad.json"
+        bad_ptr_file.write_text(json.dumps({**ptr_signed, "hmac_sha256": "hmac-sha256:" + ("0" * 64)}), encoding="utf-8")
+        rv_bad = subprocess.run([str(bridge_bin), "verify", str(bad_ptr_file)], capture_output=True, text=True, env=env_hmac, timeout=5)
+        check("wm-cpr-bridge verify fails closed on tampered mandala pointer (rc=2)", rv_bad.returncode == 2)
+
+        # Sidecar v4.6.0 accepts mandala-cpr-pointer/0.5
+        sc_env = {
+            **os.environ,
+            "WM_HANDOFF_CACHE_DIR": str(cache_dir),
+            "WM_CPR_BRIDGE_LEDGER": str(td_path / "ledger.jsonl"),
+            "WM_CPR_HMAC_KEY": key,
+            "ANTIGRAVITY_SIDECAR_WEB_PORT": "0",
+        }
+        sc_proc = subprocess.Popen([sys.executable, "-S", "-B", str(sidecar_py)], env=sc_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            disc = cache_dir / "sidecar.json"
+            for _ in range(40):
+                if disc.is_file():
+                    break
+                time.sleep(0.05)
+            info = json.loads(disc.read_text(encoding="utf-8"))
+            req = urllib.request.Request(
+                f"{info['url']}/api/receipt",
+                data=json.dumps(ptr_signed).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                sc_ok = resp.status == 201
+            with urllib.request.urlopen(f"{info['url']}/api/status", timeout=2) as resp2:
+                st_j = json.loads(resp2.read().decode("utf-8"))
+            check("sidecar v4.6.0 accepts mandala-cpr-pointer/0.5 & reports version", sc_ok and st_j.get("version") == "4.6.0", str(st_j.get("version")))
+        finally:
+            sc_proc.send_signal(signal.SIGTERM)
+            sc_proc.wait(timeout=4)
+
+        # 14e) Isolated HOME install.sh --hosts codex,cursor preserves browser/whitemagic MCP
+        fake_home = td_path / "fake_home"
+        (fake_home / ".codex").mkdir(parents=True)
+        (fake_home / ".cursor").mkdir(parents=True)
+        (fake_home / ".codex" / "config.toml").write_text(
+            '[plugins."unified-computer-use@openai-bundled"]\nenabled = true\n\n[mcp_servers.whitemagic]\ncommand = "/usr/bin/wm3"\nenabled = false\n',
+            encoding="utf-8",
+        )
+        (fake_home / ".cursor" / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"whitemagic": {"command": "/usr/bin/wm3", "args": ["serve"]}}}),
+            encoding="utf-8",
+        )
+        inst_env = {**os.environ, "HOME": str(fake_home), "WM_SKIP_CARGO": "1"}
+        r_inst = subprocess.run(
+            ["bash", str(KIT / "install.sh"), "--hosts", "codex,cursor"],
+            cwd=str(KIT),
+            env=inst_env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        cx_hooks = json.loads((fake_home / ".codex" / "hooks.json").read_text(encoding="utf-8")) if (fake_home / ".codex" / "hooks.json").is_file() else {}
+        cx_toml = (fake_home / ".codex" / "config.toml").read_text(encoding="utf-8")
+        cu_hooks = json.loads((fake_home / ".cursor" / "hooks.json").read_text(encoding="utf-8")) if (fake_home / ".cursor" / "hooks.json").is_file() else {}
+        cu_mcp = json.loads((fake_home / ".cursor" / "mcp.json").read_text(encoding="utf-8")) if (fake_home / ".cursor" / "mcp.json").is_file() else {}
+        check(
+            "install.sh --hosts codex,cursor configures hooks+wm_fast while preserving existing entries",
+            r_inst.returncode == 0
+            and len(cx_hooks.get("hooks", {}).get("PreToolUse", [])) == 1
+            and "[mcp_servers.wm_fast]" in cx_toml
+            and '[plugins."unified-computer-use@openai-bundled"]\nenabled = true' in cx_toml
+            and cu_hooks.get("version") == 1
+            and "beforeShellExecution" in cu_hooks.get("hooks", {})
+            and "whitemagic" in cu_mcp.get("mcpServers", {})
+            and "wm_fast" in cu_mcp.get("mcpServers", {}),
+            r_inst.stderr[-300:] if r_inst.returncode != 0 else "",
+        )
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="agy_hook_state_") as state_td:
         os.environ["WM_HOOK_STATE_DIR"] = state_td
@@ -2130,7 +2320,8 @@ def main():
         test_v442_self_heal_and_rust_post_tool()
         test_v450_rust_pretool_crystal_and_swarm_guards()
         test_v451_sidecar_cpr_bridge_and_plugin_scoping()
-    print(f"\n=== Wave 3/4/v4.5.1 Test Summary: {PASS} passed, {FAIL} failed ===")
+        test_v460_multihost_codex_cursor_and_cpr_translate()
+    print(f"\n=== Wave 3/4/v4.6.0 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

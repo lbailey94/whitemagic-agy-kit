@@ -1,9 +1,9 @@
 {
   "name": "whitemagic-agy-kit",
   "displayName": "WhiteMagic AGY Turbo Kit",
-  "version": "4.5.1",
+  "version": "4.6.0",
   "logo": "assets/logo.svg",
-  "description": "Fused Antigravity App/IDE/CLI accelerator: 5-tool eager MCP (batch_search, apply_edits, read_slices, run_checks, code_graph), Rust wm-squeeze v3 (--pre-tool/--post-tool/--hud), resident sidecar telemetry UI, Sangha CPR bridge, multi-surface CliffCompaction CLIs, Tricameral CyberBrain, and SIM memory.",
+  "description": "Multi-host AI harness accelerator (Antigravity, Codex, Cursor): 5-tool eager MCP (batch_search, apply_edits, read_slices, run_checks, code_graph), Rust wm-squeeze v3 (--host agy|codex|cursor), resident sidecar UI, Sangha CPR bridge, multi-launcher wm-reset, Tricameral CyberBrain, and SIM memory.",
   "author": {
     "name": "Lucas Bailey",
     "url": "https://github.com/lbailey94"

@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "4.5.1"
+VERSION = "4.6.0"
 MAX_RECEIPT_BYTES = 16384
 
 
@@ -163,10 +163,20 @@ def _build_status_payload() -> dict:
             }
         )
 
+    hosts_detected = [
+        h for h, p in (
+            ("agy", Path.home() / ".gemini"),
+            ("codex", Path.home() / ".codex"),
+            ("cursor", Path.home() / ".cursor"),
+        )
+        if p.is_dir()
+    ]
+
     return {
         "ok": True,
         "version": VERSION,
         "pid": os.getpid(),
+        "hosts_detected": hosts_detected,
         "telemetry": {
             "sample_stops": len(stops),
             "avg_hit_pct": avg_hit,
@@ -189,8 +199,22 @@ def _verify_posted_receipt(obj: dict) -> tuple[bool, str, str]:
     if not isinstance(obj, dict):
         return False, "", "JSON body must be an object"
     schema = str(obj.get("schema") or "")
-    if schema not in ("wm-receipt/1.2", "wm-confinement-receipt/1.1"):
+    if schema not in ("wm-receipt/1.2", "wm-confinement-receipt/1.1", "mandala-cpr-pointer/0.5"):
         return False, "", f"Unsupported receipt schema: {schema!r}"
+    if schema == "mandala-cpr-pointer/0.5":
+        digest = str(obj.get("bundle_sha256") or obj.get("stdout_hash") or "")
+        if not digest:
+            return False, "", "Missing bundle_sha256 or stdout_hash"
+        hmac_raw = str(obj.get("hmac_sha256") or "")
+        signing_key = (os.environ.get("WM_CPR_HMAC_KEY") or os.environ.get("WM_CONFINEMENT_SIGNING_KEY") or "").strip()
+        if hmac_raw and signing_key:
+            core = {k: v for k, v in obj.items() if k != "hmac_sha256"}
+            canon = json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            expected = hmac.new(signing_key.encode("utf-8"), canon, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(hmac_raw.removeprefix("hmac-sha256:"), expected):
+                return False, digest, "Invalid hmac_sha256 signature"
+        return True, digest, ""
+
     digest = str(obj.get("crystal_sha256") or obj.get("receipt_sha256") or "")
     if not digest:
         return False, "", "Missing crystal_sha256 or receipt_sha256"

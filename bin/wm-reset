@@ -142,17 +142,18 @@ def load_or_build_crystal(args, cache_dir: Path) -> tuple[str, dict | None, Path
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Reset into a clean cache-warmed AGY session from a verbatim handoff crystal.")
+    ap = argparse.ArgumentParser(description="Reset into a clean cache-warmed AGY, Codex, or Cursor session from a verbatim handoff crystal.")
     ap.add_argument("--conv", help="Source conversation ID prefix (defaults to newest crystal / transcript)")
     ap.add_argument("--surface", choices=["all", "app", "ide", "cli"], default="all", help="AGY surface to scan (default: all)")
-    ap.add_argument("--model", default="gemini-4-hydrogen", help="Target model profile (default: gemini-4-hydrogen)")
-    ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"], default="high", help="Reasoning effort (default: high)")
-    ap.add_argument("--agent", help="Optional native agent name (e.g., hydrogen-builder)")
+    ap.add_argument("--launcher", choices=["agy", "codex", "cursor"], default=os.environ.get("WM_RESET_LAUNCHER", "agy"), help="Target agent CLI (default: agy)")
+    ap.add_argument("--model", default="", help="Target model profile (defaults to gemini-4-hydrogen for agy)")
+    ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"], default="high", help="Reasoning effort for agy (default: high)")
+    ap.add_argument("--agent", help="Optional native agent name (e.g., hydrogen-builder for agy)")
     ap.add_argument("--cwd", default=os.getcwd(), help="Working directory for git snapshot and session launch")
     ap.add_argument("--prompt", default="", help="Optional continuation instruction appended after the crystal")
     ap.add_argument("--print-crystal", action="store_true", help="Print resolved crystal markdown and exit")
-    ap.add_argument("--dry-run", action="store_true", help="Print resolved launch command + receipt metadata without starting agy")
-    ap.add_argument("--print", dest="print_mode", action="store_true", help="Launch agy in non-interactive --print mode instead of -i")
+    ap.add_argument("--dry-run", action="store_true", help="Print resolved launch command + receipt metadata without starting launcher")
+    ap.add_argument("--print", dest="print_mode", action="store_true", help="Launch in non-interactive --print / exec mode")
     args = ap.parse_args()
 
     cache_dir = Path(os.environ.get("WM_HANDOFF_CACHE_DIR") or str(Path.home() / ".cache" / "wm-handoff"))
@@ -171,22 +172,44 @@ def main():
         seed_parts.extend(["", "## Continuation Task", args.prompt.strip()])
     seed_prompt = "\n".join(seed_parts)
 
-    model_id = _normalize_model(args.model, args.effort)
-    agy_bin = os.environ.get("AGY_BIN") or shutil.which("agy") or "agy"
-    cmd = [agy_bin, "--model", model_id, "--effort", args.effort]
-    if args.agent:
-        cmd.extend(["--agent", args.agent])
-    cmd.extend(["-p" if args.print_mode else "-i", seed_prompt])
+    explicit_model = args.model.strip()
+    if args.launcher == "codex":
+        codex_bin = os.environ.get("CODEX_BIN") or shutil.which("codex") or "codex"
+        model_id = explicit_model or "default"
+        cmd = [codex_bin]
+        if args.print_mode:
+            cmd.append("exec")
+        cmd.extend(["-C", args.cwd])
+        if explicit_model:
+            cmd.extend(["-m", explicit_model])
+        cmd.append(seed_prompt)
+    elif args.launcher == "cursor":
+        ca_bin = os.environ.get("CURSOR_AGENT_BIN") or shutil.which("cursor-agent") or "cursor-agent"
+        model_id = explicit_model or "default"
+        cmd = [ca_bin, "--workspace", args.cwd]
+        if explicit_model:
+            cmd.extend(["--model", explicit_model])
+        if args.print_mode:
+            cmd.append("-p")
+        cmd.append(seed_prompt)
+    else:
+        model_id = _normalize_model(explicit_model or "gemini-4-hydrogen", args.effort)
+        agy_bin = os.environ.get("AGY_BIN") or shutil.which("agy") or "agy"
+        cmd = [agy_bin, "--model", model_id, "--effort", args.effort]
+        if args.agent:
+            cmd.extend(["--agent", args.agent])
+        cmd.extend(["-p" if args.print_mode else "-i", seed_prompt])
 
     if args.dry_run:
         summary = {
+            "launcher": args.launcher,
             "crystal_path": str(crystal_path),
             "crystal_bytes": len(crystal.encode("utf-8")),
             "est_tokens": len(crystal) // 4,
             "receipt_schema": (rec_data or {}).get("schema"),
             "crystal_sha256": (rec_data or {}).get("crystal_sha256"),
             "model": model_id,
-            "effort": args.effort,
+            "effort": args.effort if args.launcher == "agy" else None,
             "cwd": args.cwd,
             "command_preview": " ".join(shlex.quote(c) for c in cmd[:-1]) + " <seed_prompt>",
         }

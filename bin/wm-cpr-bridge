@@ -53,8 +53,38 @@ def verify_receipt(receipt_path: Path, check_crystal_file: bool = True) -> dict:
         return {"valid": False, "schema": "", "digest": "", "sig_status": "error", "error": "Receipt JSON must be an object", "receipt": {}}
 
     schema = str(rec.get("schema") or "")
-    if schema not in ("wm-receipt/1.2", "wm-confinement-receipt/1.1"):
+    if not schema and rec.get("spec") == "continuity-receipt/0.5" and isinstance(rec.get("receipts"), list):
+        schema = "continuity-receipt/0.5"
+    if schema not in ("wm-receipt/1.2", "wm-confinement-receipt/1.1", "mandala-cpr-pointer/0.5", "continuity-receipt/0.5"):
         return {"valid": False, "schema": schema, "digest": "", "sig_status": "error", "error": f"Unsupported schema: {schema!r}", "receipt": rec}
+
+    if schema == "mandala-cpr-pointer/0.5":
+        digest = str(rec.get("bundle_sha256") or rec.get("stdout_hash") or "")
+        if not digest:
+            return {"valid": False, "schema": schema, "digest": "", "sig_status": "error", "error": "Missing bundle_sha256 / stdout_hash", "receipt": rec}
+        hmac_raw = str(rec.get("hmac_sha256") or "")
+        sig_status = "unsigned"
+        if hmac_raw:
+            signing_key = (os.environ.get("WM_CPR_HMAC_KEY") or os.environ.get("WM_CONFINEMENT_SIGNING_KEY") or "").strip()
+            if signing_key:
+                core = {k: v for k, v in rec.items() if k != "hmac_sha256"}
+                canon = json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                expected_hex = hmac.new(signing_key.encode("utf-8"), canon, hashlib.sha256).hexdigest()
+                given_hex = hmac_raw.removeprefix("hmac-sha256:")
+                if not hmac.compare_digest(given_hex, expected_hex):
+                    return {"valid": False, "schema": schema, "digest": digest, "sig_status": "tampered", "error": "hmac_sha256 signature mismatch", "receipt": rec}
+                sig_status = "verified"
+            else:
+                sig_status = "present"
+        return {"valid": True, "schema": schema, "digest": digest, "sig_status": sig_status, "error": "", "receipt": rec}
+
+    if schema == "continuity-receipt/0.5":
+        receipts_list = rec.get("receipts")
+        if not isinstance(receipts_list, list) or not receipts_list:
+            return {"valid": False, "schema": schema, "digest": "", "sig_status": "error", "error": "Missing or empty receipts array", "receipt": rec}
+        canon = json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        digest = "sha256:" + hashlib.sha256(canon).hexdigest()
+        return {"valid": True, "schema": schema, "digest": digest, "sig_status": "ed25519-bundle", "error": "", "receipt": rec}
 
     digest = str(rec.get("crystal_sha256") or rec.get("receipt_sha256") or "")
     if not digest:
@@ -107,8 +137,57 @@ def verify_receipt(receipt_path: Path, check_crystal_file: bool = True) -> dict:
     return {"valid": True, "schema": schema, "digest": digest, "sig_status": sig_status, "error": "", "receipt": rec}
 
 
+def translate_to_wm_receipt(rec: dict, res: dict) -> dict:
+    """Translate continuity-receipt/0.5 or mandala-cpr-pointer/0.5 into wm-receipt/1.2."""
+    src_schema = res["schema"]
+    task_id = str(rec.get("task_id") or "")
+    slot_id = str(rec.get("slot_id") or "")
+    sandbox_class = str(rec.get("sandbox_class") or "")
+    verdict = str(rec.get("verdict") or "")
+    profile_id = ""
+    if src_schema == "continuity-receipt/0.5":
+        receipts = rec.get("receipts") or []
+        for item in receipts:
+            if not task_id and item.get("task_id"):
+                task_id = str(item["task_id"])
+            if item.get("type") == "task.execution":
+                body = item.get("body") or {}
+                sandbox_class = str(body.get("sandbox_class") or sandbox_class)
+                rp = body.get("runner_profile") or {}
+                profile_id = str(rp.get("profile_id") or "")
+        verdict = verdict or ("TERMINATED" if any(r.get("type") == "task.termination" for r in receipts) else "OPEN")
+    return {
+        "schema": "wm-receipt/1.2",
+        "kind": "mandala_execution",
+        "source_schema": src_schema,
+        "crystal_sha256": res["digest"],
+        "sig_status": res["sig_status"],
+        "task_id": task_id,
+        "slot_id": slot_id,
+        "sandbox_class": sandbox_class,
+        "profile_id": profile_id,
+        "verdict": verdict,
+        "conv_id": (task_id or slot_id or "mandala")[:16],
+        "model": f"mandala:{sandbox_class or 'unknown'}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def format_pointer(rec: dict, sig_status: str) -> str:
-    schema = str(rec.get("schema") or "wm-receipt/1.2")
+    schema = str(rec.get("schema") or rec.get("spec") or "wm-receipt/1.2")
+    if schema in ("mandala-cpr-pointer/0.5", "continuity-receipt/0.5"):
+        digest = str(rec.get("bundle_sha256") or rec.get("stdout_hash") or rec.get("crystal_sha256") or "?")[:24]
+        task_id = str(rec.get("task_id") or "?")[:18]
+        slot_id = str(rec.get("slot_id") or "?")[:18]
+        sclass = str(rec.get("sandbox_class") or "?")
+        verdict = str(rec.get("verdict") or ("TRUSTED" if schema == "continuity-receipt/0.5" else "?"))
+        lines = [
+            f"[CPR {schema} | {sclass} | digest={digest} | sig={sig_status}]",
+            f"- Task: `{task_id}` | slot=`{slot_id}` | verdict=`{verdict}`",
+        ]
+        out = "\n".join(lines) + "\n"
+        return out[: MAX_POINTER_BYTES - 1] + ("\n" if not out[: MAX_POINTER_BYTES - 1].endswith("\n") else "")
+
     kind = str(rec.get("kind") or "handoff_crystal")
     digest = str(rec.get("crystal_sha256") or rec.get("receipt_sha256") or "?")
     conv = str(rec.get("conv_id") or "default")[:12]
@@ -197,7 +276,24 @@ def main():
     pt.add_argument("--limit", type=int, default=10)
     pt.add_argument("--json", action="store_true")
 
+    px = sub.add_parser("translate", help="Translate Mandala 0.5 receipt/pointer into wm-receipt/1.2")
+    px.add_argument("input", help="Path to Mandala continuity-receipt/0.5 or mandala-cpr-pointer/0.5 JSON")
+    px.add_argument("--out", default="", help="Optional output JSON path")
+
     args = ap.parse_args()
+
+    if args.cmd == "translate":
+        res = verify_receipt(Path(args.input), check_crystal_file=False)
+        if not res["valid"]:
+            sys.stderr.write(f"wm-cpr-bridge: verification failed: {res['error']}\n")
+            sys.exit(2)
+        envelope = translate_to_wm_receipt(res["receipt"], res)
+        rendered = json.dumps(envelope, indent=2, ensure_ascii=False) + "\n"
+        if args.out:
+            Path(args.out).write_text(rendered, encoding="utf-8")
+        else:
+            sys.stdout.write(rendered)
+        return
 
     if args.cmd == "verify":
         res = verify_receipt(Path(args.receipt), check_crystal_file=not args.no_crystal_check)

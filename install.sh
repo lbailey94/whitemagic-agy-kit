@@ -1,44 +1,68 @@
 #!/usr/bin/env bash
-# WhiteMagic AGY Turbo Kit v4.5.1 — Idempotent Cross-Platform Installer (macOS + Linux)
+# WhiteMagic Turbo Kit v4.6.0 — Idempotent Multi-Host Cross-Platform Installer (Antigravity, Codex, Cursor)
 # Installs:
-#   1. Zero-dependency Rust binaries `wm-squeeze`, `wm-codegraph`, & Safe-Rust `muninn-engine` -> ~/.local/bin/
-#   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` & `tricameral_dispatch` MCPs + resident sidecar; or `--sync-global`)
-#   3. Hardened `INK-Q/agy-fast` plugin (--auto-update off) if Node >= 20 is available (preserves existing valid installs)
-#   4. Disables 6 unused heavy official plugins (-10.4k tokens/session) if present
-#   5. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `agy-token-audit`, `wm-local-digest`, `wm-dream`, `wm-handoff`, `wm-reset`, `wm-cpr-bridge`, `wm-models`, `wm-huginn`, `wm-muninn`, `wm-tricameral`, `wm-tricameral-mcp`, `statusline.py`)
-#   6. Non-destructive `~/.gemini/antigravity-cli/settings.json` safe allowlist + statusLine tuning (timestamped backup; leaves model untouched)
-#   7. Selective `"eager": true` MCP promotion for locally detected `wm3` / `whitemagic_gen3` / `firecrawl-local-mcp`
-#   8. Optional Tricameral spore pull (`--with-huginn` | `--with-ravens` | `--with-tricameral`) via `wm-models`
+#   1. Zero-dependency Rust binaries `wm-squeeze` (multi-host `--host agy|codex|cursor`), `wm-codegraph`, & `muninn-engine` -> ~/.local/bin/
+#   2. Host adapters (`--hosts agy,codex,cursor` or `--hosts all`; default `agy`):
+#      - agy:    Native Antigravity plugin `whitemagic-agy-kit` (+ eager MCPs + resident sidecar + settings)
+#      - codex:  ~/.codex/hooks.json (PreToolUse/PostToolUse) + `[mcp_servers.wm_fast]` in ~/.codex/config.toml (+ optional `--prune-codex-office`)
+#      - cursor: ~/.cursor/hooks.json (beforeShellExecution/beforeMCPExecution/preToolUse) + `wm_fast` in ~/.cursor/mcp.json
+#   3. Shared portable 5-tool fast MCP bundle (`~/.local/share/whitemagic/wm-fast-mcp/mcp-server.mjs`)
+#   4. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `agy-token-audit`, `wm-local-digest`, `wm-dream`, `wm-handoff`, `wm-reset`, `wm-cpr-bridge`, ...)
+#   5. Optional Tricameral spore pull (`--with-huginn` | `--with-ravens` | `--with-tricameral`) via `wm-models`
 set -euo pipefail
 
 KIT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PLUGINS_DIR="${HOME}/.gemini/config/plugins"
 LOCAL_BIN="${HOME}/.local/bin"
 AGY_CLI_DIR="${HOME}/.gemini/antigravity-cli"
+FAST_MCP_DIR="${HOME}/.local/share/whitemagic/wm-fast-mcp"
 MODELS_DIR="${WM_MODELS_DIR:-${HOME}/.local/share/whitemagic/models}"
 SKIP_AGY_FAST=0
 SKIP_TRICAMERAL_ENGINE=0
 KEEP_HEAVY_PLUGINS=0
 SYNC_GLOBAL=0
+PRUNE_CODEX_OFFICE=0
+HOSTS="${WM_HOSTS:-agy}"
 PULL_PROFILE=""
 
-for arg in "$@"; do
-    case "$arg" in
-        --skip-agy-fast) SKIP_AGY_FAST=1 ;;
-        --skip-tricameral-engine) SKIP_TRICAMERAL_ENGINE=1 ;;
-        --keep-heavy-plugins) KEEP_HEAVY_PLUGINS=1 ;;
-        --sync-global) SYNC_GLOBAL=1 ;;
-        --with-huginn) PULL_PROFILE="huginn" ;;
-        --with-ravens) PULL_PROFILE="ravens" ;;
-        --with-tricameral) PULL_PROFILE="tricameral" ;;
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --skip-agy-fast) SKIP_AGY_FAST=1; shift ;;
+        --skip-tricameral-engine) SKIP_TRICAMERAL_ENGINE=1; shift ;;
+        --keep-heavy-plugins) KEEP_HEAVY_PLUGINS=1; shift ;;
+        --sync-global) SYNC_GLOBAL=1; shift ;;
+        --prune-codex-office) PRUNE_CODEX_OFFICE=1; shift ;;
+        --hosts)
+            HOSTS="${2:?--hosts requires a comma-separated list (e.g. agy,codex,cursor)}"
+            shift 2
+            ;;
+        --hosts=*)
+            HOSTS="${1#--hosts=}"
+            shift
+            ;;
+        --with-huginn) PULL_PROFILE="huginn"; shift ;;
+        --with-ravens) PULL_PROFILE="ravens"; shift ;;
+        --with-tricameral) PULL_PROFILE="tricameral"; shift ;;
         -h|--help)
-            echo "Usage: ./install.sh [--skip-agy-fast] [--skip-tricameral-engine] [--keep-heavy-plugins] [--sync-global] [--with-huginn|--with-ravens|--with-tricameral]"
+            echo "Usage: ./install.sh [--hosts agy,codex,cursor|all] [--prune-codex-office] [--skip-agy-fast] [--skip-tricameral-engine] [--keep-heavy-plugins] [--sync-global] [--with-huginn|--with-ravens|--with-tricameral]"
             exit 0
             ;;
+        *) shift ;;
     esac
 done
 
-mkdir -p "$PLUGINS_DIR" "$LOCAL_BIN" "$AGY_CLI_DIR" "${HOME}/.gemini/config/hooks" "$MODELS_DIR"
+if [ "$HOSTS" = "all" ]; then
+    HOSTS="agy,codex,cursor"
+fi
+HAS_AGY=0; HAS_CODEX=0; HAS_CURSOR=0
+case ",${HOSTS}," in *,agy,*) HAS_AGY=1 ;; esac
+case ",${HOSTS}," in *,codex,*) HAS_CODEX=1 ;; esac
+case ",${HOSTS}," in *,cursor,*) HAS_CURSOR=1 ;; esac
+
+mkdir -p "$LOCAL_BIN" "$MODELS_DIR" "$FAST_MCP_DIR"
+if [ "$HAS_AGY" -eq 1 ]; then
+    mkdir -p "$PLUGINS_DIR" "$AGY_CLI_DIR" "${HOME}/.gemini/config/hooks"
+fi
 
 install_bin() {
     # Atomic temp-file + mv replaces the directory entry with a fresh inode,
@@ -52,7 +76,9 @@ install_bin() {
 }
 
 echo "=== 1. Building Rust binaries: wm-squeeze, wm-codegraph & Safe-Rust muninn-engine ==="
-if command -v cargo >/dev/null 2>&1; then
+if [ "${WM_SKIP_CARGO:-0}" -eq 1 ]; then
+    echo "Skipping Cargo build (WM_SKIP_CARGO=1)"
+elif command -v cargo >/dev/null 2>&1; then
     cargo build --release --manifest-path "${KIT_DIR}/tools/wm-squeeze/Cargo.toml"
     install_bin "${KIT_DIR}/tools/wm-squeeze/target/release/wm-squeeze" "${LOCAL_BIN}/wm-squeeze"
     cargo build --release --manifest-path "${KIT_DIR}/tools/wm-codegraph/Cargo.toml"
@@ -77,6 +103,37 @@ elif command -v rustc >/dev/null 2>&1; then
 else
     echo "[warn] Rust toolchain not found; skipping native binaries (hooks fail-open cleanly without them)."
 fi
+
+NODE_BIN=""
+for cand in \
+    "$(command -v node 2>/dev/null || true)" \
+    "${LOCAL_BIN}/node" \
+    $(ls -1d "${HOME}"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V -r || true) \
+    /opt/homebrew/bin/node \
+    /usr/local/bin/node \
+    "${HOME}/.volta/bin/node" \
+    $(ls -1d "${HOME}"/.fnm/node-versions/*/installation/bin/node 2>/dev/null | sort -V -r || true); do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+        NODE_BIN="$cand"
+        break
+    fi
+done
+TURBO_MCP_DIR="${KIT_DIR}/tools/agy-turbo-mcp"
+if [ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ]; then
+    if [ "$NODE_BIN" != "${LOCAL_BIN}/node" ]; then
+        ln -sf "$NODE_BIN" "${LOCAL_BIN}/node"
+    fi
+    if [ -d "$TURBO_MCP_DIR" ] && [ ! -f "${KIT_DIR}/plugin/dist/mcp-server.mjs" -o "${TURBO_MCP_DIR}/src/mcp-server.ts" -nt "${KIT_DIR}/plugin/dist/mcp-server.mjs" ]; then
+        if [ -d "${TURBO_MCP_DIR}/node_modules" ] && command -v npm >/dev/null 2>&1; then
+            (cd "$TURBO_MCP_DIR" && npm run build)
+        fi
+    fi
+fi
+if [ -f "${KIT_DIR}/plugin/dist/mcp-server.mjs" ]; then
+    install_bin "${KIT_DIR}/plugin/dist/mcp-server.mjs" "${FAST_MCP_DIR}/mcp-server.mjs"
+fi
+
+if [ "$HAS_AGY" -eq 1 ]; then
 
 if [ "$SYNC_GLOBAL" -eq 1 ]; then
     echo "=== 2. Syncing hooks & skills into global ~/.gemini/config (zero plugin duplication) ==="
@@ -145,33 +202,8 @@ hp.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 print(f"Updated global {hp}")
 PY
 else
-    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.5.1 ==="
-    # Build fused TS MCP & benchmark bundle if needed (probe PATH, ~/.local/bin, nvm, homebrew, volta, fnm)
-    TURBO_MCP_DIR="${KIT_DIR}/tools/agy-turbo-mcp"
-    NODE_BIN=""
-    for cand in \
-        "$(command -v node 2>/dev/null || true)" \
-        "${LOCAL_BIN}/node" \
-        $(ls -1d "${HOME}"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V -r || true) \
-        /opt/homebrew/bin/node \
-        /usr/local/bin/node \
-        "${HOME}/.volta/bin/node" \
-        $(ls -1d "${HOME}"/.fnm/node-versions/*/installation/bin/node 2>/dev/null | sort -V -r || true); do
-        if [ -n "$cand" ] && [ -x "$cand" ]; then
-            NODE_BIN="$cand"
-            break
-        fi
-    done
-    if [ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ]; then
-        if [ "$NODE_BIN" != "${LOCAL_BIN}/node" ]; then
-            ln -sf "$NODE_BIN" "${LOCAL_BIN}/node"
-        fi
-        if [ -d "$TURBO_MCP_DIR" ] && [ ! -f "${KIT_DIR}/plugin/dist/mcp-server.mjs" -o "${TURBO_MCP_DIR}/src/mcp-server.ts" -nt "${KIT_DIR}/plugin/dist/mcp-server.mjs" ]; then
-            if [ -d "${TURBO_MCP_DIR}/node_modules" ] && command -v npm >/dev/null 2>&1; then
-                (cd "$TURBO_MCP_DIR" && npm run build)
-            fi
-        fi
-    else
+    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.6.0 ==="
+    if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
         echo "[WARN] Node.js (>=20) not found; fused 5-tool 'fast' MCP will fall back to 1-tool 'codegraph' MCP."
     fi
 
@@ -305,14 +337,17 @@ if [ "$KEEP_HEAVY_PLUGINS" -eq 0 ] && command -v agy >/dev/null 2>&1; then
         agy plugin disable "$p" >/dev/null 2>&1 || true
     done
 fi
+fi # end HAS_AGY plugin install
 
-echo "=== 5. Installing portable CLI tools, model manifest & cache-warmth statusline ==="
+echo "=== 5. Installing portable CLI tools & model manifest ==="
 for tool in wm-sim agy-bench agy-mode agy-token-audit wm-local-digest wm-dream wm-handoff wm-reset wm-cpr-bridge wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-fleet wm-grok-mcp wm-vps wm-triage; do
     if [ -f "${KIT_DIR}/bin/${tool}" ]; then
         install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
     fi
 done
 cp "${KIT_DIR}/models/manifest.json" "${MODELS_DIR}/manifest.json"
+
+if [ "$HAS_AGY" -eq 1 ]; then
 install_bin "${KIT_DIR}/bin/statusline.py" "${AGY_CLI_DIR}/statusline.py"
 
 echo "=== 6. Updating ~/.gemini/antigravity-cli/settings.json (non-destructive; model untouched) ==="
@@ -528,6 +563,182 @@ if wm_plugin_mcp.is_file():
     except Exception:
         pass
 PY
+fi # end HAS_AGY settings & MCP
+
+if [ "$HAS_CODEX" -eq 1 ]; then
+    echo "=== 7b. Configuring Codex adapter (~/.codex/hooks.json & ~/.codex/config.toml) ==="
+    mkdir -p "${HOME}/.codex"
+    PRUNE_OFFICE="${PRUNE_CODEX_OFFICE}" FAST_MJS="${FAST_MCP_DIR}/mcp-server.mjs" NODE_CMD="${NODE_BIN:-node}" python3 - <<'PY'
+import json, os, re, shutil
+from datetime import datetime
+from pathlib import Path
+
+home = Path.home()
+codex_dir = home / ".codex"
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# 1. Merge ~/.codex/hooks.json idempotently
+hooks_path = codex_dir / "hooks.json"
+if hooks_path.is_file():
+    shutil.copy2(hooks_path, hooks_path.with_name(f"hooks.json.bak-{ts}"))
+    try:
+        hdata = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except Exception:
+        hdata = {}
+else:
+    hdata = {}
+if not isinstance(hdata, dict):
+    hdata = {}
+hooks = hdata.setdefault("hooks", {})
+
+def _without_wm(entries):
+    out = []
+    for ent in entries or []:
+        inner = ent.get("hooks") if isinstance(ent, dict) else None
+        if isinstance(inner, list) and any("wm-squeeze" in str(h.get("command", "")) for h in inner if isinstance(h, dict)):
+            continue
+        out.append(ent)
+    return out
+
+pre = _without_wm(hooks.get("PreToolUse"))
+pre.append({
+    "matcher": "Bash|apply_patch",
+    "hooks": [{
+        "type": "command",
+        "command": 'if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze --pre-tool --host codex; elif [ -x "$HOME/.local/bin/wm-squeeze" ]; then exec "$HOME/.local/bin/wm-squeeze" --pre-tool --host codex; fi',
+        "timeout": 5,
+    }],
+})
+hooks["PreToolUse"] = pre
+
+post = _without_wm(hooks.get("PostToolUse"))
+post.append({
+    "matcher": "Bash",
+    "hooks": [{
+        "type": "command",
+        "command": 'if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze --post-tool --host codex; elif [ -x "$HOME/.local/bin/wm-squeeze" ]; then exec "$HOME/.local/bin/wm-squeeze" --post-tool --host codex; fi',
+        "timeout": 5,
+    }],
+})
+hooks["PostToolUse"] = post
+hooks_path.write_text(json.dumps(hdata, indent=2) + "\n", encoding="utf-8")
+print(f"Updated {hooks_path} (PreToolUse + PostToolUse for Codex)")
+
+# 2. Merge [mcp_servers.wm_fast] into ~/.codex/config.toml (preserving unrelated keys & plugins)
+cfg_path = codex_dir / "config.toml"
+node_cmd = os.environ.get("NODE_CMD") or "node"
+fast_mjs = os.environ.get("FAST_MJS") or ""
+cur_toml = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
+if cfg_path.is_file():
+    shutil.copy2(cfg_path, cfg_path.with_name(f"config.toml.bak-{ts}"))
+
+if fast_mjs and Path(fast_mjs).is_file():
+    block = (
+        "# WhiteMagic Turbo Fast 5-tool MCP (v4.6.0)\n"
+        "[mcp_servers.wm_fast]\n"
+        f'command = "{node_cmd}"\n'
+        f'args = ["{fast_mjs}"]\n'
+        "startup_timeout_sec = 15\n"
+        "tool_timeout_sec = 60\n"
+    )
+    if "[mcp_servers.wm_fast]" in cur_toml:
+        cur_toml = re.sub(
+            r"(?ms)^(?:# WhiteMagic Turbo Fast[^\n]*\n)?\[mcp_servers\.wm_fast\]\n.*?(?=\n\[|\Z)",
+            block.rstrip("\n"),
+            cur_toml,
+            count=1,
+        )
+    else:
+        if cur_toml and not cur_toml.endswith("\n"):
+            cur_toml += "\n"
+        cur_toml += ("\n" if cur_toml else "") + block
+
+if os.environ.get("PRUNE_OFFICE") == "1" and cur_toml:
+    for plugin_id in (
+        "documents@openai-primary-runtime",
+        "pdf@openai-primary-runtime",
+        "spreadsheets@openai-primary-runtime",
+        "presentations@openai-primary-runtime",
+        "template-creator@openai-primary-runtime",
+        "visualize@openai-bundled",
+    ):
+        pat = rf'(\[plugins\."{re.escape(plugin_id)}"\]\s*\n\s*enabled\s*=\s*)true'
+        cur_toml = re.sub(pat, r"\1false", cur_toml)
+
+if cur_toml:
+    cfg_path.write_text(cur_toml.rstrip("\n") + "\n", encoding="utf-8")
+    print(f"Updated {cfg_path} ([mcp_servers.wm_fast])")
+PY
+fi
+
+if [ "$HAS_CURSOR" -eq 1 ]; then
+    echo "=== 7c. Configuring Cursor adapter (~/.cursor/hooks.json & ~/.cursor/mcp.json) ==="
+    mkdir -p "${HOME}/.cursor"
+    FAST_MJS="${FAST_MCP_DIR}/mcp-server.mjs" NODE_CMD="${NODE_BIN:-node}" python3 - <<'PY'
+import json, os, shutil
+from datetime import datetime
+from pathlib import Path
+
+home = Path.home()
+cursor_dir = home / ".cursor"
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# 1. Merge ~/.cursor/hooks.json (version: 1)
+hooks_path = cursor_dir / "hooks.json"
+if hooks_path.is_file():
+    shutil.copy2(hooks_path, hooks_path.with_name(f"hooks.json.bak-{ts}"))
+    try:
+        hdata = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except Exception:
+        hdata = {}
+else:
+    hdata = {}
+if not isinstance(hdata, dict):
+    hdata = {}
+hdata["version"] = 1
+hooks = hdata.setdefault("hooks", {})
+
+def _strip_wm(items):
+    return [it for it in (items or []) if not (isinstance(it, dict) and "wm-squeeze" in str(it.get("command", "")))]
+
+for ev, extra in (
+    ("beforeShellExecution", {}),
+    ("beforeMCPExecution", {"matcher": "wm_fast|whitemagic"}),
+    ("preToolUse", {}),
+):
+    lst = _strip_wm(hooks.get(ev))
+    entry = dict(extra)
+    entry["command"] = (
+        f'if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze --pre-tool --host cursor --event {ev}; '
+        f'elif [ -x "$HOME/.local/bin/wm-squeeze" ]; then exec "$HOME/.local/bin/wm-squeeze" --pre-tool --host cursor --event {ev}; fi'
+    )
+    lst.append(entry)
+    hooks[ev] = lst
+
+hooks_path.write_text(json.dumps(hdata, indent=2) + "\n", encoding="utf-8")
+print(f"Updated {hooks_path} (beforeShellExecution, beforeMCPExecution, preToolUse)")
+
+# 2. Merge wm_fast into ~/.cursor/mcp.json without disturbing whitemagic
+mcp_path = cursor_dir / "mcp.json"
+if mcp_path.is_file():
+    shutil.copy2(mcp_path, mcp_path.with_name(f"mcp.json.bak-{ts}"))
+    try:
+        mdata = json.loads(mcp_path.read_text(encoding="utf-8"))
+    except Exception:
+        mdata = {}
+else:
+    mdata = {}
+if not isinstance(mdata, dict):
+    mdata = {}
+servers = mdata.setdefault("mcpServers", {})
+node_cmd = os.environ.get("NODE_CMD") or "node"
+fast_mjs = os.environ.get("FAST_MJS") or ""
+if fast_mjs and Path(fast_mjs).is_file():
+    servers["wm_fast"] = {"command": node_cmd, "args": [fast_mjs]}
+    mcp_path.write_text(json.dumps(mdata, indent=2) + "\n", encoding="utf-8")
+    print(f"Updated {mcp_path} servers={list(servers.keys())}")
+PY
+fi
 
 if [ -n "$PULL_PROFILE" ]; then
     echo ""
@@ -541,5 +752,5 @@ export PATH="${LOCAL_BIN}:${PATH}"
 wm-sim audit || true
 wm-models list || true
 echo ""
-echo "Done! Launch with 'agy' (or 'agy-mode longevity' / 'agy-mode orchestrator')."
+echo "Done! Installed hosts=${HOSTS}."
 echo "To pull local Tricameral spores later: wm-models pull huginn | ravens | tricameral"

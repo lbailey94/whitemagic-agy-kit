@@ -1477,7 +1477,7 @@ fn extract_json_array_elements(arr_raw: &str, max_items: usize) -> Vec<String> {
     out
 }
 
-fn run_post_tool() {
+fn run_post_tool(host: HostKind) {
     let mut stdin_buf = String::new();
     if io::stdin().read_to_string(&mut stdin_buf).is_err() || stdin_buf.trim().is_empty() {
         println!("{{}}");
@@ -1486,6 +1486,62 @@ fn run_post_tool() {
 
     // Ultra-fast clean path (<2ms total runtime): small payload with no error field cannot fail or spill
     if stdin_buf.len() <= 16_000 && !stdin_buf.contains("\"error\"") {
+        let _ = host;
+        println!("{{}}");
+        return;
+    }
+
+    if host != HostKind::Agy {
+        let payload = extract_top_level_fields(
+            &stdin_buf,
+            &["error", "tool_name", "tool_input", "tool_response", "output", "session_id", "conversation_id", "command"],
+        );
+        let err_raw = payload
+            .get("error")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != "false" && *s != "null");
+        let conv_id = payload
+            .get("session_id")
+            .or_else(|| payload.get("conversation_id"))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let tool_name = payload.get("tool_name").map(|s| s.as_str()).unwrap_or("shell");
+        if let Some(err_str) = err_raw {
+            let ti = payload.get("tool_input").map(|s| s.as_str()).unwrap_or("");
+            let cmd = extract_top_level_fields(ti, &["command", "cmd"])
+                .get("command")
+                .cloned()
+                .or_else(|| payload.get("command").cloned())
+                .unwrap_or_default();
+            let ledger_path = env::var("WM_SIM_LEDGER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    env::var("HOME")
+                        .ok()
+                        .map(|h| PathBuf::from(h).join(".local/share/whitemagic/sim_ledger.jsonl"))
+                });
+            if let Some(lp) = ledger_path {
+                if let Some(parent) = lp.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let cmd_clean = truncate_chars(&redact_secrets(&cmd), 160);
+                let err_clean = truncate_chars(&redact_secrets(err_str), 200);
+                let line = format!(
+                    "{{\"event\":\"tool_failure\",\"host\":\"{}\",\"ts\":\"{}\",\"conversation_id\":\"{}\",\"tool\":\"{}\",\"cmd_preview\":\"{}\",\"error\":\"{}\"}}\n",
+                    host.as_str(),
+                    utc_iso_now(),
+                    json_escape(conv_id),
+                    json_escape(tool_name),
+                    json_escape(&cmd_clean),
+                    json_escape(&err_clean),
+                );
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(lp) {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+        }
         println!("{{}}");
         return;
     }
@@ -1819,6 +1875,31 @@ fn extract_json_object_entries(txt: &str) -> Vec<(String, String)> {
     out
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostKind {
+    Agy,
+    Codex,
+    Cursor,
+}
+
+impl HostKind {
+    fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "codex" => HostKind::Codex,
+            "cursor" => HostKind::Cursor,
+            _ => HostKind::Agy,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            HostKind::Agy => "agy",
+            HostKind::Codex => "codex",
+            HostKind::Cursor => "cursor",
+        }
+    }
+}
+
 fn pretool_allow() {
     println!("{{\"decision\":\"allow\"}}");
 }
@@ -1829,6 +1910,58 @@ fn pretool_decision(decision: &str, reason: &str) {
         json_escape(decision),
         json_escape(reason)
     );
+}
+
+fn emit_pretool_allow(host: HostKind) {
+    match host {
+        HostKind::Agy => pretool_allow(),
+        HostKind::Codex => println!("{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\"}}}}"),
+        HostKind::Cursor => println!("{{\"permission\":\"allow\"}}"),
+    }
+}
+
+fn emit_pretool_decision(host: HostKind, decision: &str, reason: &str) {
+    match host {
+        HostKind::Agy => pretool_decision(decision, reason),
+        HostKind::Codex => {
+            let perm = if decision == "deny" { "deny" } else { "ask" };
+            println!(
+                "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"{}\",\"permissionDecisionReason\":\"{}\"}}}}",
+                perm,
+                json_escape(reason)
+            );
+        }
+        HostKind::Cursor => {
+            let perm = if decision == "deny" { "deny" } else { "ask" };
+            println!(
+                "{{\"permission\":\"{}\",\"agent_message\":\"{}\"}}",
+                perm,
+                json_escape(reason)
+            );
+        }
+    }
+}
+
+fn emit_pretool_rewrite_cmd(host: HostKind, cmd_key: &str, rewritten: &str) {
+    match host {
+        HostKind::Agy => println!("{{\"decision\":\"allow\",\"overwrite\":{{\"CommandLine\":\"{}\"}}}}", json_escape(rewritten)),
+        HostKind::Codex => {
+            let key = if cmd_key == "cmd" { "cmd" } else { "command" };
+            println!(
+                "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"updatedInput\":{{\"{}\":\"{}\"}}}}}}",
+                key,
+                json_escape(rewritten)
+            );
+        }
+        HostKind::Cursor => {
+            let key = if cmd_key == "cmd" { "cmd" } else { "command" };
+            println!(
+                "{{\"permission\":\"allow\",\"updated_input\":{{\"{}\":\"{}\"}}}}",
+                key,
+                json_escape(rewritten)
+            );
+        }
+    }
 }
 
 fn pretool_latest_model_and_ctx(tp: &str) -> (String, u64) {
@@ -3240,14 +3373,140 @@ fn classify_run_command_rs(cmd_line: &str) -> SimpleCmdOutcome {
     SimpleCmdOutcome::AllowAsIs
 }
 
-fn run_pre_tool(fallback_py: Option<&str>) {
+fn scan_patch_env_secret(patch_text: &str) -> Option<String> {
+    for raw_line in patch_text.lines() {
+        let line = raw_line.trim();
+        for prefix in ["*** Update File:", "*** Add File:", "*** Delete File:", "+++ ", "--- "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let path = rest.trim().trim_start_matches("a/").trim_start_matches("b/");
+                let base = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if is_env_secret_basename(base) {
+                    return Some(base.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str) {
+    let payload = extract_top_level_fields(
+        stdin_buf,
+        &["tool_name", "tool_input", "command", "file_path", "path", "server_name", "hook_event_name", "session_id", "conversation_id", "cwd"],
+    );
+    let raw_event = if !event.is_empty() {
+        event
+    } else {
+        payload.get("hook_event_name").map(|s| s.as_str()).unwrap_or("")
+    };
+    let tool_name = payload.get("tool_name").map(|s| s.trim()).unwrap_or("");
+    let ti_raw = payload.get("tool_input").map(|s| s.as_str()).unwrap_or("");
+    let ti_fields = if ti_raw.trim_start().starts_with('{') {
+        extract_top_level_fields(ti_raw, &["command", "cmd", "file_path", "path", "input", "patch", "query", "limit", "token_budget"])
+    } else {
+        HashMap::new()
+    };
+
+    // 1. Patch / file secret guard
+    if tool_name == "apply_patch" {
+        let patch_txt = ti_fields
+            .get("input")
+            .or_else(|| ti_fields.get("patch"))
+            .map(|s| s.as_str())
+            .unwrap_or(ti_raw);
+        if let Some(secret_base) = scan_patch_env_secret(patch_txt) {
+            let reason = format!("[Env-Write Guard] Modifying secrets file `{}` via apply_patch requires explicit user confirmation.", secret_base);
+            emit_pretool_decision(host, "force_ask", &reason);
+            return;
+        }
+        emit_pretool_allow(host);
+        return;
+    }
+
+    if matches!(tool_name, "write_file" | "edit_file" | "Write" | "Edit" | "StrReplace") {
+        let target_path = ti_fields
+            .get("file_path")
+            .or_else(|| ti_fields.get("path"))
+            .or_else(|| payload.get("file_path"))
+            .or_else(|| payload.get("path"))
+            .map(|s| s.trim())
+            .unwrap_or("");
+        let base = Path::new(target_path).file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if is_env_secret_basename(base) {
+            let reason = format!("[Env-Write Guard] Modifying secrets file `{}` requires explicit user confirmation.", base);
+            emit_pretool_decision(host, "force_ask", &reason);
+            return;
+        }
+        emit_pretool_allow(host);
+        return;
+    }
+
+    // 2. MCP execution guard (Cursor beforeMCPExecution / Codex custom MCP calls)
+    if host == HostKind::Cursor && raw_event == "beforeMCPExecution" {
+        if !ti_raw.is_empty() && contains_kekkai_sensitive(ti_raw) {
+            emit_pretool_decision(host, "force_ask", "[Kekkai Guard] MCP payload references sensitive credentials or protected paths; confirm explicitly.");
+            return;
+        }
+        emit_pretool_allow(host);
+        return;
+    }
+
+    // 3. Shell execution path (Codex Bash/shell/exec_command, Cursor beforeShellExecution/preToolUse Shell)
+    let is_shell = (host == HostKind::Codex && matches!(tool_name, "Bash" | "shell" | "exec_command"))
+        || (host == HostKind::Cursor && (raw_event == "beforeShellExecution" || !payload.get("command").map(|s| s.is_empty()).unwrap_or(true) || matches!(tool_name, "Shell" | "Bash" | "run_command")));
+    if !is_shell {
+        emit_pretool_allow(host);
+        return;
+    }
+
+    let (cmd_key, cmd_line) = if let Some(c) = ti_fields.get("command").filter(|s| !s.is_empty()) {
+        ("command", c.as_str())
+    } else if let Some(c) = ti_fields.get("cmd").filter(|s| !s.is_empty()) {
+        ("cmd", c.as_str())
+    } else if let Some(c) = payload.get("command").filter(|s| !s.is_empty()) {
+        ("command", c.as_str())
+    } else if !ti_raw.is_empty() && !ti_raw.trim_start().starts_with('{') {
+        ("command", ti_raw)
+    } else {
+        ("command", "")
+    };
+
+    if cmd_line.is_empty() {
+        emit_pretool_allow(host);
+        return;
+    }
+    if let Some(reason) = check_destructive_cmd(cmd_line) {
+        let msg = format!("[Data-Loss Guard] {}. Confirm explicitly before proceeding.", reason);
+        emit_pretool_decision(host, "force_ask", &msg);
+        return;
+    }
+    if contains_kekkai_sensitive(cmd_line) {
+        emit_pretool_decision(
+            host,
+            "force_ask",
+            "[Kekkai Guard] Command references sensitive credentials or protected directories; confirm explicitly.",
+        );
+        return;
+    }
+
+    match classify_run_command_rs(cmd_line) {
+        SimpleCmdOutcome::Rewrite(rewritten) => emit_pretool_rewrite_cmd(host, cmd_key, &rewritten),
+        SimpleCmdOutcome::DelegatePy | SimpleCmdOutcome::AllowAsIs => emit_pretool_allow(host),
+    }
+}
+
+fn run_pre_tool(fallback_py: Option<&str>, host: HostKind, event: Option<&str>) {
     if env::var("WM_AGY_BENCH_VANILLA").ok().as_deref() == Some("1") {
-        pretool_allow();
+        emit_pretool_allow(host);
         return;
     }
     let mut stdin_buf = String::new();
     if io::stdin().read_to_string(&mut stdin_buf).is_err() || stdin_buf.trim().is_empty() {
-        pretool_allow();
+        emit_pretool_allow(host);
+        return;
+    }
+    if host != HostKind::Agy {
+        run_pre_tool_non_agy(host, event.unwrap_or(""), &stdin_buf);
         return;
     }
 
@@ -3396,7 +3655,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!(
-            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --pre-tool [--py FALLBACK_SCRIPT]\n  wm-squeeze --hud\n  wm-squeeze --post-tool\n  wm-squeeze --stats"
+            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --pre-tool [--py FALLBACK_SCRIPT] [--host agy|codex|cursor] [--event NAME]\n  wm-squeeze --hud\n  wm-squeeze --post-tool [--host agy|codex|cursor]\n  wm-squeeze --stats"
         );
         std::process::exit(0);
     }
@@ -3409,21 +3668,39 @@ fn main() {
         return;
     }
     if args[0] == "--post-tool" {
-        run_post_tool();
-        return;
-    }
-    if args[0] == "--pre-tool" {
-        let mut py_fb: Option<&str> = None;
+        let mut host = HostKind::Agy;
         let mut i = 1;
         while i < args.len() {
-            if args[i] == "--py" && i + 1 < args.len() {
-                py_fb = Some(args[i + 1].as_str());
+            if args[i] == "--host" && i + 1 < args.len() {
+                host = HostKind::from_str(&args[i + 1]);
                 i += 2;
             } else {
                 i += 1;
             }
         }
-        run_pre_tool(py_fb);
+        run_post_tool(host);
+        return;
+    }
+    if args[0] == "--pre-tool" {
+        let mut py_fb: Option<&str> = None;
+        let mut host = HostKind::Agy;
+        let mut event: Option<&str> = None;
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "--py" && i + 1 < args.len() {
+                py_fb = Some(args[i + 1].as_str());
+                i += 2;
+            } else if args[i] == "--host" && i + 1 < args.len() {
+                host = HostKind::from_str(&args[i + 1]);
+                i += 2;
+            } else if args[i] == "--event" && i + 1 < args.len() {
+                event = Some(args[i + 1].as_str());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        run_pre_tool(py_fb, host, event);
         return;
     }
 
