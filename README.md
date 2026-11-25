@@ -1,6 +1,7 @@
-# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v4.4.1 — Compound Spill Shield, Sub-4ms Rust HUD & App/IDE Parity)
+# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v4.4.2 — Self-Healing `read_file`, Sub-3ms Rust `--post-tool` & App/IDE Parity)
 
 Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity App 2.0, Antigravity IDE, and CLI (`agy 1.5.14+`) optimization suite fusing `whitemagic-agy-kit` and `INK-Q/agy-fast` (MIT) into a single unified plugin — **works standalone with zero external dependencies** (plus optional WhiteMagic Gen3 & Tricameral integrations):
+- **Self-Healing & Sub-3ms Rust Hooks (`v4.4.2`):** Automatic `PreToolUse` recovery of inverted/line-count `read_file` ranges (`10/10` historical failures self-healed) and `[Path Hint]` sibling/parent suggestions on missing files; compiled zero-dep Rust `wm-squeeze --post-tool` (`2.2 ms` median, `23.2×` faster than Python) with rich `read_file`/`write_file`/`edit_file` failure previews; lazy-import `pre_tool_guard.py` (`-24.8%` `read_file` / `-25.1%` MCP guard latency); windowed legacy-filtered `wm-dream` (`stops` vs `spills`); word-boundary-safe `session_start_brief.py`; and quoted-`cd`-with-spaces heredoc, backslash-newline continuation, and read-only `xargs` spill capture (`1,399` squeezed, `+170.6%` vs `v4.3.0`).
 - **Compound Spill Shield & Rust HUD (`v4.4.1`):** Compound/multiline read-only bash, uncapped pipeline, and complex heredoc (`cd ... && python3 - <<'PY'`) `wm-squeeze --pipe` wrapping (zero false `SIGPIPE` via `(set +o pipefail ...)`), compiled zero-dep Rust `wm-squeeze --hud` `PostInvocation` hook with idle-gap attribution, JSON-encoded `transcript.jsonl` arg unwrapping across companion CLIs, and disabled-plugin rule filtering in `wm-sim audit`.
 - **App/IDE Parity & Longevity Shield (`v4.4.0`):** Quote-aware `PreToolUse` `wm-squeeze` (`+38.6%` more commands squeezed across `3,497` real commands, eliminating quoted `rg`/`find` bypasses), standalone `python3 -c` `wm-squeeze --pipe` wrapping, wide-line JSON/JSONL `<=50L` `read_file` clamping, Firecrawl/Research Engine MCP auto-budgeting, zero-token `PostInvocation` App/IDE Longevity HUD (`0` model tokens, `2.48%` alert rate on `7,188` replayed turns), multi-surface (`app`+`ide`+`cli`) companion CLIs, hardened Node/MCP wiring, deduplicated `AGENTS.md` (`-26.6%` bytes), and [`benchmarks/RESULTS_2026-11-25_v44.md`](./benchmarks/RESULTS_2026-11-25_v44.md).
 - **Token-Burn Shield (`v4.1.0`):** Forensic `agy-token-audit` CLI (`--recent`, `--conv`, `--swarm`, `--report-md`), wide-span & burst `read_file` auto-clamping (`>250L` / `150L` above `120k` ctx / `120L` burst), multiline inline `python3 - <<'PY'` heredoc `wm-squeeze --pipe` auto-wrapping, portable `[Env-Write Guard]` (`force_ask` on `.env*` secrets, fixing AGY sandbox relative deny-rule errors), and automatic user/plugin skill deduplication.
@@ -12,12 +13,13 @@ Built from empirical offline forensics across `50` real sessions (`12,740` turns
 
 ---
 
-## Headline Empirical Results ([v4.4.1 3-Way Benchmarks](./benchmarks/RESULTS_2026-11-25_v441.md) · [v4.4.0 Benchmarks](./benchmarks/RESULTS_2026-11-25_v44.md) · [v3/Wave4 Benchmarks](./benchmarks/RESULTS_2026-11-21.md) · [v4.1.0 Swarm Telemetry](./benchmarks/AGY_SWARM_TOKEN_TELEMETRY_REPORT_2026-11-23.md))
+## Headline Empirical Results ([v4.4.2 Benchmarks](./benchmarks/RESULTS_2026-11-25_v442.md) · [v4.4.1 Benchmarks](./benchmarks/RESULTS_2026-11-25_v441.md) · [v4.4.0 Benchmarks](./benchmarks/RESULTS_2026-11-25_v44.md) · [v3/Wave4 Benchmarks](./benchmarks/RESULTS_2026-11-21.md) · [v4.1.0 Swarm Telemetry](./benchmarks/AGY_SWARM_TOKEN_TELEMETRY_REPORT_2026-11-23.md))
 
-- **Compound Spill Shield & Rust HUD (`v4.4.1`, [RESULTS_2026-11-25_v441.md](./benchmarks/RESULTS_2026-11-25_v441.md)):**
-  - **3-Way 22-Session Replay (`3,391` `run_command` calls):** `515` (`v4.3.0`) → `725` (`v4.4.0`) → **`1,350` (`v4.4.1`, `+162.1%`)** commands auto-squeezed; spill-command capture jumped `42/229 → 55/229 → 124/229` (**`54.1%`**, `2.95×` `v4.3.0`); `plugin/rules/AGENTS.md` cut **`-26.6%`** (`3,573 B → 2,623 B`).
-  - **Rust `wm-squeeze --hud` vs Python (`30` runs + `6,894`-turn replay):** **`2.1 ms` median (`4.1 ms` p95)** vs Python `57.6 ms` (**`27.9×` faster**, exact JSON parity `true`), emitting alerts on `2.45%` of turns with **`0` model tokens** added.
-  - **Live `agy -p` Verifications (`Gemini 4 Hydrogen (High)`):** `v4.4.0` A/B cut wall-time **`-29.9%`** (`28.68s → 20.11s`) & spills **`1 → 0`**; `v4.4.1` multiline compound smoke test rewrote & ran cleanly (`rc=0`, `0` spills, `0` hook errors).
+- **Self-Healing, Sub-3ms Rust Hooks & 4-Way Replay (`v4.4.2`, [RESULTS_2026-11-25_v442.md](./benchmarks/RESULTS_2026-11-25_v442.md)):**
+  - **4-Way 22-Session Replay (`3,383` `run_command` calls):** `517` (`v4.3.0`) → `727` (`v4.4.0`) → `1,347` (`v4.4.1`) → **`1,399` (`v4.4.2`, `+170.6%` vs `v4.3.0`)** commands auto-squeezed; historical spill capture climbed `42/226 → 55/226 → 122/226 → 127/226` (**`56.2%`**, `3.02×` `v4.3.0`).
+  - **`read_file` Self-Heal & Latency (`v4.4.1` → `v4.4.2`, `30` runs):** **`10/10` (`100%`)** historical `invalid line range` crashes self-healed; `pre_tool_guard.py` lazy-import refactor cut `read_file` median **`103.4 → 77.8 ms` (`-24.8%`)** and MCP guard median **`104.6 → 78.4 ms` (`-25.1%`)**.
+  - **Rust `wm-squeeze --post-tool` & `--hud` vs Python (`30` runs + `6,944`-turn replay):** `--post-tool` runs in **`2.2 ms` median (`3.4 ms` p95)** vs Python `50.0 ms` (**`23.2×` faster**, parity `True`); `--hud` runs in **`3.6 ms` median (`4.9 ms` p95)** vs `77.2 ms` (**`21.3×` faster**, `0` model tokens added, `2.61%` alert rate).
+- **Live `agy -p` & `v4.4.x` Compound Verification:** `v4.4.0` A/B cut wall-time **`-29.9%`** (`28.68s → 20.11s`) & spills **`1 → 0`**; `v4.4.1` multiline compound smoke test rewrote & ran cleanly (`rc=0`, `0` spills, `0` hook errors); `v4.4.2` suite passes **`183/183`** checks twice idempotently.
 
 - **Live 19-Session `/swarm` Before vs. After (`v4.1.0` Token-Burn Shield, `agy-token-audit --swarm`):**
   - **Avg uncached input / worker:** `0.57M → 0.175M` (**`-69.4%`**) · **Avg total input / worker:** `8.99M → 1.89M` (**`-79.0%`**) · **Avg output / worker:** `111.5k → 52.6k` (**`-52.8%`**)
@@ -39,18 +41,18 @@ Built from empirical offline forensics across `50` real sessions (`12,740` turns
 
 ---
 
-## What's Included (Core Architecture — v4.4.1)
+## What's Included (Core Architecture — v4.4.2)
 
-1. **`wm-squeeze` — Zero-Dependency Rust CoACT CLI Compressor, Cache & HUD (`tools/wm-squeeze/`):**
-   - Single stripped `std`-only Rust binary (`<500 KB`, `<3 ms`) wired via `PreToolUse` `overwrite` for strictly allowlisted read-only/build/test commands (`git`, `cargo`, `go test`, `pytest`, `npm`/`pnpm`/`yarn`, `rg`, `grep`, `find`, `ls`, `tree`, `gh`, `wm3`, `ruff`, `mypy`, `eslint`, `tsc`), plus safe compound/multiline/piped read-only blocks, standalone `python3 -c`, and inline Python heredocs (`wm-squeeze --pipe`).
+1. **`wm-squeeze` — Zero-Dependency Rust CoACT CLI Compressor, Cache, PostTool & HUD (`tools/wm-squeeze/`):**
+   - Single stripped `std`-only Rust binary (`<500 KB`, `<3 ms`) wired via `PreToolUse` `overwrite` for strictly allowlisted read-only/build/test commands (`git`, `cargo`, `go test`, `pytest`, `npm`/`pnpm`/`yarn`, `rg`, `grep`, `find`, `ls`, `tree`, `gh`, `wm3`, `ruff`, `mypy`, `eslint`, `tsc`), plus safe compound/multiline/piped/xargs read-only blocks, standalone `python3 -c`, and quoted-`cd` Python heredocs (`wm-squeeze --pipe`).
    - **Zero permission bypass:** `--safe` executes directly via `execvp` (no `sh -c`), enforces a compiled-in safe allowlist, and refuses dangerous flags (`find -exec/-delete`, `git -c/--exec-path`, `rg --pre`, `cargo --config`) with exit code `2`.
    - **Content-addressed git-aware result cache** (`300s` TTL, auto-invalidated on any file edit) prevents 20–60 s repeat rebuild gaps from evicting Gemini 4's prefix cache.
-   - **Sub-4ms Zero-Token Longevity HUD (`wm-squeeze --hud`):** `PostInvocation` hook emitting `metadata.user_markdown` (`"systemMessage": ""`, `0` model tokens) on model flips, `120k`/`200k` context cliffs (App/IDE), and cold idle resumes.
+   - **Sub-4ms Zero-Token Rust Lifecycle Hooks:** `wm-squeeze --hud` (`PostInvocation`, `metadata.user_markdown`, `0` model tokens) and `wm-squeeze --post-tool` (`PostToolUse`, `2.2 ms` median, rich `read_file`/`write_file`/`edit_file` failure capture & secret redaction).
 2. **`wm-codegraph` — Zero-Dependency Rust Incremental Symbol & Call-Graph Engine (`tools/wm-codegraph/`):**
    - Indexes Rust, Python, TS/JS, Go, C/C++, and Shell incrementally (`~/.cache/wm-codegraph/`).
    - Runs as CLI (`wm-codegraph overview|defs|callers|callees|impact|skeleton <target>`) or inside the 5-tool eager MCP (`code_graph`).
-3. **Deterministic `PreToolUse` Safety & Anti-Bloat Engine (`plugin/hooks/pre_tool_guard.py`):**
-   - Data-Loss & `.env*` secret guards (`force_ask`), quote-aware `wm-squeeze` rewriting, `>250`-line unbounded/wide-span `read_file` auto-clamp (`L1–200`, `<=150L` at `>=120k` ctx, `<=120L` on 4+ read bursts, `<=50L` on wide-line JSON/JSONL), compaction-aware duplicate-read dedup (`deny`), `>=150k` multimodal cache-cliff guard (`force_ask`), and MCP auto-budgeting.
+3. **Deterministic `PreToolUse` Safety, Self-Healing & Anti-Bloat Engine (`plugin/hooks/pre_tool_guard.py`):**
+   - Data-Loss & `.env*` secret guards (`force_ask`), quote-aware `wm-squeeze` rewriting, **self-healing `read_file` line ranges** (auto-corrects inverted/line-count `EndLine < StartLine` instead of crashing), **`[Path Hint]` missing-file sibling/parent suggestions**, `>250`-line unbounded/wide-span `read_file` auto-clamp (`L1–200`, `<=150L` at `>=120k` ctx, `<=120L` on 4+ read bursts, `<=50L` on wide-line JSON/JSONL), compaction-aware duplicate-read dedup (`deny`), `>=150k` multimodal cache-cliff guard (`force_ask`), and MCP auto-budgeting.
 4. **`wm-handoff` (*CliffCompaction* Verbatim Session Reset Crystalizer, `bin/wm-handoff`):**
    - Multi-surface (`--surface all|app|ide|cli`) zero-paraphrase, truncation-only, SHA-256-pinned `<1.8k`-token session handoff crystal for cleanly resetting cold `>100k` sessions instead of paying 200k+ uncached re-prefills.
 5. **Zero-Jitter Turn-0 Prefix (`ContextCacheToken`), Cache-Warmth `statusLine`, `Stop` Telemetry & Multi-Surface CLIs:**

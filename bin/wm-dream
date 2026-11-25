@@ -19,13 +19,55 @@ from pathlib import Path
 
 HOME = Path.home()
 DATA_DIR = HOME / ".local" / "share" / "whitemagic"
-SIM_LEDGER = DATA_DIR / "sim_ledger.jsonl"
-TELEM_LOG = DATA_DIR / "agy_telemetry.jsonl"
-SQUEEZE_LOG = DATA_DIR / "wm_squeeze_stats.jsonl"
-OUT_DIGEST = DATA_DIR / "dream_digest.md"
+SIM_LEDGER = Path(os.environ.get("WM_SIM_LEDGER", str(DATA_DIR / "sim_ledger.jsonl")))
+TELEM_LOG = Path(os.environ.get("WM_AGY_TELEMETRY", str(DATA_DIR / "agy_telemetry.jsonl")))
+SQUEEZE_LOG = Path(os.environ.get("WM_SQUEEZE_STATS", str(DATA_DIR / "wm_squeeze_stats.jsonl")))
+OUT_DIGEST = Path(os.environ.get("WM_DREAM_DIGEST", str(DATA_DIR / "dream_digest.md")))
 
 
-def load_jsonl(path, tail_lines=500):
+def _trunc_word(text: str, limit: int) -> str:
+    s = " ".join(str(text or "").split())
+    if len(s) <= limit:
+        return s
+    if limit <= 4:
+        return s[:limit]
+    cut = s[: limit - 3]
+    sp = cut.rfind(" ")
+    if sp >= int((limit - 3) * 0.55):
+        cut = cut[:sp]
+    cut = cut.rstrip(" ,;:-")
+    return cut + "..."
+
+
+def _parse_iso_ts(ts_val):
+    if ts_val is None or ts_val == "":
+        return None
+    if isinstance(ts_val, (int, float)):
+        return float(ts_val)
+    try:
+        return datetime.fromisoformat(str(ts_val).strip().replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _is_retired_tool(tool_name: str, include_legacy: bool) -> bool:
+    if include_legacy:
+        return False
+    if tool_name.startswith("mcp_agy-fast_"):
+        return (HOME / ".gemini" / "config" / "plugins" / "whitemagic-agy-kit").exists()
+    return False
+
+
+def _clean_error_summary(raw_err: str) -> str:
+    first = next((ln.strip() for ln in str(raw_err or "").splitlines() if ln.strip()), "")
+    for prefix in ("Encountered error in step execution:", "Encountered error in tool execution:", "Error:"):
+        if first.startswith(prefix):
+            first = first[len(prefix) :].strip()
+    first = first.rstrip(": ").strip()
+    return _trunc_word(first, 56)
+
+
+def load_jsonl(path, tail_lines=600):
     if not path.exists():
         return []
     out = []
@@ -44,26 +86,47 @@ def main():
     ap = argparse.ArgumentParser(description="Consolidate SIM failures, AGY cache telemetry, and wm-squeeze savings.")
     ap.add_argument("--dry-run", action="store_true", help="Print digest without writing dream_digest.md")
     ap.add_argument("--window-days", type=int, default=7, help="Telemetry lookback window in days (default: 7)")
+    ap.add_argument("--include-legacy", action="store_true", help="Include failures from retired legacy mcp_agy-fast_* tools")
     args = ap.parse_args()
 
     now = time.time()
     cutoff = now - args.window_days * 86400
+    include_legacy = args.include_legacy or os.environ.get("WM_DREAM_INCLUDE_LEGACY") == "1"
 
-    # 1. Recurring SIM failures
-    sim_rows = load_jsonl(SIM_LEDGER, 400)
+    # 1. Windowed recurring SIM failures (skip retired legacy tools once fused plugin is active)
+    sim_rows = load_jsonl(SIM_LEDGER, 600)
     fail_counts = Counter()
     for r in sim_rows:
-        if r.get("event") == "tool_failure":
-            tool = r.get("tool", "?")
-            err = str(r.get("error", "")).splitlines()[0][:55]
-            fail_counts[f"{tool}: {err}"] += 1
+        if r.get("event") != "tool_failure":
+            continue
+        ts_epoch = _parse_iso_ts(r.get("ts"))
+        if ts_epoch is not None and ts_epoch < cutoff:
+            continue
+        tool = str(r.get("tool") or "?")
+        if _is_retired_tool(tool, include_legacy):
+            continue
+        err = _clean_error_summary(str(r.get("error") or ""))
+        key = f"{tool}: {err}" if err else tool
+        fail_counts[key] += 1
 
-    # 2. Rolling AGY telemetry
-    telem_rows = [r for r in load_jsonl(TELEM_LOG, 300) if float(r.get("ts_epoch", now)) >= cutoff]
-    tot_unc = sum(int(r.get("session_uncached", 0)) for r in telem_rows)
-    tot_cac = sum(int(r.get("session_cached", 0)) for r in telem_rows)
-    hits = [float(r["last_hit_pct"]) for r in telem_rows if r.get("last_hit_pct") is not None]
+    # 2. Rolling AGY telemetry (partition stop rows vs tool_spill events cleanly)
+    telem_recent = []
+    for r in load_jsonl(TELEM_LOG, 600):
+        row_ts = r.get("ts_epoch")
+        if row_ts is None:
+            row_ts = _parse_iso_ts(r.get("ts"))
+        if row_ts is None or float(row_ts) >= cutoff:
+            telem_recent.append(r)
+
+    stop_rows = [r for r in telem_recent if r.get("event", "stop") != "tool_spill"]
+    spill_rows = [r for r in telem_recent if r.get("event") == "tool_spill"]
+
+    tot_unc = sum(int(r.get("session_uncached", 0)) for r in stop_rows)
+    tot_cac = sum(int(r.get("session_cached", 0)) for r in stop_rows)
+    hits = [float(r["last_hit_pct"]) for r in stop_rows if r.get("last_hit_pct") is not None]
     avg_hit = (sum(hits) / len(hits)) if hits else None
+
+    spill_counts = Counter(str(r.get("kind") or "spill") for r in spill_rows)
 
     # 3. wm-squeeze savings
     sq_rows = [r for r in load_jsonl(SQUEEZE_LOG, 2000) if float(r.get("ts", now)) >= cutoff]
@@ -79,12 +142,12 @@ def main():
                 rule_warns.append(f"{rf.name}={sz//1024}KB(>75%)")
 
     lines = [
-        f"Dream Digest ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC, {args.window_days}d window):"
+        f"Dream Digest ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC, {args.window_days}d):"
     ]
-    if telem_rows:
+    if stop_rows:
         hit_s = f"{avg_hit:.1f}%" if avg_hit is not None else "n/a"
         lines.append(
-            f"  - AGY Telemetry: {len(telem_rows)} stops | avg cache hit {hit_s} | unc {tot_unc/1e6:.2f}M / cac {tot_cac/1e6:.1f}M"
+            f"  - AGY: {len(stop_rows)} stops | hit {hit_s} | unc {tot_unc/1e6:.2f}M / cac {tot_cac/1e6:.1f}M"
         )
     if sq_rows:
         pct = 100.0 * sq_saved / max(sq_raw, 1)
@@ -92,20 +155,27 @@ def main():
             f"  - wm-squeeze: {len(sq_rows)} cmds | saved {sq_saved/1024:.1f} KB ({pct:.0f}%, ~{sq_saved//4:,} tok)"
         )
     if fail_counts:
-        top_f = "; ".join(f"({n}x) {k}" for k, n in fail_counts.most_common(2))
-        lines.append(f"  - Top recurring tool failures: {top_f[:160]}")
+        top_items = [f"({n}x) {_trunc_word(k, 68)}" for k, n in fail_counts.most_common(2)]
+        lines.append(f"  - Top failures: {_trunc_word('; '.join(top_items), 148)}")
+    if spill_counts:
+        top_kind, top_cnt = spill_counts.most_common(1)[0]
+        lines.append(f"  - Spills ({len(spill_rows)}): {top_cnt}x {top_kind} (prefer scripts >25KB)")
     hms_h1 = DATA_DIR / "huginn1_estate.hms"
     hms_m4 = DATA_DIR / "muninn4_hippocampus.hms"
     if hms_h1.exists() or hms_m4.exists():
         h1_kb = hms_h1.stat().st_size // 1024 if hms_h1.exists() else 0
         m4_kb = hms_m4.stat().st_size // 1024 if hms_m4.exists() else 0
-        lines.append(f"  - Tricameral Holograms: Huginn-1={h1_kb}KB | Muninn-4={m4_kb}KB (use wm-huginn / wm-muninn)")
+        lines.append(f"  - Holograms: Huginn={h1_kb}KB | Muninn={m4_kb}KB")
     if rule_warns:
         lines.append(f"  - WARN rule budget: {', '.join(rule_warns)}")
 
-    digest = "\n".join(lines)
-    if len(digest) > 480:
-        digest = digest[:477] + "..."
+    # Fit whole lines cleanly within 460 bytes without mid-word clipping
+    kept = []
+    for ln in lines:
+        cand = "\n".join(kept + [ln])
+        if len(cand.encode("utf-8")) <= 460:
+            kept.append(ln)
+    digest = "\n".join(kept) if kept else _trunc_word(lines[0], 455)
 
     if args.dry_run:
         print(digest)

@@ -14,27 +14,86 @@ Portable (macOS + Linux) AGY PreToolUse Guard & Deterministic Token Optimizer (W
 
 import json
 import os
-import re
-import shlex
-import shutil
-import socket
-import stat as stat_mod
 import sys
-from pathlib import Path
 
-KEKKAI_SENSITIVE_RE = re.compile(
-    r"(?:\.ssh/|id_ed25519|id_rsa|\.aws/credentials|/etc/shadow|\bcurl\b[^;\n]*\|\s*(?:ba)?sh|\bwget\b[^;\n]*\|\s*(?:ba)?sh|\blandlock\b[^;\n]*\b(?:disable|bypass)\b|\bseccomp\b[^;\n]*\b(?:disable|bypass)\b)",
-    re.IGNORECASE,
+KEKKAI_SENSITIVE_PATTERN = (
+    r"(?:\.ssh/|id_ed25519|id_rsa|\.aws/credentials|/etc/shadow|\bcurl\b[^;\n]*\|\s*(?:ba)?sh|\bwget\b[^;\n]*\|\s*(?:ba)?sh|\blandlock\b[^;\n]*\b(?:disable|bypass)\b|\bseccomp\b[^;\n]*\b(?:disable|bypass)\b)"
 )
-HUGINN_SOCK = Path(os.environ.get("WM_TRICAMERAL_SOCK_DIR", "/tmp")) / "wm_huginn.sock"
+HUGINN_SOCK = os.path.join(os.environ.get("WM_TRICAMERAL_SOCK_DIR") or "/tmp", "wm_huginn.sock")
+
+DESTRUCTIVE_PATTERN_SPECS = (
+    (
+        r"(?:^|[;&|]\s*)rm\s+(?:-(?:[^\s]*r[^\s]*f|[^\s]*f[^\s]*r)[^\s]*|-[^\s]*r[^\s]*\s+-[^\s]*f[^\s]*|-[^\s]*f[^\s]*\s+-[^\s]*r[^\s]*)\s+(?:/\s*$|/\*|\~|\$HOME(?:\s|$)|/(?:home|Users)/[^/\s]+(?:\s|$))",
+        "Recursive force-delete targeting root or home directory",
+    ),
+    (r"\bdrop\s+(?:table|database|schema|view)\b", "SQL DROP statement detected"),
+    (r"\btruncate\s+table\b", "SQL TRUNCATE TABLE detected"),
+    (r"\bgcloud\s+projects\s+delete\b", "Destructive gcloud project deletion detected"),
+    (r"\b(?:gsutil|gcloud\s+storage)\s+rm\b", "Cloud Storage deletion command detected"),
+    (r"\bgit\s+push\s+(?:--force|-f)\b.*\b(?:main|master)\b", "Force-push to main/master branch detected"),
+    (
+        r"\bmkfs\.[a-z0-9]+\b|\bdd\s+if=.*\bof=/dev/|\bdiskutil\s+(?:eraseDisk|eraseVolume|partitionDisk)\b",
+        "Raw disk/block device formatting or overwrite detected",
+    ),
+)
+
+_DESTRUCTIVE_CACHE = None
+_KEKKAI_RE_CACHE = None
+_SHELL_RE_CACHE = None
+_ENV_RE_CACHE = None
+
+
+def _state_dir() -> str:
+    return os.environ.get("WM_HOOK_STATE_DIR") or "/tmp/agy-hook-state"
+
+
+def _san_conv_id(conv_id: str) -> str:
+    return "".join(c for c in conv_id if c.isascii() and (c.isalnum() or c in "_-"))[:20]
+
+
+def _get_destructive_patterns():
+    global _DESTRUCTIVE_CACHE
+    if _DESTRUCTIVE_CACHE is None:
+        import re
+        _DESTRUCTIVE_CACHE = [(re.compile(p, re.IGNORECASE), msg) for p, msg in DESTRUCTIVE_PATTERN_SPECS]
+    return _DESTRUCTIVE_CACHE
+
+
+def _get_kekkai_re():
+    global _KEKKAI_RE_CACHE
+    if _KEKKAI_RE_CACHE is None:
+        import re
+        _KEKKAI_RE_CACHE = re.compile(KEKKAI_SENSITIVE_PATTERN, re.IGNORECASE)
+    return _KEKKAI_RE_CACHE
+
+
+def _get_shell_res():
+    global _SHELL_RE_CACHE
+    if _SHELL_RE_CACHE is None:
+        import re
+        _SHELL_RE_CACHE = (
+            re.compile(r"^[A-Za-z_][A-Za-z0-9_]*="),
+            re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1"),
+            re.compile(r"^-[A-Za-z]*i"),
+        )
+    return _SHELL_RE_CACHE
+
+
+def _get_env_re():
+    global _ENV_RE_CACHE
+    if _ENV_RE_CACHE is None:
+        import re
+        _ENV_RE_CACHE = re.compile(r"^\.env(?:\.([A-Za-z0-9_.-]+))?$", re.IGNORECASE)
+    return _ENV_RE_CACHE
 
 
 def check_huginn_kekkai_socket(cmd):
     """Zero-spawn (<175ms) neural Kekkai check over resident wm_huginn.sock for sensitive commands."""
-    if os.environ.get("WM_HUGINN_KEKKAI_OFF") == "1" or not HUGINN_SOCK.exists():
+    if os.environ.get("WM_HUGINN_KEKKAI_OFF") == "1" or not os.path.exists(HUGINN_SOCK):
         return None
-    if not KEKKAI_SENSITIVE_RE.search(cmd):
+    if not _get_kekkai_re().search(cmd):
         return None
+    import socket
     try:
         req = {
             "id": "pretool_kekkai",
@@ -47,7 +106,7 @@ def check_huginn_kekkai_socket(cmd):
         }
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(0.8)
-            s.connect(str(HUGINN_SOCK))
+            s.connect(HUGINN_SOCK)
             s.sendall((json.dumps(req) + "\n").encode("utf-8"))
             buf = b""
             while not buf.endswith(b"\n"):
@@ -67,37 +126,15 @@ def check_huginn_kekkai_socket(cmd):
         return None
     return None
 
-DESTRUCTIVE_PATTERNS = [
-    (
-        re.compile(
-            r"(?:^|[;&|]\s*)rm\s+(?:-(?:[^\s]*r[^\s]*f|[^\s]*f[^\s]*r)[^\s]*|-[^\s]*r[^\s]*\s+-[^\s]*f[^\s]*|-[^\s]*f[^\s]*\s+-[^\s]*r[^\s]*)\s+(?:/\s*$|/\*|\~|\$HOME(?:\s|$)|/(?:home|Users)/[^/\s]+(?:\s|$))",
-            re.IGNORECASE,
-        ),
-        "Recursive force-delete targeting root or home directory",
-    ),
-    (re.compile(r"\bdrop\s+(?:table|database|schema|view)\b", re.IGNORECASE), "SQL DROP statement detected"),
-    (re.compile(r"\btruncate\s+table\b", re.IGNORECASE), "SQL TRUNCATE TABLE detected"),
-    (re.compile(r"\bgcloud\s+projects\s+delete\b", re.IGNORECASE), "Destructive gcloud project deletion detected"),
-    (re.compile(r"\b(?:gsutil|gcloud\s+storage)\s+rm\b", re.IGNORECASE), "Cloud Storage deletion command detected"),
-    (re.compile(r"\bgit\s+push\s+(?:--force|-f)\b.*\b(?:main|master)\b", re.IGNORECASE), "Force-push to main/master branch detected"),
-    (
-        re.compile(
-            r"\bmkfs\.[a-z0-9]+\b|\bdd\s+if=.*\bof=/dev/|\bdiskutil\s+(?:eraseDisk|eraseVolume|partitionDisk)\b",
-            re.IGNORECASE,
-        ),
-        "Raw disk/block device formatting or overwrite detected",
-    ),
-]
-_CONV_ID_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
-
-def _write_json_atomic(path: Path, payload_obj) -> None:
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    with tmp.open("w", encoding="utf-8") as fh:
+def _write_json_atomic(path: str, payload_obj) -> None:
+    d, base = os.path.split(path)
+    tmp = os.path.join(d, f".{base}.tmp.{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload_obj, fh)
     os.replace(tmp, path)
 
-SHELL_META_RE = re.compile(r"[|><;`\n$*?\[\]{}]|(?<!&)&(?!&)|(?:^|\s)~")
+
 _UNQUOTED_UNSAFE_CHARS = set("|><;`\n$*?[]{}()")
 _DOUBLE_QUOTED_UNSAFE_CHARS = set("$`\n")
 _PY_SAFE_FLAGS = {"-u", "-B", "-S", "-O", "-E", "-s", "-q"}
@@ -109,18 +146,22 @@ _COMPOUND_SAFE_CMDS = {
     "git", "cargo", "pytest", "go", "npm", "pnpm", "yarn", "ruff", "mypy", "eslint",
     "tsc", "python3", "python", "wm3", "wm-gen3", "wm-preflight-brief", "wm-sim",
     "wm-models", "wm-handoff", "wm-codegraph", "wm-vps", "wm-triage", "agy", "gh",
-    "systemctl", "true", "false",
+    "systemctl", "xargs", "true", "false",
 }
-_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_HEREDOC_OP_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
-_SED_INPLACE_RE = re.compile(r"^-[A-Za-z]*i")
+_XARGS_READONLY_CMDS = {
+    "echo", "printf", "ls", "ll", "wc", "head", "tail", "cat", "nl",
+    "stat", "file", "du", "rg", "grep", "egrep", "fgrep", "sort", "uniq",
+    "cut", "tr", "sha256sum", "shasum", "md5sum", "jq",
+}
+_XARGS_SAFE_NOARG_FLAGS = {"-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit"}
+_XARGS_SAFE_ARG_FLAGS = {"-n", "-P", "-L", "-I", "-d", "-s", "-E", "--max-args", "--max-procs", "--replace", "--delimiter", "--max-chars", "--eof"}
 MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".pdf")
 BINARY_EXTS = (
     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".pdf", ".zip", ".gz", ".tar",
     ".zst", ".xz", ".bz2", ".bin", ".exe", ".so", ".dylib", ".dll", ".o", ".a",
     ".wasm", ".sqlite", ".db", ".gguf", ".safetensors", ".pt", ".pth", ".mp3", ".mp4", ".wav",
 )
-STATE_DIR = Path(os.environ.get("WM_HOOK_STATE_DIR", "/tmp/agy-hook-state"))
+IGNORED_HINT_NAMES = {".git", "node_modules", "__pycache__", ".DS_Store"}
 
 
 def emit(obj):
@@ -149,26 +190,26 @@ def latest_ctx_tokens(transcript_path):
     if not transcript_path:
         return 0
     try:
-        p = Path(transcript_path)
-        st = p.stat()
-        if not stat_mod.S_ISREG(st.st_mode):
+        st = os.stat(transcript_path)
+        if (st.st_mode & 0o170000) != 0o100000:
             return 0
         sz = st.st_size
         mtime_ns = st.st_mtime_ns
-        # Fast O(1) stat-cache hit across parallel tool bursts within the same turn
-        cf = STATE_DIR / "ctx_stat_cache.json"
+        state_dir = _state_dir()
+        cf = os.path.join(state_dir, "ctx_stat_cache.json")
         try:
-            if cf.is_file():
-                cached = json.loads(cf.read_text(encoding="utf-8"))
+            if os.path.isfile(cf):
+                with open(cf, "r", encoding="utf-8") as f:
+                    cached = json.loads(f.read())
                 if (
-                    cached.get("path") == str(p)
+                    cached.get("path") == str(transcript_path)
                     and cached.get("sz") == sz
                     and cached.get("mtime_ns") == mtime_ns
                 ):
                     return int(cached.get("ctx") or 0)
         except Exception:
             pass
-        with open(p, "rb") as f:
+        with open(transcript_path, "rb") as f:
             if sz > 24576:
                 f.seek(sz - 24576)
             tail = f.read().decode("utf-8", errors="replace")
@@ -186,9 +227,9 @@ def latest_ctx_tokens(transcript_path):
                     ctx_found = ctx
                     break
         try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            os.makedirs(state_dir, exist_ok=True)
             _write_json_atomic(
-                cf, {"path": str(p), "sz": sz, "mtime_ns": mtime_ns, "ctx": ctx_found}
+                cf, {"path": str(transcript_path), "sz": sz, "mtime_ns": mtime_ns, "ctx": ctx_found}
             )
         except Exception:
             pass
@@ -199,11 +240,12 @@ def latest_ctx_tokens(transcript_path):
 
 
 def find_wm_squeeze():
+    import shutil
     if shutil.which("wm-squeeze"):
         return "wm-squeeze"
-    cand = Path.home() / ".local" / "bin" / "wm-squeeze"
-    if cand.is_file() and os.access(cand, os.X_OK):
-        return str(cand)
+    cand = os.path.join(os.path.expanduser("~"), ".local", "bin", "wm-squeeze")
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
     return None
 
 
@@ -398,6 +440,53 @@ def _split_top_level_and(s: str):
     return parts
 
 
+def _strip_unquoted_line_continuations(s: str) -> str:
+    """Collapse shell backslash-newline continuations outside single quotes (matches bash outside/double quotes)."""
+    if "\\\n" not in s and "\\\r\n" not in s:
+        return s
+    out = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 < n and s[i + 1] == "\n":
+                out.append(" ")
+                i += 2
+                continue
+            if i + 2 < n and s[i + 1] == "\r" and s[i + 2] == "\n":
+                out.append(" ")
+                i += 3
+                continue
+            if i + 1 < n:
+                out.append(ch)
+                out.append(s[i + 1])
+                i += 2
+                continue
+        if ch == "'":
+            if not in_double:
+                in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _strip_inline_comment(seg: str) -> str:
     """Strip shell `# comment` outside single/double quotes and escapes."""
     in_single = False
@@ -431,26 +520,70 @@ def _strip_inline_comment(seg: str) -> str:
     return seg.strip()
 
 
+def _is_xargs_safe(cmd_args: list[str]) -> bool:
+    """Allow xargs only with harmless flags and a strictly read-only subcommand."""
+    i = 0
+    n = len(cmd_args)
+    while i < n:
+        a = cmd_args[i]
+        if a == "--":
+            i += 1
+            break
+        if not a.startswith("-"):
+            break
+        if a in _XARGS_SAFE_NOARG_FLAGS:
+            i += 1
+            continue
+        if a in _XARGS_SAFE_ARG_FLAGS:
+            i += 2
+            continue
+        if any(a.startswith(f + "=") for f in _XARGS_SAFE_ARG_FLAGS if f.startswith("--")):
+            i += 1
+            continue
+        if len(a) >= 2 and a[:2] in ("-n", "-P", "-L", "-I", "-d", "-s", "-E"):
+            i += 1
+            continue
+        if a.startswith("-") and not a.startswith("--") and all(("-" + c) in _XARGS_SAFE_NOARG_FLAGS for c in a[1:]):
+            i += 1
+            continue
+        return False
+
+    sub_toks = cmd_args[i:]
+    if not sub_toks:
+        return True
+    first_sub = sub_toks[0]
+    if "{" in first_sub or "}" in first_sub or "$" in first_sub:
+        return False
+    sub_base = os.path.basename(first_sub)
+    sub_args = sub_toks[1:]
+    if sub_base not in _XARGS_READONLY_CMDS:
+        return False
+    if sub_base == "rg":
+        return not any(x == "--pre" or x.startswith("--pre=") for x in sub_args)
+    return True
+
+
 def _is_compound_segment_safe(seg: str) -> tuple[bool, str, list[str]]:
     """Validate one statement/pipe segment for read-only/diagnostic safety."""
+    import re
+    import shlex
+    assign_re, heredoc_op_re, sed_inplace_re = _get_shell_res()
+
     cleaned = _strip_inline_comment(seg)
     if not cleaned:
         return True, "", []
-    # Strip harmless trailing/inline 2>&1, 2>/dev/null, >/dev/null
     cleaned = re.sub(r"(?:^|\s)(?:2>&1|2>/dev/null|>/dev/null|>&[12])(?=\s|$)", " ", cleaned).strip()
-    # Strip trailing heredoc operator (`<<'TAG'` / `<<TAG`) for tokenization if present
-    cleaned = _HEREDOC_OP_RE.sub("", cleaned).strip()
+    cleaned = heredoc_op_re.sub("", cleaned).strip()
     if not cleaned:
         return True, "", []
     try:
         toks = shlex.split(cleaned)
     except Exception:
         return False, "", []
-    while toks and _ASSIGN_RE.match(toks[0]):
+    while toks and assign_re.match(toks[0]):
         toks.pop(0)
     if not toks:
         return True, "", []
-    # Reject shell control-flow keywords (only wrap clean command sequences/pipelines)
     if toks[0] in ("if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "function"):
         return False, "", []
 
@@ -461,10 +594,11 @@ def _is_compound_segment_safe(seg: str) -> tuple[bool, str, list[str]]:
 
     if cmd_base in ("cargo", "pytest", "go", "npm", "pnpm", "yarn", "rg", "grep", "find", "wm3", "wm-gen3", "gh"):
         return is_safe_squeezable(cmd_base, cmd_args), cmd_base, cmd_args
+    if cmd_base == "xargs":
+        return _is_xargs_safe(cmd_args), cmd_base, cmd_args
     if cmd_base == "git":
         if is_safe_squeezable("git", cmd_args):
             return True, cmd_base, cmd_args
-        # Also allow rev-parse / describe / remote -v
         i = 0
         while i < len(cmd_args):
             a = cmd_args[i]
@@ -481,7 +615,6 @@ def _is_compound_segment_safe(seg: str) -> tuple[bool, str, list[str]]:
             return ok, cmd_base, cmd_args
         return False, cmd_base, cmd_args
     if cmd_base in ("python3", "python"):
-        # Only allow `-c`, `-` (heredoc), `--version`, or safe `-m` modules
         rest = [a for a in cmd_args if a not in _PY_SAFE_FLAGS]
         if not rest:
             return False, cmd_base, cmd_args
@@ -492,7 +625,7 @@ def _is_compound_segment_safe(seg: str) -> tuple[bool, str, list[str]]:
         return False, cmd_base, cmd_args
     if cmd_base == "sed":
         for a in cmd_args:
-            if a == "--in-place" or a.startswith("--in-place=") or _SED_INPLACE_RE.match(a):
+            if a == "--in-place" or a.startswith("--in-place=") or sed_inplace_re.match(a):
                 return False, cmd_base, cmd_args
         return True, cmd_base, cmd_args
     if cmd_base == "awk":
@@ -517,6 +650,8 @@ def _maybe_wrap_safe_compound_readonly(s: str):
         return None
     if not s or "wm-squeeze" in s:
         return None
+    import shlex
+    _, heredoc_op_re, _ = _get_shell_res()
 
     segments = []  # list of (sep_before, seg_text)
     cur = []
@@ -555,6 +690,14 @@ def _maybe_wrap_safe_compound_readonly(s: str):
             continue
         if in_double:
             if ch == "\\":
+                if i + 1 < n and s[i + 1] == "\n":
+                    cur.append(" ")
+                    i += 2
+                    continue
+                if i + 2 < n and s[i + 1] == "\r" and s[i + 2] == "\n":
+                    cur.append(" ")
+                    i += 3
+                    continue
                 cur.append(ch)
                 escaped = True
                 i += 1
@@ -569,6 +712,14 @@ def _maybe_wrap_safe_compound_readonly(s: str):
 
         # Outside quotes
         if ch == "\\":
+            if i + 1 < n and s[i + 1] == "\n":
+                cur.append(" ")
+                i += 2
+                continue
+            if i + 2 < n and s[i + 1] == "\r" and s[i + 2] == "\n":
+                cur.append(" ")
+                i += 3
+                continue
             cur.append(ch)
             escaped = True
             i += 1
@@ -590,7 +741,7 @@ def _maybe_wrap_safe_compound_readonly(s: str):
         if ch == "<" and i + 1 < n and s[i + 1] == "(":
             return None
         if ch == "<" and i + 1 < n and s[i + 1] == "<":
-            m_hd = _HEREDOC_OP_RE.match(s, i)
+            m_hd = heredoc_op_re.match(s, i)
             if m_hd:
                 pending_heredoc = m_hd.group(2)
                 cur.append(m_hd.group(0))
@@ -599,7 +750,6 @@ def _maybe_wrap_safe_compound_readonly(s: str):
         if ch == ">":
             if i + 1 < n and s[i + 1] == "(":
                 return None
-            # Allow only 2>&1, 2>/dev/null, >/dev/null, >&1, >&2
             prev_ch = s[i - 1] if i > 0 else ""
             if s.startswith(">&1", i) or s.startswith(">&2", i):
                 cur.append(s[i : i + 3])
@@ -684,6 +834,8 @@ def _maybe_wrap_safe_compound_readonly(s: str):
 
 def _maybe_wrap_python_dash_c(s: str):
     """Wrap standalone `python3 -c "..."` (single or multiline) through `wm-squeeze --pipe`."""
+    import re
+    import shlex
     cleaned = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
     if not cleaned:
         return None
@@ -716,13 +868,15 @@ def maybe_squeeze_command(cmd_line):
     s = (cmd_line or "").strip()
     if not s or "wm-squeeze" in s:
         return None
+    import re
+    import shlex
 
-    # Safe inline Python heredoc output cap (`[cd <dir> && ] python3 [-u|-B] - <<'PY' ...`)
+    # Safe inline Python heredoc output cap (`[cd <dir|quoted dir> && ] python3 [-u|-B] - <<'PY' ...`)
     if "\n" in s and os.environ.get("WM_SQUEEZE_HEREDOC_OFF") != "1":
         lines = s.splitlines()
         first = lines[0].strip()
         m = re.match(
-            r"^(?:cd\s+\S+\s+&&\s+)?(python3?(?:\s+-[uBSO]+)*)\s+-\s+<<(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2(?:\s+(?:2>&1|2>/dev/null))*\s*$",
+            r"""^(?:cd\s+(?:"[^"\n]+"|'[^'\n]+'|\S+)\s+&&\s+)?(python3?(?:\s+-[uBSO]+)*)\s+-\s+<<(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2(?:\s+(?:2>&1|2>/dev/null))*\s*$""",
             first,
         )
         if m and not any(ch in first for ch in ("|", ";", "$", "`")) and not re.search(r"(?<!&)&\s*$", first):
@@ -743,12 +897,13 @@ def maybe_squeeze_command(cmd_line):
         if wrapped_py:
             return wrapped_py
 
-    # Strip harmless trailing 2>&1 / 2>/dev/null (wm-squeeze captures stdout + stderr)
+    # Strip harmless trailing 2>&1 / 2>/dev/null and unquoted backslash-newline line continuations
     s_single = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
     if not s_single:
         return None
+    s_norm = _strip_unquoted_line_continuations(s_single)
 
-    parts = _split_top_level_and(s_single)
+    parts = _split_top_level_and(s_norm)
     if parts:
         cwd_arg = None
         toks = None
@@ -764,9 +919,9 @@ def maybe_squeeze_command(cmd_line):
                         toks = rtoks
                 except Exception:
                     toks = None
-        elif len(parts) == 1 and not _has_unsafe_shell_meta(s_single):
+        elif len(parts) == 1 and not _has_unsafe_shell_meta(s_norm):
             try:
-                toks = shlex.split(s_single) or None
+                toks = shlex.split(s_norm) or None
             except Exception:
                 toks = None
 
@@ -812,15 +967,16 @@ def is_wide_line_file(path_obj, size: int) -> bool:
         return False
 
 
-def file_exceeds_lines(path_obj, threshold=250):
+def file_exceeds_lines(path_str, threshold=250, sz=None):
     """Fast streaming check (<1ms): returns True if file has >threshold lines or >24KB text."""
     try:
-        sz = path_obj.stat().st_size
+        if sz is None:
+            sz = os.stat(path_str).st_size
         if sz <= 4096:
             return False
         if sz > 32768:
             return True
-        with open(path_obj, "rb") as f:
+        with open(path_str, "rb") as f:
             chunk = f.read(32768)
         if b"\x00" in chunk[:1024]:
             return False  # binary
@@ -833,12 +989,14 @@ def check_and_record_read_dedup(conv_id, abs_path, start_line, end_line, step_id
     if not conv_id or os.environ.get("WM_READ_DEDUP_OFF") == "1":
         return None
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        sf = STATE_DIR / f"{_CONV_ID_SANITIZE_RE.sub('', conv_id)[:20]}.json"
+        state_dir = _state_dir()
+        os.makedirs(state_dir, exist_ok=True)
+        sf = os.path.join(state_dir, f"{_san_conv_id(conv_id)}.json")
         state = {}
-        if sf.is_file():
+        if os.path.isfile(sf):
             try:
-                state = json.loads(sf.read_text(encoding="utf-8"))
+                with open(sf, "r", encoding="utf-8") as fh:
+                    state = json.loads(fh.read())
             except Exception:
                 state = {}
         key = f"{abs_path}|{start_line}|{end_line}"
@@ -856,7 +1014,6 @@ def check_and_record_read_dedup(conv_id, abs_path, start_line, end_line, step_id
                 )
         state[key] = {"mtime_ns": mtime_ns, "size": size, "step": step_idx, "ctx": cur_ctx}
         if len(state) > 128:
-            # Drop oldest half by step
             items = sorted(state.items(), key=lambda kv: kv[1].get("step", 0))[-96:]
             state = dict(items)
         _write_json_atomic(sf, state)
@@ -870,12 +1027,14 @@ def track_and_check_burst(conv_id, abs_path, step_idx):
     if not conv_id or step_idx <= 0:
         return False
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        bf = STATE_DIR / f"burst_{_CONV_ID_SANITIZE_RE.sub('', conv_id)[:20]}.json"
+        state_dir = _state_dir()
+        os.makedirs(state_dir, exist_ok=True)
+        bf = os.path.join(state_dir, f"burst_{_san_conv_id(conv_id)}.json")
         entries = []
-        if bf.is_file():
+        if os.path.isfile(bf):
             try:
-                raw = json.loads(bf.read_text(encoding="utf-8"))
+                with open(bf, "r", encoding="utf-8") as fh:
+                    raw = json.loads(fh.read())
                 if isinstance(raw, list):
                     entries = raw
             except Exception:
@@ -894,6 +1053,148 @@ def track_and_check_burst(conv_id, abs_path, step_idx):
         return False
 
 
+def _to_int(val):
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    try:
+        return int(val)
+    except Exception:
+        return None
+
+
+def _split_name_tokens(stem: str):
+    cur = []
+    out = []
+    for ch in stem.lower():
+        if ch.isalnum():
+            cur.append(ch)
+        elif cur:
+            out.append("".join(cur))
+            cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _score_filename(cand_name: str, target_name: str) -> float:
+    cl = cand_name.lower()
+    tl = target_name.lower()
+    if cl == tl:
+        return 100.0
+    c_stem, c_ext = os.path.splitext(cl)
+    t_stem, t_ext = os.path.splitext(tl)
+    score = 0.0
+    if t_ext and c_ext == t_ext:
+        score += 10.0
+    if t_stem and c_stem:
+        if t_stem in c_stem or c_stem in t_stem:
+            score += 22.0
+        pref = 0
+        for a, b in zip(c_stem, t_stem):
+            if a == b:
+                pref += 1
+            else:
+                break
+        if pref >= 2:
+            score += min(pref, 12) * 3.0
+        t_toks = {t for t in _split_name_tokens(t_stem) if len(t) >= 2}
+        if t_toks:
+            c_toks = set(_split_name_tokens(c_stem))
+            score += 8.0 * len(t_toks & c_toks)
+        c_set, t_set = set(c_stem), set(t_stem)
+        union = len(c_set | t_set)
+        if union:
+            score += 8.0 * len(c_set & t_set) / union
+    return score
+
+
+def _missing_path_hint(p_str: str, raw_path: str) -> str:
+    """Bounded O(1) scan of parent/grandparent directory for missing read_file targets."""
+    try:
+        if os.path.isdir(p_str):
+            items = []
+            with os.scandir(p_str) as it:
+                for idx, entry in enumerate(it):
+                    if idx >= 80:
+                        break
+                    if entry.name in IGNORED_HINT_NAMES:
+                        continue
+                    try:
+                        items.append(entry.name + ("/" if entry.is_dir() else ""))
+                    except Exception:
+                        items.append(entry.name)
+            items.sort()
+            shown = ", ".join(items[:10])
+            suffix = f" (+{len(items) - 10} more)" if len(items) > 10 else ""
+            base = os.path.basename(p_str) or p_str
+            return (
+                f"[Path Hint] `{base}` is a directory, not a file. "
+                + (f"Entries: {shown}{suffix}." if shown else "Directory is empty.")
+            )
+
+        parent = os.path.dirname(p_str)
+        target_name = os.path.basename(p_str)
+        gp_hit = ""
+        gp = os.path.dirname(parent) if parent else ""
+        if gp and gp != parent and target_name and os.path.isdir(gp):
+            cand_gp = os.path.join(gp, target_name)
+            if os.path.isfile(cand_gp):
+                gp_hit = cand_gp
+
+        if parent and os.path.isdir(parent):
+            scored = []
+            with os.scandir(parent) as it:
+                for idx, entry in enumerate(it):
+                    if idx >= 100:
+                        break
+                    if entry.name in IGNORED_HINT_NAMES:
+                        continue
+                    try:
+                        disp = entry.name + ("/" if entry.is_dir() else "")
+                    except Exception:
+                        disp = entry.name
+                    scored.append((-_score_filename(entry.name, target_name), disp.lower(), disp))
+            scored.sort()
+            best = [item[2] for item in scored[:4]]
+            p_disp = os.path.basename(parent) or parent
+            msg = f"[Path Hint] File does not exist: `{raw_path}`."
+            if best:
+                msg += f" Closest in `{p_disp}/`: {', '.join(best)}."
+            else:
+                msg += f" `{p_disp}/` has no matching entries."
+            if gp_hit:
+                msg += f" Found `{target_name}` in parent dir: `{gp_hit}`."
+            return msg
+
+        if gp and os.path.isdir(gp):
+            gp_entries = []
+            with os.scandir(gp) as it:
+                for idx, entry in enumerate(it):
+                    if idx >= 60:
+                        break
+                    if entry.name in IGNORED_HINT_NAMES:
+                        continue
+                    try:
+                        disp = entry.name + ("/" if entry.is_dir() else "")
+                    except Exception:
+                        disp = entry.name
+                    gp_entries.append((-_score_filename(entry.name, os.path.basename(parent)), disp.lower(), disp))
+            gp_entries.sort()
+            gp_best = [item[2] for item in gp_entries[:4]]
+            msg = f"[Path Hint] Parent directory does not exist: `{parent}`."
+            if gp_hit:
+                msg += f" Found `{target_name}` at `{gp_hit}`."
+            elif gp_best:
+                msg += f" Closest in `{gp}/`: {', '.join(gp_best)}."
+            return msg
+
+        return f"[Path Hint] File and parent directory do not exist: `{raw_path}`."
+    except Exception:
+        return f"[Path Hint] File does not exist: `{raw_path}`."
+
+
 def handle_read_file(args, payload):
     raw_path = args.get("Path") or args.get("path") or ""
     if not raw_path:
@@ -902,7 +1203,7 @@ def handle_read_file(args, payload):
     transcript = payload.get("transcriptPath") or ""
     cur_ctx = 0
 
-    # C1: Multimodal >=150k cache-cliff guard
+    # C1: Multimodal >=150k cache-cliff guard (must precede disk existence checks)
     if low.endswith(MEDIA_EXTS):
         cur_ctx = latest_ctx_tokens(transcript)
         if cur_ctx >= 150_000:
@@ -920,13 +1221,26 @@ def handle_read_file(args, payload):
     if "/.system_generated/" in str(raw_path) or low.endswith(BINARY_EXTS):
         return {"decision": "allow"}
 
-    p = Path(raw_path)
-    if not p.is_file():
-        return {"decision": "allow"}
+    p_raw = os.path.expanduser(str(raw_path).strip())
+    if not os.path.isabs(p_raw):
+        cwd = str(payload.get("cwd") or "").strip()
+        if cwd and os.path.isdir(cwd):
+            p_str = os.path.normpath(os.path.join(cwd, p_raw))
+        elif os.path.exists(p_raw):
+            p_str = os.path.abspath(p_raw)
+        else:
+            return {"decision": "allow"}
+    else:
+        p_str = os.path.normpath(p_raw)
+
+    if not os.path.isfile(p_str):
+        if os.environ.get("WM_READ_HINT_OFF") == "1":
+            return {"decision": "allow"}
+        return {"decision": "deny", "reason": _missing_path_hint(p_str, str(raw_path))}
 
     try:
-        st = p.stat()
-        abs_p = str(p.resolve())
+        st = os.stat(p_str)
+        abs_p = os.path.realpath(p_str)
     except Exception:
         return {"decision": "allow"}
 
@@ -936,18 +1250,20 @@ def handle_read_file(args, payload):
     overwrite = {}
     conv_id = str(payload.get("conversationId") or "")
     step_idx = int(payload.get("stepIdx") or 0)
+    s_int = _to_int(s_line)
+    e_int = _to_int(e_line)
 
-    # C2: Auto-clamp unbounded, unbounded-tail, wide-span (>250L / >200L@120k), or wide-line files (>50L)
+    # C2: Self-heal inverted/invalid line ranges + auto-clamp unbounded/wide-span/wide-line reads
     if b_off is None and os.environ.get("WM_READ_CLAMP_OFF") != "1":
-        span = None
-        if s_line is not None and e_line is not None:
-            try:
-                span = int(e_line) - int(s_line) + 1
-            except Exception:
-                span = None
-        wide_lines = (span is None or span > 50) and is_wide_line_file(p, st.st_size)
-        # Fast-path: explicitly bounded <=150L (or <=50L on wide-line files) cannot trigger clamping
-        already_compact = span is not None and span <= (50 if wide_lines else 150)
+        if s_int is not None and s_int < 1:
+            s_int = 1
+            s_line = 1
+            overwrite["StartLine"] = 1
+        inverted = s_int is not None and e_int is not None and e_int < s_int
+        span = (e_int - s_int + 1) if (s_int is not None and e_int is not None and not inverted) else None
+        wide_lines = (inverted or span is None or span > 50) and is_wide_line_file(p_str, st.st_size)
+
+        already_compact = (not inverted) and (span is not None) and span <= (50 if wide_lines else 150)
         if not already_compact:
             cur_ctx = latest_ctx_tokens(transcript)
             max_span = 150 if cur_ctx >= 120_000 else 200
@@ -955,27 +1271,53 @@ def handle_read_file(args, payload):
             if wide_lines:
                 max_span = min(max_span, 50)
                 clamp_trigger = min(clamp_trigger, 60)
-            is_large_file = wide_lines or file_exceeds_lines(p, threshold=clamp_trigger)
+            is_large_file = wide_lines or file_exceeds_lines(p_str, threshold=clamp_trigger, sz=st.st_size)
             if is_large_file and conv_id and step_idx > 0:
                 if track_and_check_burst(conv_id, abs_p, step_idx):
                     max_span = min(max_span, 120 if not wide_lines else 50)
 
-            if s_line is None and e_line is None:
+            if inverted:
+                if 1 <= e_int <= 250:
+                    # EndLine passed as line count -> compute inclusive EndLine
+                    e_int = s_int + min(e_int, max_span) - 1
+                    e_line = e_int
+                    overwrite["EndLine"] = e_int
+                elif e_int > 250:
+                    # Swapped (StartLine, EndLine) -> flip and bound to max_span
+                    new_s = e_int
+                    new_e = min(s_int, new_s + max_span - 1)
+                    s_int, e_int = new_s, new_e
+                    s_line, e_line = new_s, new_e
+                    overwrite["StartLine"] = new_s
+                    overwrite["EndLine"] = new_e
+                else:
+                    e_int = s_int + max_span - 1
+                    e_line = e_int
+                    overwrite["EndLine"] = e_int
+            elif s_int is None and e_int is None:
                 if is_large_file:
                     s_line = 1
                     e_line = max_span
-                    overwrite = {"StartLine": 1, "EndLine": max_span}
-            elif s_line is not None and e_line is None:
+                    overwrite["StartLine"] = 1
+                    overwrite["EndLine"] = max_span
+            elif s_int is not None and e_int is None:
                 if is_large_file:
-                    s_int = int(s_line)
                     e_line = s_int + max_span - 1
-                    overwrite = {"EndLine": e_line}
-            elif s_line is not None and e_line is not None:
-                s_int = int(s_line)
-                e_int = int(e_line)
+                    overwrite["EndLine"] = e_line
+            elif s_int is not None and e_int is not None:
                 if (e_int - s_int + 1) > clamp_trigger:
                     e_line = s_int + max_span - 1
-                    overwrite = {"EndLine": e_line}
+                    overwrite["EndLine"] = e_line
+            elif s_int is None and e_int is not None:
+                if e_int < 1:
+                    e_int = max_span
+                    e_line = e_int
+                    overwrite["EndLine"] = e_int
+                elif is_large_file and e_int > clamp_trigger:
+                    s_line = 1
+                    e_line = max_span
+                    overwrite["StartLine"] = 1
+                    overwrite["EndLine"] = max_span
 
     # C3: Exact unchanged duplicate-slice dedup
     if conv_id and step_idx > 0:
@@ -1007,7 +1349,6 @@ def handle_whitemagic_mcp(tool_name, args):
         if ow:
             return {"decision": "allow", "overwrite": ow}
     elif tool_name == "mcp_whitemagic_whitemagic_gen3_memory_recall":
-        # Gen3 cyberbrain memory_recall schema accepts {query, limit, scope, historical} (no max_content_bytes)
         lim = args.get("limit")
         if lim is None or (isinstance(lim, (int, float)) and lim > 6):
             return {"decision": "allow", "overwrite": {"limit": 5}}
@@ -1032,12 +1373,14 @@ def handle_manage_task(args, payload):
     if action != "status" or not task_id or not conv_id:
         return {"decision": "allow"}
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        pf = STATE_DIR / f"poll_{_CONV_ID_SANITIZE_RE.sub('', conv_id)[:20]}.json"
+        state_dir = _state_dir()
+        os.makedirs(state_dir, exist_ok=True)
+        pf = os.path.join(state_dir, f"poll_{_san_conv_id(conv_id)}.json")
         state = {}
-        if pf.is_file():
+        if os.path.isfile(pf):
             try:
-                state = json.loads(pf.read_text(encoding="utf-8"))
+                with open(pf, "r", encoding="utf-8") as fh:
+                    state = json.loads(fh.read())
             except Exception:
                 state = {}
         entry = state.get(task_id) or {"count": 0, "last_step": -999}
@@ -1065,18 +1408,19 @@ def handle_manage_task(args, payload):
     return {"decision": "allow"}
 
 
-ENV_SECRET_BASENAME_RE = re.compile(r"^\.env(?:\.([A-Za-z0-9_.-]+))?$", re.IGNORECASE)
 SAFE_ENV_SUFFIXES = {"example", "sample", "template", "dist", "schema"}
 
 
 def check_env_write_guard(tool_name, args):
     """Require explicit confirmation when writing/editing .env secret files (portable replacement for relative deny rules)."""
+    if tool_name not in ("write_file", "edit_file") and not tool_name.endswith("_apply_edits"):
+        return None
     paths = []
     if tool_name in ("write_file", "edit_file"):
         p = args.get("Path") or args.get("path") or ""
         if p:
             paths.append(str(p))
-    elif tool_name.endswith("_apply_edits"):
+    else:
         edits = args.get("edits")
         if isinstance(edits, str):
             try:
@@ -1087,9 +1431,12 @@ def check_env_write_guard(tool_name, args):
             for item in edits:
                 if isinstance(item, dict) and item.get("path"):
                     paths.append(str(item["path"]))
+    if not paths:
+        return None
+    env_re = _get_env_re()
     for raw_p in paths:
         base = os.path.basename(raw_p.strip())
-        m = ENV_SECRET_BASENAME_RE.match(base)
+        m = env_re.match(base)
         if m and (m.group(1) or "").lower() not in SAFE_ENV_SUFFIXES:
             return {
                 "decision": "force_ask",
@@ -1122,23 +1469,26 @@ def main():
         emit({"decision": "allow"})
         return
 
-    # 1. Data-loss guard + Huginn-1 Kekkai neural firewall for shell/check/edit tools
+    # 1. Data-loss guard + Huginn-1 Kekkai neural firewall (only compile patterns when shell cmds exist)
     env_guard = check_env_write_guard(tool_name, args)
     if env_guard:
         emit(env_guard)
         return
-    for cmd in extract_commands(args):
-        for pattern, reason in DESTRUCTIVE_PATTERNS:
-            if pattern.search(cmd):
-                emit({
-                    "decision": "force_ask",
-                    "reason": f"[Data-Loss Guard] {reason}. Confirm explicitly before proceeding.",
-                })
+    cmds = extract_commands(args)
+    if cmds:
+        destructive_patterns = _get_destructive_patterns()
+        for cmd in cmds:
+            for pattern, reason in destructive_patterns:
+                if pattern.search(cmd):
+                    emit({
+                        "decision": "force_ask",
+                        "reason": f"[Data-Loss Guard] {reason}. Confirm explicitly before proceeding.",
+                    })
+                    return
+            kekkai_reason = check_huginn_kekkai_socket(cmd)
+            if kekkai_reason:
+                emit({"decision": "force_ask", "reason": kekkai_reason})
                 return
-        kekkai_reason = check_huginn_kekkai_socket(cmd)
-        if kekkai_reason:
-            emit({"decision": "force_ask", "reason": kekkai_reason})
-            return
 
     # 2. Safe CLI output compression for run_command
     if tool_name == "run_command" and args.get("CommandLine"):
@@ -1147,7 +1497,7 @@ def main():
             emit({"decision": "allow", "overwrite": {"CommandLine": rewritten}})
             return
 
-    # 3. read_file anti-bloat & cache-cliff guard
+    # 3. read_file self-heal, missing-path hints, anti-bloat & cache-cliff guard
     if tool_name == "read_file":
         emit(handle_read_file(args, payload))
         return

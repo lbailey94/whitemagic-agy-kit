@@ -1602,9 +1602,194 @@ def test_v441_spill_cap_and_rust_hud():
         med_ms = hud_lats[len(hud_lats) // 2]
         check(f"Rust wm-squeeze --hud median latency < 25ms ({med_ms:.1f}ms)", med_ms < 25.0)
 
-    # 10h) wm-sim audit skips disabled agy-fast rules
+    # 10h) wm-sim audit skips disabled agy-fast rule file
     p_sim_audit = subprocess.run([str(LOCAL_BIN / "wm-sim"), "audit"], capture_output=True, text=True)
     check("wm-sim audit skips disabled agy-fast rule file", p_sim_audit.returncode == 0 and "plugins/agy-fast/rules/AGENTS.md" not in p_sim_audit.stdout)
+
+
+def test_v442_self_heal_and_rust_post_tool():
+    print("\n11. v4.4.2 Self-Healing read_file, Path Hints, Rust --post-tool, Dream & Brief Hygiene:")
+    SQ_BIN = LOCAL_BIN / "wm-squeeze"
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+
+        # 11a) read_file self-healing inverted/invalid line ranges
+        big500 = td_path / "big500.py"
+        big500.write_text("\n".join(f"row_{i} = 'payload text {i}'" for i in range(500)) + "\n", encoding="utf-8")
+        wide_jl = td_path / "wide500.jsonl"
+        wide_jl.write_text("\n".join(json.dumps({"i": i, "d": "X" * 520}) for i in range(100)) + "\n", encoding="utf-8")
+        tr_lo = td_path / "tr_lo.jsonl"
+        tr_lo.write_text(json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 5000, "cache_read_tokens": 35000}) + "\n")
+
+        rc, out, _, _ = run_hook(PRE_HOOK, {"conversationId": "v442-heal-1", "stepIdx": 1, "transcriptPath": str(tr_lo), "toolCall": {"name": "read_file", "args": {"Path": str(big500), "StartLine": 280, "EndLine": 120}}})
+        check("read_file StartLine=280,EndLine=120 -> healed EndLine=399", rc == 0 and json.loads(out).get("overwrite") == {"EndLine": 399}, out)
+
+        rc, out, _, _ = run_hook(PRE_HOOK, {"conversationId": "v442-heal-2", "stepIdx": 1, "transcriptPath": str(tr_lo), "toolCall": {"name": "read_file", "args": {"Path": str(big500), "StartLine": 101, "EndLine": 100}}})
+        check("read_file StartLine=101,EndLine=100 -> healed EndLine=200", rc == 0 and json.loads(out).get("overwrite") == {"EndLine": 200}, out)
+
+        rc, out, _, _ = run_hook(PRE_HOOK, {"conversationId": "v442-heal-3", "stepIdx": 1, "transcriptPath": str(tr_lo), "toolCall": {"name": "read_file", "args": {"Path": str(big500), "StartLine": 450, "EndLine": 350}}})
+        check("read_file swapped 450..350 -> StartLine=350,EndLine=450", rc == 0 and json.loads(out).get("overwrite") == {"StartLine": 350, "EndLine": 450}, out)
+
+        rc, out, _, _ = run_hook(PRE_HOOK, {"conversationId": "v442-heal-4", "stepIdx": 1, "transcriptPath": str(tr_lo), "toolCall": {"name": "read_file", "args": {"Path": str(big500), "StartLine": 0, "EndLine": 50}}})
+        check("read_file StartLine=0,EndLine=50 -> clamped StartLine=1", rc == 0 and json.loads(out).get("overwrite") == {"StartLine": 1}, out)
+
+        rc, out, _, _ = run_hook(PRE_HOOK, {"conversationId": "v442-heal-5", "stepIdx": 1, "transcriptPath": str(tr_lo), "toolCall": {"name": "read_file", "args": {"Path": str(wide_jl), "StartLine": 280, "EndLine": 120}}})
+        check("read_file wide JSONL 280..120 -> capped EndLine=329 (50L)", rc == 0 and json.loads(out).get("overwrite") == {"EndLine": 329}, out)
+
+        # 11b) Missing-path & directory hints
+        proj = td_path / "proj"
+        sub = proj / "hooks"
+        sub.mkdir(parents=True)
+        (proj / "hooks.json").write_text("{}\n")
+        (sub / "pre_tool_guard.py").write_text("# ok\n")
+        (sub / "post_tool_sim.py").write_text("# ok\n")
+
+        _, out_miss, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "read_file", "args": {"Path": str(sub / "pre_tool_gard.py")}}})
+        dm = json.loads(out_miss)
+        check("read_file typo -> deny [Path Hint] closest sibling", dm.get("decision") == "deny" and "[Path Hint]" in dm.get("reason", "") and "pre_tool_guard.py" in dm.get("reason", ""), out_miss)
+
+        _, out_gp, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "read_file", "args": {"Path": str(sub / "hooks.json")}}})
+        dg = json.loads(out_gp)
+        check("read_file wrong subdir -> parent-dir hint finds hooks.json", dg.get("decision") == "deny" and "hooks.json" in dg.get("reason", "") and "parent dir" in dg.get("reason", ""), out_gp)
+
+        _, out_dir, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "read_file", "args": {"Path": str(sub)}}})
+        dd = json.loads(out_dir)
+        check("read_file directory -> deny [Path Hint] entries", dd.get("decision") == "deny" and "is a directory" in dd.get("reason", "") and "pre_tool_guard.py" in dd.get("reason", ""), out_dir)
+
+        _, out_off, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "read_file", "args": {"Path": str(sub / "missing.py")}}}, env_extra={"WM_READ_HINT_OFF": "1"})
+        check("WM_READ_HINT_OFF=1 disables path hint -> allow", json.loads(out_off).get("decision") == "allow")
+
+        # 11c) Spill-shield 3 edge cases (cd with spaces heredoc, backslash-nl continuation, safe xargs)
+        sp_dir = td_path / "dir with spaces"
+        sp_dir.mkdir()
+        (sp_dir / "alpha.py").write_text("target_needle = 1\n")
+
+        cmd_hd_sp = f'cd "{sp_dir}" && python3 - <<\'PY\'\nprint("SPACES_HEREDOC_OK")\nPY'
+        _, out_hs, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd_hd_sp}}})
+        rew_hs = (json.loads(out_hs).get("overwrite") or {}).get("CommandLine", "")
+        p_hs = subprocess.run(["bash", "-c", rew_hs], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"}) if rew_hs else None
+        check("cd with spaces + python3 heredoc wrapped & executes rc=0", "--pipe" in rew_hs and p_hs is not None and p_hs.returncode == 0 and "SPACES_HEREDOC_OK" in p_hs.stdout, rew_hs)
+
+        cmd_cont = f'cd "{sp_dir}" && \\\nls -la'
+        _, out_ct, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd_cont}}})
+        rew_ct = (json.loads(out_ct).get("overwrite") or {}).get("CommandLine", "")
+        p_ct = subprocess.run(["bash", "-c", rew_ct], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1", "WM_SQUEEZE_NO_CACHE": "1"}) if rew_ct else None
+        check("cd with spaces + backslash-newline continuation squeezed & rc=0", "--safe" in rew_ct and p_ct is not None and p_ct.returncode == 0 and "alpha.py" in p_ct.stdout, rew_ct)
+
+        (td_path / "clean.py").write_text("target_needle = 1\n")
+        cmd_xg = f'rg -l target_needle "{td_path / "clean.py"}" | xargs -r ls -lh'
+        _, out_xg, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd_xg}}})
+        rew_xg = (json.loads(out_xg).get("overwrite") or {}).get("CommandLine", "")
+        p_xg = subprocess.run(["bash", "-c", rew_xg], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"}) if rew_xg else None
+        check("rg -l | xargs -r ls wrapped & executes rc=0", "--pipe" in rew_xg and p_xg is not None and p_xg.returncode == 0 and "clean.py" in p_xg.stdout, rew_xg)
+
+        cmd_xg0 = f'rg -0 -l target_needle "{sp_dir}" | xargs -0 -r ls -lh'
+        _, out_xg0, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd_xg0}}})
+        rew_xg0 = (json.loads(out_xg0).get("overwrite") or {}).get("CommandLine", "")
+        p_xg0 = subprocess.run(["bash", "-c", rew_xg0], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"}) if rew_xg0 else None
+        check("rg -0 -l | xargs -0 -r ls handles spaces rc=0", "--pipe" in rew_xg0 and p_xg0 is not None and p_xg0.returncode == 0 and "alpha.py" in p_xg0.stdout, rew_xg0)
+
+        for bad_xg in (f'rg -l foo "{sp_dir}" | xargs -r rm -f', f'rg -l foo "{sp_dir}" | xargs sed -i "s/a/b/"'):
+            _, out_bx, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": bad_xg}}})
+            check(f"unsafe xargs untouched ({bad_xg.split('|')[1].strip()})", "overwrite" not in json.loads(out_bx))
+
+        # 11d) Rust wm-squeeze --post-tool parity + speed vs Python post_tool_sim.py
+        sim_py = td_path / "sim_py.jsonl"
+        sim_rs = td_path / "sim_rs.jsonl"
+        tel_py = td_path / "tel_py.jsonl"
+        tel_rs = td_path / "tel_rs.jsonl"
+
+        test_err_cases = [
+            {"conversationId": "c1234567890abcdef", "cwd": str(td_path), "modelName": "hydrogen", "toolCall": {"name": "read_file", "args": {"Path": "/tmp/a.py", "StartLine": 280, "EndLine": 120}}, "error": "invalid line range Bearer sk_live_999999"},
+            {"conversationId": "c1", "toolCall": {"name": "write_file", "args": {"Path": "/tmp/w.py"}}, "error": "api_key=supersecret1234"},
+            {"conversationId": "c1", "toolCall": {"name": "edit_file", "args": {"Path": "/tmp/e.py"}}, "error": "target not found"},
+            {"conversationId": "c1", "toolCall": {"name": "mcp_whitemagic-agy-kit_fast_apply_edits", "args": {"edits": [{"path": "x.rs"}, {"path": "y.rs"}]}}, "error": "aborted"},
+        ]
+        for pl in test_err_cases:
+            run_hook(POST_HOOK, pl, env_extra={"WM_SIM_LEDGER": str(sim_py), "WM_AGY_TELEMETRY": str(tel_py)})
+            subprocess.run([str(SQ_BIN), "--post-tool"], input=json.dumps(pl), capture_output=True, text=True, env={**os.environ, "WM_SIM_LEDGER": str(sim_rs), "WM_AGY_TELEMETRY": str(tel_rs)}, timeout=5)
+
+        py_rows = [json.loads(l) for l in sim_py.read_text().splitlines() if l.strip()]
+        rs_rows = [json.loads(l) for l in sim_rs.read_text().splitlines() if l.strip()]
+        parity_errs = len(py_rows) == 4 and len(rs_rows) == 4 and all(
+            p.get("tool") == r.get("tool") and p.get("cmd_preview") == r.get("cmd_preview") and p.get("error") == r.get("error")
+            for p, r in zip(py_rows, rs_rows)
+        )
+        check("Rust --post-tool failure parity + rich read/write/edit preview + redaction", parity_errs and "read_file: /tmp/a.py [L280-120]" in rs_rows[0]["cmd_preview"] and "[REDACTED]" in rs_rows[0]["error"] and "[REDACTED]" in rs_rows[1]["error"])
+
+        for spl in (
+            {"conversationId": "sp1", "toolCall": {"name": "run_command", "args": {"CommandLine": "cat big"}}, "result": "Z" * 18000},
+            {"conversationId": "sp2", "toolCall": {"name": "write_file", "args": {"Path": "/tmp/huge.py", "Content": "Y" * 26000}}},
+        ):
+            run_hook(POST_HOOK, spl, env_extra={"WM_SIM_LEDGER": str(sim_py), "WM_AGY_TELEMETRY": str(tel_py)})
+            subprocess.run([str(SQ_BIN), "--post-tool"], input=json.dumps(spl), capture_output=True, text=True, env={**os.environ, "WM_SIM_LEDGER": str(sim_rs), "WM_AGY_TELEMETRY": str(tel_rs)}, timeout=5)
+        py_sp = [json.loads(l) for l in tel_py.read_text().splitlines() if l.strip()]
+        rs_sp = [json.loads(l) for l in tel_rs.read_text().splitlines() if l.strip()]
+        check("Rust --post-tool spill parity (output_spill + large_write_file)", len(py_sp) == 2 and len(rs_sp) == 2 and all(p.get("kind") == r.get("kind") and p.get("bytes") == r.get("bytes") for p, r in zip(py_sp, rs_sp)))
+
+        clean_pl = json.dumps({"toolCall": {"name": "read_file", "args": {"Path": "/tmp/a.py"}}, "result": "ok"})
+        pt_lats = []
+        for _ in range(15):
+            t0 = time.perf_counter()
+            subprocess.run([str(SQ_BIN), "--post-tool"], input=clean_pl, capture_output=True, text=True, timeout=5)
+            pt_lats.append((time.perf_counter() - t0) * 1000.0)
+        pt_lats.sort()
+        pt_med = pt_lats[len(pt_lats) // 2]
+        check(f"Rust wm-squeeze --post-tool clean latency < 15ms ({pt_med:.1f}ms)", pt_med < 15.0)
+
+        # 11e) wm-dream windowing & retired legacy exclusion + session_start_brief word-boundary safety
+        from datetime import datetime, timedelta, timezone
+        now_utc = datetime.now(timezone.utc)
+        d_sim = td_path / "dream_sim.jsonl"
+        d_sim.write_text(
+            "\n".join([
+                json.dumps({"event": "tool_failure", "ts": (now_utc - timedelta(days=12)).isoformat(), "tool": "read_file", "error": "stale 12d old"}),
+                json.dumps({"event": "tool_failure", "ts": (now_utc - timedelta(days=1)).isoformat(), "tool": "mcp_agy-fast_fast_apply_edits", "error": "Atomic edit aborted:"}),
+                json.dumps({"event": "tool_failure", "ts": (now_utc - timedelta(days=1)).isoformat(), "tool": "run_command", "error": "exit status 2:"}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        d_tel = td_path / "dream_tel.jsonl"
+        d_tel.write_text(
+            "\n".join([
+                json.dumps({"event": "stop", "ts_epoch": time.time(), "session_uncached": 10000, "session_cached": 90000, "last_hit_pct": 90.0}),
+                json.dumps({"event": "stop", "ts_epoch": time.time(), "session_uncached": 20000, "session_cached": 80000, "last_hit_pct": 80.0}),
+                json.dumps({"event": "tool_spill", "ts": now_utc.isoformat(), "kind": "large_write_file", "bytes": 30000}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        d_sq = td_path / "dream_sq.jsonl"
+        d_sq.write_text(json.dumps({"ts": time.time(), "raw": 10000, "out": 2000, "saved": 8000}) + "\n", encoding="utf-8")
+        d_out = td_path / "dream_digest.md"
+        p_dr = subprocess.run(
+            [str(LOCAL_BIN / "wm-dream"), "--window-days", "7"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "WM_SIM_LEDGER": str(d_sim), "WM_AGY_TELEMETRY": str(d_tel), "WM_SQUEEZE_STATS": str(d_sq), "WM_DREAM_DIGEST": str(d_out)},
+        )
+        d_txt = d_out.read_text(encoding="utf-8") if d_out.is_file() else ""
+        check(
+            "wm-dream excludes 12d/legacy failures, counts stops!=spills, <=460B",
+            p_dr.returncode == 0 and "AGY: 2 stops" in d_txt and "Spills (1): 1x large_write_file" in d_txt and "run_command: exit status 2" in d_txt and "stale 12d old" not in d_txt and "mcp_agy-fast_" not in d_txt and len(d_txt.strip()) <= 460,
+            d_txt,
+        )
+
+        # session_start_brief word-boundary truncation
+        pf_f = td_path / "PREFLIGHT.md"
+        pf_f.write_text("# Header 1\n> Summary line\n> Release: whitemagic-agy-kit v4.4.2 " + ("word " * 30) + "\n", encoding="utf-8")
+        ss_sim = td_path / "ss_sim.jsonl"
+        ss_sim.write_text(json.dumps({"event": "experiment", "domain": "agy-kit", "problem_group": "v442", "status": "kept", "target": "suite", "observed_outcome": "alpha beta gamma delta epsilon " * 8 + "validate --strict"}) + "\n", encoding="utf-8")
+        _, out_ss, _, _ = run_hook(
+            START_HOOK,
+            {"conversationId": "ss-word"},
+            env_extra={"WM_PREFLIGHT_PATH": str(pf_f), "WM_SIM_LEDGER": str(ss_sim), "WM_DREAM_DIGEST": str(d_out)},
+        )
+        ss_msg = json.loads(out_ss).get("injectSteps", [{}])[0].get("systemMessage", {}).get("systemMessage", "")
+        check(
+            "session_start_brief <=1450B & no mid-word Dream Digest truncation",
+            len(ss_msg.encode("utf-8")) <= 1450 and "run_command: exit status 2" in ss_msg and not ss_msg.rstrip().endswith("f..."),
+            f"{len(ss_msg)}B",
+        )
 
 
 def main():
@@ -1621,7 +1806,8 @@ def main():
         test_v41_token_burn_shield()
         test_v44_ide_longevity_shield()
         test_v441_spill_cap_and_rust_hud()
-    print(f"\n=== Wave 3/4/v4.4.1 Test Summary: {PASS} passed, {FAIL} failed ===")
+        test_v442_self_heal_and_rust_post_tool()
+    print(f"\n=== Wave 3/4/v4.4.2 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

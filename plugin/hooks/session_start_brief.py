@@ -23,7 +23,7 @@ PREFLIGHT_PATH = Path(
 )
 DATA_DIR = HOME / ".local" / "share" / "whitemagic"
 SIM_LEDGER = Path(os.environ.get("WM_SIM_LEDGER", str(DATA_DIR / "sim_ledger.jsonl")))
-DREAM_DIGEST = DATA_DIR / "dream_digest.md"
+DREAM_DIGEST = Path(os.environ.get("WM_DREAM_DIGEST", str(DATA_DIR / "dream_digest.md")))
 
 IGNORED_DIRS = {
     ".git", "node_modules", "target", "__pycache__", ".venv", "venv",
@@ -31,18 +31,51 @@ IGNORED_DIRS = {
 }
 
 
+def _trunc_word(text: str, limit: int) -> str:
+    s = str(text or "").rstrip()
+    if len(s) <= limit:
+        return s
+    if limit <= 4:
+        return s[:limit]
+    cut = s[: limit - 3]
+    sp = cut.rfind(" ")
+    if sp >= int((limit - 3) * 0.55):
+        cut = cut[:sp]
+    cut = cut.rstrip(" ,;:-")
+    return cut + "..."
+
+
+def _fit_utf8_lines(text: str, max_bytes: int) -> str:
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    lines = text.splitlines()
+    kept = []
+    for ln in lines:
+        cand = "\n".join(kept + [ln])
+        if len(cand.encode("utf-8")) <= max_bytes:
+            kept.append(ln)
+        else:
+            break
+    if kept:
+        return "\n".join(kept)
+    return _trunc_word(text, max_bytes - 4)
+
+
 def build_brief():
-    parts = []
+    preflight_lines = []
     if PREFLIGHT_PATH.exists():
         lines = PREFLIGHT_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
         header = [l.strip() for l in lines[:4] if l.strip()]
-        claims = [l.strip() for l in lines if "Claim:" in l or "Release:" in l][:3]
-        parts.append(f"[SessionStart Cached Brief | source={PREFLIGHT_PATH}]")
-        parts.extend(header[:3])
+        claims = [l.strip() for l in lines if "Claim:" in l or "Release:" in l][:2]
+        preflight_lines.append(f"[SessionStart Cached Brief | source={PREFLIGHT_PATH}]")
+        preflight_lines.extend(_trunc_word(h, 180) for h in header[:3])
         if claims:
-            parts.append("Recent Sangha Claims/Releases:")
-            parts.extend(f"  {c[:130]}" for c in claims)
+            preflight_lines.append("Recent Sangha Claims/Releases:")
+            preflight_lines.extend(f"  {_trunc_word(c, 115)}" for c in claims)
 
+    sim_header = ""
+    sim_lines = []
     if SIM_LEDGER.exists():
         recent_exps = []
         recent_fails = 0
@@ -59,28 +92,47 @@ def build_brief():
             elif e.get("event") == "tool_failure":
                 recent_fails += 1
         if recent_exps or recent_fails:
-            parts.append(f"SIM Ledger ({len(recent_exps)} recent lessons, {recent_fails} recent failures; query with `wm-sim query`):")
+            sim_header = f"SIM Ledger ({len(recent_exps)} recent lessons, {recent_fails} recent failures; query with `wm-sim query`):"
             for e in reversed(recent_exps[-3:]):
-                parts.append(
-                    f"  - [{e.get('domain')}/{e.get('problem_group')}] ({e.get('status')}) {e.get('target')}: {e.get('observed_outcome','')[:115]}"
+                outcome = _trunc_word(e.get("observed_outcome", ""), 95)
+                sim_lines.append(
+                    f"  - [{e.get('domain')}/{e.get('problem_group')}] ({e.get('status')}) {e.get('target')}: {outcome}"
                 )
 
+    dream_lines = []
     if DREAM_DIGEST.exists():
         try:
             age_days = (time.time() - DREAM_DIGEST.stat().st_mtime) / 86400.0
             if age_days <= 7.0:
                 dtxt = DREAM_DIGEST.read_text(encoding="utf-8", errors="replace").strip()
                 if dtxt:
-                    parts.append(dtxt[:360])
+                    dream_lines = [_trunc_word(ln.rstrip(), 180) for ln in dtxt.splitlines() if ln.strip()]
         except Exception:
             pass
 
-    if not parts:
+    if not preflight_lines and not sim_header and not dream_lines:
         return ""
-    text = "\n".join(parts)
-    if len(text) > 1450:
-        text = text[:1447] + "..."
-    return text
+
+    # Assemble within 1450-byte budget cleanly on whole-line boundaries (Dream Digest preserved intact)
+    out_lines = list(preflight_lines)
+    dream_block = "\n".join(dream_lines)
+    reserve_dream = len(dream_block.encode("utf-8")) + (1 if dream_block else 0)
+    if sim_header:
+        cand_h = "\n".join(out_lines + [sim_header])
+        if len(cand_h.encode("utf-8")) + reserve_dream <= 1450:
+            out_lines.append(sim_header)
+            for sl in sim_lines:
+                cand_s = "\n".join(out_lines + [sl])
+                if len(cand_s.encode("utf-8")) + reserve_dream <= 1450:
+                    out_lines.append(sl)
+
+    for dl in dream_lines:
+        cand_d = "\n".join(out_lines + [dl])
+        if len(cand_d.encode("utf-8")) <= 1450:
+            out_lines.append(dl)
+
+    text = "\n".join(out_lines)
+    return _fit_utf8_lines(text, 1450)
 
 
 def _run_git(cwd_path, args):
@@ -215,9 +267,8 @@ def main():
         sys.stdout.flush()
         return
 
-    raw_bytes = msg.encode("utf-8")
-    if len(raw_bytes) > 2550:
-        msg = raw_bytes[:2547].decode("utf-8", errors="ignore") + "..."
+    if len(msg.encode("utf-8")) > 2550:
+        msg = _fit_utf8_lines(msg, 2550)
 
     out = {
         "injectSteps": [

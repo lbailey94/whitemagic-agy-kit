@@ -1260,11 +1260,439 @@ fn run_hud() {
     }
 }
 
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let yr = y + if m <= 2 { 1 } else { 0 };
+    (yr, m, d)
+}
+
+fn utc_iso_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (yr, mo, dy) = civil_from_days(days);
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00", yr, mo, dy, hh, mm, ss)
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+fn is_secret_val_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'+')
+}
+
+fn starts_with_ignore_ascii_case(hay: &[u8], pat: &[u8]) -> bool {
+    hay.len() >= pat.len() && hay[..pat.len()].eq_ignore_ascii_case(pat)
+}
+
+fn redact_secrets(input: &str) -> String {
+    let b = input.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+    let keys: [&[u8]; 7] = [
+        b"authorization",
+        b"password",
+        b"api_key",
+        b"api-key",
+        b"secret",
+        b"token",
+        b"bearer",
+    ];
+    while i < n {
+        let mut replaced = false;
+        let prev_alnum = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if !prev_alnum {
+            if starts_with_ignore_ascii_case(&b[i..], b"bearer") {
+                let mut j = i + 6;
+                if j < n && b[j].is_ascii_whitespace() {
+                    while j < n && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    let tok_start = j;
+                    while j < n && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'.' | b'_' | b'-')) {
+                        j += 1;
+                    }
+                    if j > tok_start {
+                        out.push_str("[REDACTED]");
+                        i = j;
+                        replaced = true;
+                    }
+                }
+            }
+            if !replaced {
+                for &kw in &keys[..6] {
+                    if starts_with_ignore_ascii_case(&b[i..], kw) {
+                        let mut j = i + kw.len();
+                        while j < n && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j < n && (b[j] == b'=' || b[j] == b':') {
+                            j += 1;
+                            while j < n && b[j].is_ascii_whitespace() {
+                                j += 1;
+                            }
+                            let mut quote: Option<u8> = None;
+                            if j < n && (b[j] == b'\'' || b[j] == b'"') {
+                                quote = Some(b[j]);
+                                j += 1;
+                            }
+                            let val_start = j;
+                            while j < n && is_secret_val_char(b[j]) {
+                                j += 1;
+                            }
+                            if j - val_start >= 8 {
+                                if let Some(q) = quote {
+                                    if j < n && b[j] == q {
+                                        j += 1;
+                                    }
+                                }
+                                out.push_str("[REDACTED]");
+                                i = j;
+                                replaced = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !replaced {
+            if let Some(ch) = input[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn extract_json_array_elements(arr_raw: &str, max_items: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = arr_raw.trim().as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return out;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() && out.len() < max_items {
+        i = skip_json_ws(bytes, i);
+        if i >= bytes.len() || bytes[i] == b']' {
+            break;
+        }
+        if bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            if let Some((val, end)) = parse_json_str_at(bytes, i) {
+                out.push(val);
+                i = end;
+            } else {
+                break;
+            }
+        } else {
+            let end = skip_json_value(bytes, i);
+            if end > i {
+                if let Ok(elem) = std::str::from_utf8(&bytes[i..end]) {
+                    out.push(elem.to_string());
+                }
+            }
+            i = end.max(i + 1);
+        }
+    }
+    out
+}
+
+fn run_post_tool() {
+    let mut stdin_buf = String::new();
+    if io::stdin().read_to_string(&mut stdin_buf).is_err() || stdin_buf.trim().is_empty() {
+        println!("{{}}");
+        return;
+    }
+
+    // Ultra-fast clean path (<2ms total runtime): small payload with no error field cannot fail or spill
+    if stdin_buf.len() <= 16_000 && !stdin_buf.contains("\"error\"") {
+        println!("{{}}");
+        return;
+    }
+
+    let payload = extract_top_level_fields(
+        &stdin_buf,
+        &["error", "toolCall", "result", "output", "toolOutput", "conversationId", "cwd", "modelName"],
+    );
+    let err_raw = payload
+        .get("error")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "false");
+
+    let tc_raw = payload.get("toolCall").map(|s| s.as_str()).unwrap_or("");
+    let tc_fields = extract_top_level_fields(tc_raw, &["name", "args", "arguments"]);
+    let tool_name = tc_fields
+        .get("name")
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    let args_raw = tc_fields
+        .get("args")
+        .or_else(|| tc_fields.get("arguments"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let args_fields = if args_raw.trim_start().starts_with('{') {
+        extract_top_level_fields(
+            args_raw,
+            &[
+                "CommandLine",
+                "command",
+                "Path",
+                "path",
+                "StartLine",
+                "EndLine",
+                "Content",
+                "content",
+                "Replacement",
+                "replacement",
+                "edits",
+                "commands",
+                "queries",
+                "mode",
+                "target",
+                "ServerName",
+                "ToolName",
+            ],
+        )
+    } else {
+        HashMap::new()
+    };
+
+    let out_raw = payload
+        .get("result")
+        .or_else(|| payload.get("output"))
+        .or_else(|| payload.get("toolOutput"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let write_content = if tool_name == "write_file" {
+        args_fields
+            .get("Content")
+            .or_else(|| args_fields.get("content"))
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    let edit_content = if tool_name == "edit_file" {
+        args_fields
+            .get("Replacement")
+            .or_else(|| args_fields.get("replacement"))
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    } else {
+        ""
+    };
+
+    let mut spill_bytes = 0usize;
+    let mut spill_kind = "";
+    if err_raw.is_none() {
+        if out_raw.len() > 16_000 {
+            spill_bytes = out_raw.len();
+            spill_kind = "output_spill";
+        } else if write_content.len() > 25_000 {
+            spill_bytes = write_content.len();
+            spill_kind = "large_write_file";
+        } else if edit_content.len() > 25_000 {
+            spill_bytes = edit_content.len();
+            spill_kind = "large_edit_file";
+        }
+    }
+
+    if let Some(err_str) = err_raw {
+        let raw_preview = if tool_name == "run_command" {
+            args_fields
+                .get("CommandLine")
+                .or_else(|| args_fields.get("command"))
+                .cloned()
+                .unwrap_or_default()
+        } else if tool_name == "read_file" {
+            let p = args_fields.get("Path").or_else(|| args_fields.get("path")).map(|s| s.as_str()).unwrap_or("");
+            if p.is_empty() {
+                "read_file".to_string()
+            } else {
+                let s_l = args_fields.get("StartLine").map(|s| s.as_str());
+                let e_l = args_fields.get("EndLine").map(|s| s.as_str());
+                if s_l.is_some() || e_l.is_some() {
+                    format!("read_file: {} [L{}-{}]", p, s_l.unwrap_or("1"), e_l.unwrap_or("EOF"))
+                } else {
+                    format!("read_file: {}", p)
+                }
+            }
+        } else if tool_name == "write_file" || tool_name == "edit_file" {
+            let p = args_fields.get("Path").or_else(|| args_fields.get("path")).map(|s| s.as_str()).unwrap_or("");
+            if p.is_empty() {
+                tool_name.to_string()
+            } else {
+                format!("{}: {}", tool_name, p)
+            }
+        } else if tool_name.ends_with("_apply_edits") {
+            let elems = args_fields
+                .get("edits")
+                .map(|e| extract_json_array_elements(e, 4))
+                .unwrap_or_default();
+            let paths: Vec<String> = elems
+                .iter()
+                .filter(|el| el.trim_start().starts_with('{'))
+                .map(|el| {
+                    extract_top_level_fields(el, &["path"])
+                        .get("path")
+                        .cloned()
+                        .unwrap_or_else(|| "?".to_string())
+                })
+                .collect();
+            if paths.is_empty() {
+                "apply_edits".to_string()
+            } else {
+                format!("apply_edits: {}", paths.join(", "))
+            }
+        } else if tool_name.ends_with("_run_checks") {
+            let elems = args_fields
+                .get("commands")
+                .map(|c| extract_json_array_elements(c, 1))
+                .unwrap_or_default();
+            let first = match elems.first() {
+                Some(el) if el.trim_start().starts_with('{') => extract_top_level_fields(el, &["command"])
+                    .get("command")
+                    .cloned()
+                    .unwrap_or_default(),
+                Some(el) => el.clone(),
+                None => String::new(),
+            };
+            format!("run_checks: {}", first)
+        } else if tool_name.ends_with("_batch_search") {
+            let elems = args_fields
+                .get("queries")
+                .map(|q| extract_json_array_elements(q, 4))
+                .unwrap_or_default();
+            let qtypes: Vec<String> = elems
+                .iter()
+                .filter(|el| el.trim_start().starts_with('{'))
+                .map(|el| {
+                    extract_top_level_fields(el, &["type"])
+                        .get("type")
+                        .cloned()
+                        .unwrap_or_else(|| "?".to_string())
+                })
+                .collect();
+            format!("batch_search: {}", qtypes.join(","))
+        } else if tool_name.ends_with("_code_graph") {
+            format!(
+                "code_graph: {}:{}",
+                args_fields.get("mode").map(|s| s.as_str()).unwrap_or(""),
+                args_fields.get("target").map(|s| s.as_str()).unwrap_or("")
+            )
+        } else {
+            let srv = args_fields.get("ServerName").map(|s| s.as_str()).unwrap_or("");
+            let t_sub = args_fields.get("ToolName").map(|s| s.as_str()).unwrap_or("");
+            if !srv.is_empty() || !t_sub.is_empty() {
+                format!("{}/{}", srv, t_sub)
+            } else {
+                tool_name.to_string()
+            }
+        };
+
+        let preview = truncate_chars(&redact_secrets(&raw_preview), 180);
+        let error_clean = truncate_chars(&redact_secrets(err_str), 240);
+        let conv_id = truncate_chars(payload.get("conversationId").map(|s| s.as_str()).unwrap_or(""), 16);
+        let cwd = payload.get("cwd").map(|s| s.as_str()).unwrap_or("");
+        let model = payload.get("modelName").map(|s| s.as_str()).unwrap_or("");
+
+        let ledger_path = env::var("WM_SIM_LEDGER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".local/share/whitemagic/sim_ledger.jsonl"))
+            });
+        if let Some(lp) = ledger_path {
+            if let Some(parent) = lp.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let line = format!(
+                "{{\"event\":\"tool_failure\",\"ts\":\"{}\",\"conversation_id\":\"{}\",\"cwd\":\"{}\",\"model\":\"{}\",\"tool\":\"{}\",\"cmd_preview\":\"{}\",\"error\":\"{}\"}}\n",
+                utc_iso_now(),
+                json_escape(&conv_id),
+                json_escape(cwd),
+                json_escape(model),
+                json_escape(tool_name),
+                json_escape(&preview),
+                json_escape(&error_clean)
+            );
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(lp) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    } else if spill_bytes > 0 {
+        let src_txt = args_fields
+            .get("Path")
+            .or_else(|| args_fields.get("path"))
+            .or_else(|| args_fields.get("CommandLine"))
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| out_raw);
+        let preview = truncate_chars(&redact_secrets(&truncate_chars(src_txt, 180)), 180);
+        let conv_id = truncate_chars(payload.get("conversationId").map(|s| s.as_str()).unwrap_or(""), 16);
+        let telem_path = env::var("WM_AGY_TELEMETRY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".local/share/whitemagic/agy_telemetry.jsonl"))
+            });
+        if let Some(tp) = telem_path {
+            if let Some(parent) = tp.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let line = format!(
+                "{{\"event\":\"tool_spill\",\"kind\":\"{}\",\"ts\":\"{}\",\"conv_id\":\"{}\",\"tool\":\"{}\",\"bytes\":{},\"preview\":\"{}\"}}\n",
+                spill_kind,
+                utc_iso_now(),
+                json_escape(&conv_id),
+                json_escape(tool_name),
+                spill_bytes,
+                json_escape(&preview)
+            );
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(tp) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }
+
+    println!("{{}}");
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!(
-            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --hud\n  wm-squeeze --stats"
+            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --hud\n  wm-squeeze --post-tool\n  wm-squeeze --stats"
         );
         std::process::exit(0);
     }
@@ -1274,6 +1702,10 @@ fn main() {
     }
     if args[0] == "--hud" {
         run_hud();
+        return;
+    }
+    if args[0] == "--post-tool" {
+        run_post_tool();
         return;
     }
 

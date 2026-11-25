@@ -1,7 +1,7 @@
 {
   "name": "whitemagic-agy-kit",
   "displayName": "WhiteMagic AGY Turbo Kit",
-  "version": "4.4.1",
+  "version": "4.4.2",
   "logo": "assets/logo.svg",
   "description": "Fused Antigravity App/IDE/CLI accelerator: 5-tool eager MCP (batch_search, apply_edits, read_slices, run_checks, code_graph), quote-aware wm-squeeze v3, zero-token PostInvocation longevity HUD, atomic PreToolUse guards, multi-surface CliffCompaction CLIs, Tricameral CyberBrain, and SIM memory.",
   "author": {

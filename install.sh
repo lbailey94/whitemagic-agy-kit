@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WhiteMagic AGY Turbo Kit v4.4.1 — Idempotent Cross-Platform Installer (macOS + Linux)
+# WhiteMagic AGY Turbo Kit v4.4.2 — Idempotent Cross-Platform Installer (macOS + Linux)
 # Installs:
 #   1. Zero-dependency Rust binaries `wm-squeeze`, `wm-codegraph`, & Safe-Rust `muninn-engine` -> ~/.local/bin/
 #   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` & `tricameral_dispatch` MCPs; or `--sync-global`)
@@ -115,7 +115,7 @@ hooks = {
             {
                 "matcher": "run_command|read_file|write_file|edit_file|call_mcp_tool|mcp_whitemagic-agy-kit_fast_run_checks|mcp_whitemagic-agy-kit_fast_apply_edits|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits",
                 "hooks": [
-                    {"type": "command", "command": "python3 -S -B ~/.gemini/config/hooks/post_tool_sim.py", "timeout": 5}
+                    {"type": "command", "command": "if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze --post-tool; elif [ -x \"$HOME/.local/bin/wm-squeeze\" ]; then exec \"$HOME/.local/bin/wm-squeeze\" --post-tool; else exec python3 -S -B ~/.gemini/config/hooks/post_tool_sim.py; fi", "timeout": 5}
                 ],
             }
         ],
@@ -141,7 +141,7 @@ hp.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 print(f"Updated global {hp}")
 PY
 else
-    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.4.1 ==="
+    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.4.2 ==="
     # Build fused TS MCP & benchmark bundle if needed (probe PATH, ~/.local/bin, nvm, homebrew, volta, fnm)
     TURBO_MCP_DIR="${KIT_DIR}/tools/agy-turbo-mcp"
     NODE_BIN=""

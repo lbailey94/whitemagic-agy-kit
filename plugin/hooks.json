@@ -32,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -S -B ./hooks/post_tool_sim.py",
+            "command": "if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze --post-tool; elif [ -x \"$HOME/.local/bin/wm-squeeze\" ]; then exec \"$HOME/.local/bin/wm-squeeze\" --post-tool; else exec python3 -S -B ./hooks/post_tool_sim.py; fi",
             "timeout": 5
           }
         ]

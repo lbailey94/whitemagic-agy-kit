@@ -1,4 +1,4 @@
-# WhiteMagic AGY Turbo+Fast Directives (v4.4.1)
+# WhiteMagic AGY Turbo+Fast Directives (v4.4.2)
 
 ## 1. Tool Routing & Latency Hygiene (5 Eager Tools + Fast Built-ins)
 
