@@ -1948,6 +1948,171 @@ def test_v450_rust_pretool_crystal_and_swarm_guards():
         check("3 native plugin agents present", all((KIT / "plugin" / "agents" / f).is_file() for f in ("hydrogen-builder.md", "fresh-verifier.md", "swarm-coordinator.md")))
 
 
+def test_v451_sidecar_cpr_bridge_and_plugin_scoping():
+    print("\n13. v4.5.1 Resident Sidecar UI, Sangha CPR Bridge & Plugin Scoping:")
+    import hashlib
+    import hmac
+    import signal
+    import urllib.error
+    import urllib.request
+
+    sidecar_dir = KIT / "plugin" / "sidecars" / "wm-sidecar"
+    sc_manifest = json.loads((sidecar_dir / "sidecar.json").read_text(encoding="utf-8"))
+    check(
+        "sidecar.json valid schema + AUX_PANE UI config",
+        sc_manifest.get("has_web_ui") is True
+        and any(v.get("entrypoint") == "SIDECAR_UI_ENTRYPOINT_AUX_PANE" for v in (sc_manifest.get("ui_config") or {}).get("views", [])),
+    )
+
+    handoff_bin = LOCAL_BIN / "wm-handoff"
+    bridge_bin = LOCAL_BIN / "wm-cpr-bridge"
+    sim_bin = LOCAL_BIN / "wm-sim"
+    check("wm-cpr-bridge installed & executable", bridge_bin.is_file() and os.access(bridge_bin, os.X_OK))
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        cache_dir = td_path / "cache"
+        cache_dir.mkdir()
+        srv_py = sidecar_dir / "server.py"
+        env_sc = {
+            **os.environ,
+            "ANTIGRAVITY_SIDECAR_WEB_PORT": "0",
+            "WM_HANDOFF_CACHE_DIR": str(cache_dir),
+            "WM_CONFINEMENT_SIGNING_KEY": "v451_test_hmac_secret",
+        }
+        proc = subprocess.Popen(["python3", "-S", "-B", str(srv_py)], env=env_sc, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            disc = cache_dir / "sidecar.json"
+            for _ in range(50):
+                if disc.is_file():
+                    break
+                time.sleep(0.05)
+            check("sidecar writes discovery sidecar.json", disc.is_file())
+            info = json.loads(disc.read_text(encoding="utf-8"))
+            url = info["url"]
+
+            with urllib.request.urlopen(f"{url}/healthz", timeout=2) as r:
+                hz = json.loads(r.read())
+                check("sidecar GET /healthz 200 ok", r.status == 200 and hz.get("ok") is True and hz.get("version") == "4.5.1")
+            with urllib.request.urlopen(f"{url}/", timeout=2) as r:
+                html = r.read().decode("utf-8")
+                check("sidecar GET / serves no-store UI", r.status == 200 and "WhiteMagic AGY Telemetry" in html and r.headers.get("Cache-Control") == "no-store")
+            with urllib.request.urlopen(f"{url}/api/status", timeout=2) as r:
+                st_j = json.loads(r.read())
+                check("sidecar GET /api/status returns valid payload", st_j.get("ok") is True and "telemetry" in st_j and "wm_squeeze" in st_j)
+            with urllib.request.urlopen(f"{url}/api/crystals", timeout=2) as r:
+                cr_j = json.loads(r.read())
+                check("sidecar GET /api/crystals ok", cr_j.get("ok") is True and isinstance(cr_j.get("crystals"), list))
+
+            # POST /api/receipt valid 201, bad HMAC 400, oversized 413
+            core = {"schema": "wm-receipt/1.2", "kind": "handoff_crystal", "conv_id": "v451sc1", "model": "gemini-4-hydrogen-high", "crystal_sha256": "abcd12345678"}
+            canon = json.dumps(core, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            signed = {**core, "signature": {"alg": "hmac-sha256", "sig": hmac.new(b"v451_test_hmac_secret", canon, hashlib.sha256).hexdigest()}}
+            req_ok = urllib.request.Request(f"{url}/api/receipt", data=json.dumps(signed).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req_ok, timeout=2) as r:
+                check("sidecar POST /api/receipt valid HMAC -> 201", r.status == 201)
+
+            bad_req = urllib.request.Request(f"{url}/api/receipt", data=json.dumps({**signed, "crystal_sha256": "000000000000"}).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+            code_bad = 0
+            try:
+                urllib.request.urlopen(bad_req, timeout=2)
+            except urllib.error.HTTPError as e:
+                code_bad = e.code
+            check("sidecar POST /api/receipt tampered HMAC -> 400", code_bad == 400)
+
+            big_req = urllib.request.Request(f"{url}/api/receipt", data=b"{}" + b" " * 17000, headers={"Content-Type": "application/json"}, method="POST")
+            code_big = 0
+            try:
+                urllib.request.urlopen(big_req, timeout=2)
+            except urllib.error.HTTPError as e:
+                code_big = e.code
+            check("sidecar POST /api/receipt oversized -> 413", code_big == 413)
+
+            # wm-handoff --publish-sangha + wm-cpr-bridge verify/pointer/tamper/fail-open
+            tp = td_path / "conv_bridge" / ".system_generated" / "logs" / "transcript.jsonl"
+            tp.parent.mkdir(parents=True)
+            tp.write_text("\n".join([
+                json.dumps({"type": "USER_INPUT", "content": "Verify v4.5.1 CPR bridge"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-high", "input_tokens": 42000, "cache_read_tokens": 80000, "tool_calls": [{"name": "edit_file", "args": {"Path": "server.py"}}]}),
+            ]) + "\n", encoding="utf-8")
+
+            mock_log = td_path / "sangha_calls.jsonl"
+            mock_sangha = td_path / "mock_sangha.py"
+            mock_sangha.write_text(
+                f"#!/usr/bin/env python3\nimport json, sys\nfrom pathlib import Path\nPath({str(mock_log)!r}).open('a').write(json.dumps(sys.argv[1:]) + '\\n')\n",
+                encoding="utf-8",
+            )
+            mock_sangha.chmod(0o755)
+
+            crystal_md = cache_dir / "latest_conv_bridge.md"
+            receipt_js = cache_dir / "latest_conv_bridge.receipt.json"
+            env_br = {**env_sc, "WM_SANGHA_BIN": str(mock_sangha)}
+            r_ho = subprocess.run(
+                [str(handoff_bin), "--transcript", str(tp), "--cwd", str(KIT), "--out", str(crystal_md), "--emit-receipt", str(receipt_js), "--publish-sangha", "--target", "@opencode", "--room", "core-dev"],
+                capture_output=True, text=True, env=env_br, timeout=10,
+            )
+            calls = [json.loads(l) for l in mock_log.read_text(encoding="utf-8").splitlines()] if mock_log.is_file() else []
+            body_txt = calls[0][calls[0].index("--body") + 1] if calls and "--body" in calls[0] else ""
+            check(
+                "wm-handoff --publish-sangha forwards <=600B CPR pointer to mock Sangha",
+                r_ho.returncode == 0 and len(calls) == 1 and "@opencode" in calls[0] and "computed" in calls[0] and 0 < len(body_txt.encode("utf-8")) <= 600,
+                f"{len(body_txt.encode('utf-8'))}B",
+            )
+
+            r_ver = subprocess.run([str(bridge_bin), "verify", str(receipt_js)], capture_output=True, text=True, env=env_br, timeout=5)
+            r_ptr = subprocess.run([str(bridge_bin), "pointer", "--receipt", str(receipt_js)], capture_output=True, text=True, env=env_br, timeout=5)
+            check("wm-cpr-bridge verify (HMAC) & pointer <=600B", r_ver.returncode == 0 and json.loads(r_ver.stdout).get("sig_status") == "verified" and r_ptr.returncode == 0 and len(r_ptr.stdout.encode("utf-8")) <= 600)
+
+            r_pub_fo = subprocess.run([str(bridge_bin), "publish", "--receipt", str(receipt_js)], capture_output=True, text=True, env={**env_sc, "WM_SANGHA_BIN": "/nonexistent/sangha"}, timeout=5)
+            fo_j = json.loads(r_pub_fo.stdout) if r_pub_fo.returncode == 0 else {}
+            check("wm-cpr-bridge publish fail-open without Sangha + notifies sidecar", r_pub_fo.returncode == 0 and fo_j.get("sangha_posted") is False and fo_j.get("sidecar_notified") is True and fo_j.get("valid") is True)
+
+            bad_hmac_js = td_path / "bad_hmac.receipt.json"
+            rj = json.loads(receipt_js.read_text(encoding="utf-8"))
+            rj["signature"]["sig"] = "f" * 64
+            bad_hmac_js.write_text(json.dumps(rj), encoding="utf-8")
+            r_bh = subprocess.run([str(bridge_bin), "verify", str(bad_hmac_js)], capture_output=True, text=True, env=env_br, timeout=5)
+            check("wm-cpr-bridge verify fails closed on tampered HMAC (rc=2)", r_bh.returncode == 2)
+
+            crystal_md.write_text("# tampered\n\n`crystal_sha256=deadbeef1234`\n", encoding="utf-8")
+            r_bc = subprocess.run([str(bridge_bin), "verify", str(receipt_js)], capture_output=True, text=True, env=env_br, timeout=5)
+            check("wm-cpr-bridge verify fails closed on tampered crystal file (rc=2)", r_bc.returncode == 2)
+        finally:
+            proc.send_signal(signal.SIGTERM)
+            rc_sc = proc.wait(timeout=4)
+        check("sidecar clean SIGTERM exit & removes sidecar.json", rc_sc == 0 and not (cache_dir / "sidecar.json").exists())
+
+        # wm-sim audit --scope-plugins on isolated config dir (systems repo vs web repo)
+        cfg_dir = td_path / "agy_cfg"
+        for pname, desc in (("chrome-devtools-plugin", "web"), ("modern-web-guidance-plugin", "web"), ("google-antigravity-sdk", "sdk")):
+            sk = cfg_dir / "plugins" / pname / "skills" / "s1" / "SKILL.md"
+            sk.parent.mkdir(parents=True)
+            sk.write_text(f"---\nname: {pname}-skill\ndescription: {'X' * 400}\n---\n", encoding="utf-8")
+        (cfg_dir / "config.json").write_text(
+            json.dumps({"plugins": {p: {"enabled": True} for p in ("chrome-devtools-plugin", "modern-web-guidance-plugin", "google-antigravity-sdk", "whitemagic-agy-kit")}}),
+            encoding="utf-8",
+        )
+        env_sim = {**os.environ, "WM_AGY_CONFIG_DIR": str(cfg_dir)}
+
+        sys_repo = td_path / "rust_cli_repo"
+        sys_repo.mkdir()
+        (sys_repo / "Cargo.toml").write_text('[package]\nname="sys"\n', encoding="utf-8")
+        r_sys = subprocess.run([str(sim_bin), "audit", "--scope-plugins", str(sys_repo), "--json"], capture_output=True, text=True, env=env_sim, timeout=5)
+        sys_j = json.loads(r_sys.stdout)
+        check("wm-sim audit --scope-plugins systems repo -> matched=[] & savings>0", r_sys.returncode == 0 and sys_j.get("matched_domain_plugins") == [] and sys_j.get("savings_est_tokens", 0) > 200)
+
+        web_repo = td_path / "react_web_repo"
+        web_repo.mkdir()
+        (web_repo / "index.html").write_text("<html></html>\n", encoding="utf-8")
+        (web_repo / "package.json").write_text('{"dependencies":{"react":"^19.0.0"}}\n', encoding="utf-8")
+        r_web = subprocess.run([str(sim_bin), "audit", "--scope-plugins", str(web_repo), "--write", "--json"], capture_output=True, text=True, env=env_sim, timeout=5)
+        web_j = json.loads(r_web.stdout)
+        pj_path = web_repo / ".agents" / "plugins.json"
+        pj = json.loads(pj_path.read_text(encoding="utf-8")) if pj_path.is_file() else {}
+        inc = ((pj.get("entries") or [{}])[0]).get("include_only", [])
+        check("wm-sim audit --scope-plugins --write emits web .agents/plugins.json", r_web.returncode == 0 and pj_path.is_file() and "chrome-devtools-plugin" in inc and "modern-web-guidance-plugin" in inc and "google-antigravity-sdk" in web_j.get("unmatched_enabled_plugins", []))
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="agy_hook_state_") as state_td:
         os.environ["WM_HOOK_STATE_DIR"] = state_td
@@ -1964,7 +2129,8 @@ def main():
         test_v441_spill_cap_and_rust_hud()
         test_v442_self_heal_and_rust_post_tool()
         test_v450_rust_pretool_crystal_and_swarm_guards()
-    print(f"\n=== Wave 3/4/v4.5.0 Test Summary: {PASS} passed, {FAIL} failed ===")
+        test_v451_sidecar_cpr_bridge_and_plugin_scoping()
+    print(f"\n=== Wave 3/4/v4.5.1 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

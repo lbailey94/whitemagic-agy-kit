@@ -148,8 +148,23 @@ def cmd_failures(args):
         )
 
 
+DOMAIN_PLUGINS = {
+    "chrome-devtools-plugin": "web",
+    "modern-web-guidance-plugin": "web",
+    "google-antigravity-sdk": "agy_sdk",
+    "firebase": "firebase",
+    "flutter": "flutter",
+    "android-cli-plugin": "android",
+}
+CORE_PLUGINS = {"whitemagic-agy-kit"}
+
+
+def _agy_config_dir() -> Path:
+    return Path(os.environ.get("WM_AGY_CONFIG_DIR") or str(HOME / ".gemini" / "config"))
+
+
 def _disabled_plugins() -> set:
-    cfg_json = HOME / ".gemini" / "config" / "config.json"
+    cfg_json = _agy_config_dir() / "config.json"
     if not cfg_json.is_file():
         return set()
     try:
@@ -159,8 +174,178 @@ def _disabled_plugins() -> set:
         return set()
 
 
+def _detect_repo_signals(repo_dir: Path) -> set[str]:
+    signals: set[str] = set()
+    if not repo_dir.is_dir():
+        return signals
+    scan_dirs = [repo_dir]
+    for sub in ("src", "web", "app", "frontend", "client", "pages"):
+        sd = repo_dir / sub
+        if sd.is_dir():
+            scan_dirs.append(sd)
+
+    web_exact = {"index.html", "manifest.json", "svelte.config.js", "astro.config.mjs"}
+    web_exts = {".css", ".tsx", ".jsx", ".vue", ".svelte"}
+    for d in scan_dirs:
+        try:
+            for entry in d.iterdir():
+                if not entry.is_file():
+                    continue
+                nm = entry.name
+                if nm in web_exact or nm.startswith(("vite.config.", "next.config.")) or entry.suffix.lower() in web_exts:
+                    signals.add("web")
+        except Exception:
+            pass
+
+    pkg = repo_dir / "package.json"
+    if pkg.is_file():
+        try:
+            txt = pkg.read_text(encoding="utf-8", errors="replace")[:65536].lower()
+            if any(k in txt for k in ('"react"', '"next"', '"vite"', '"vue"', '"svelte"', '"playwright"', '"puppeteer"', '"tailwindcss"')):
+                signals.add("web")
+            if "google-antigravity" in txt or "antigravity-sdk" in txt:
+                signals.add("agy_sdk")
+        except Exception:
+            pass
+
+    pyp = repo_dir / "pyproject.toml"
+    if pyp.is_file():
+        try:
+            txt = pyp.read_text(encoding="utf-8", errors="replace")[:65536].lower()
+            if "google-antigravity" in txt or "antigravity-sdk" in txt:
+                signals.add("agy_sdk")
+        except Exception:
+            pass
+
+    if (repo_dir / "pubspec.yaml").is_file():
+        signals.add("flutter")
+    if (repo_dir / "firebase.json").is_file():
+        signals.add("firebase")
+    has_gradle = any((repo_dir / g).is_file() for g in ("build.gradle", "build.gradle.kts"))
+    has_aman = (repo_dir / "AndroidManifest.xml").is_file() or (repo_dir / "app" / "src" / "main" / "AndroidManifest.xml").is_file()
+    if has_gradle and has_aman:
+        signals.add("android")
+
+    return signals
+
+
+def _plugin_frontmatter_stats(plugins_dir: Path, plugin_name: str) -> tuple[int, int]:
+    pdir = plugins_dir / plugin_name
+    if not pdir.is_dir():
+        return 0, 0
+    fm_bytes = 0
+    skill_cnt = 0
+    for sf in glob.glob(str(pdir / "**" / "SKILL.md"), recursive=True):
+        skill_cnt += 1
+        try:
+            txt = Path(sf).read_text(encoding="utf-8", errors="replace")
+            if txt.startswith("---"):
+                parts = txt.split("---", 2)
+                if len(parts) >= 2:
+                    fm_bytes += len(parts[1].encode("utf-8"))
+        except Exception:
+            pass
+    return skill_cnt, fm_bytes
+
+
+def cmd_scope_plugins(repo_dir_str: str, write: bool = False, as_json: bool = False) -> None:
+    repo_dir = Path(repo_dir_str).resolve()
+    cfg_dir = _agy_config_dir()
+    cfg_json = cfg_dir / "config.json"
+    plugins_dir = cfg_dir / "plugins"
+
+    plugs_meta = {}
+    if cfg_json.is_file():
+        try:
+            plugs_meta = json.loads(cfg_json.read_text(encoding="utf-8")).get("plugins") or {}
+        except Exception:
+            plugs_meta = {}
+
+    installed_names = set(plugs_meta.keys())
+    if plugins_dir.is_dir():
+        for p in plugins_dir.iterdir():
+            if p.is_dir():
+                installed_names.add(p.name)
+
+    signals = _detect_repo_signals(repo_dir)
+    plugin_details = {}
+    enabled_domain = []
+    matched_domain = []
+    unmatched_enabled = []
+    cur_dom_bytes = 0
+    savings_bytes = 0
+
+    for pn in sorted(installed_names):
+        if pn in CORE_PLUGINS or pn not in DOMAIN_PLUGINS:
+            continue
+        meta = plugs_meta.get(pn)
+        enabled = bool(meta.get("enabled")) if isinstance(meta, dict) else False
+        sk_c, fm_b = _plugin_frontmatter_stats(plugins_dir, pn)
+        need_sig = DOMAIN_PLUGINS[pn]
+        matched = need_sig in signals
+        plugin_details[pn] = {
+            "signal": need_sig,
+            "matched": matched,
+            "enabled_globally": enabled,
+            "skills": sk_c,
+            "frontmatter_bytes": fm_b,
+            "est_tokens": fm_b // 4,
+        }
+        if enabled:
+            enabled_domain.append(pn)
+            cur_dom_bytes += fm_b
+        if matched:
+            matched_domain.append(pn)
+        elif enabled:
+            unmatched_enabled.append(pn)
+            savings_bytes += fm_b
+
+    rec_cfg = (
+        {"entries": [{"path": "~/.gemini/config/plugins", "include_only": matched_domain}]}
+        if matched_domain
+        else None
+    )
+    wrote_path = None
+    if write and rec_cfg is not None:
+        target = repo_dir / ".agents" / "plugins.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(rec_cfg, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+        wrote_path = str(target)
+
+    out = {
+        "repo": str(repo_dir),
+        "signals": sorted(signals),
+        "enabled_domain_plugins": enabled_domain,
+        "matched_domain_plugins": matched_domain,
+        "unmatched_enabled_plugins": unmatched_enabled,
+        "current_enabled_domain_bytes": cur_dom_bytes,
+        "current_enabled_domain_tokens": cur_dom_bytes // 4,
+        "savings_est_tokens": savings_bytes // 4,
+        "plugins": plugin_details,
+        "recommended_plugins_json": rec_cfg,
+        "wrote_path": wrote_path,
+    }
+    if as_json:
+        print(json.dumps(out, indent=2))
+        return
+
+    print(f"=== Plugin Turn-0 Scope Audit ({repo_dir.name}) ===")
+    print(f"Signals detected        : {', '.join(out['signals']) if out['signals'] else 'none (systems/CLI/backend repo)'}")
+    print(f"Enabled domain plugins  : {', '.join(enabled_domain) if enabled_domain else 'none'} (~{out['current_enabled_domain_tokens']} Turn-0 tok)")
+    print(f"Matched to this repo    : {', '.join(matched_domain) if matched_domain else 'none'}")
+    print(f"Unmatched global bloat  : {', '.join(unmatched_enabled) if unmatched_enabled else 'none'} (save ~{out['savings_est_tokens']} Turn-0 tok)")
+    if unmatched_enabled:
+        print("Disable globally via    : " + " && ".join(f"agy plugin disable {p}" for p in unmatched_enabled))
+    if rec_cfg is not None:
+        print("Recommended .agents/plugins.json:\n" + json.dumps(rec_cfg, indent=2))
+    if wrote_path:
+        print(f"Wrote {wrote_path}")
+
+
 def _rule_plugin_name(rf: Path) -> str:
-    plugs_dir = HOME / ".gemini" / "config" / "plugins"
+    plugs_dir = _agy_config_dir() / "plugins"
     try:
         rel = rf.relative_to(plugs_dir)
         return rel.parts[0] if rel.parts else ""
@@ -169,6 +354,9 @@ def _rule_plugin_name(rf: Path) -> str:
 
 
 def cmd_audit(args):
+    if getattr(args, "scope_plugins", None) is not None:
+        cmd_scope_plugins(args.scope_plugins, write=bool(getattr(args, "write", False)), as_json=bool(getattr(args, "json", False)))
+        return
     disabled_plugs = _disabled_plugins()
     print("=== AGY CLI & WhiteMagic SIM Hygiene Audit ===\n")
     print("1. Rule Files (AGY per-file cap: 24,000 bytes):")
@@ -407,7 +595,10 @@ def main():
     p_f = sub.add_parser("failures", help="List recent auto-captured PostToolUse tool failures")
     p_f.add_argument("--limit", type=int, default=15)
 
-    sub.add_parser("audit", help="Run AGY rules, skills, hooks, MCP, and SIM ledger hygiene audit")
+    p_aud = sub.add_parser("audit", help="Run AGY rules, skills, hooks, MCP, and SIM ledger hygiene audit")
+    p_aud.add_argument("--scope-plugins", nargs="?", const=".", default=None, metavar="REPO_DIR", help="Analyze repo signals & Turn-0 domain plugin bloat")
+    p_aud.add_argument("--write", action="store_true", help="Write recommended <REPO_DIR>/.agents/plugins.json when domain plugins match")
+    p_aud.add_argument("--json", action="store_true", help="Print JSON output for --scope-plugins")
     sub.add_parser("prefix-hash", help="Compute deterministic ContextCacheToken SHA-256 of Turn-0 static prefix")
     sub.add_parser("sync-wm3", help="Commit unsynced SIM experiment records to WhiteMagic Gen3")
 

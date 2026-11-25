@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""
+wm-cpr-bridge — Unified Causal Provenance Receipt (CPR) Verifier & Sangha Bridge (v4.5.1).
+Works standalone (zero external deps, local ledger + optional loopback sidecar sync)
+and bridges signed wm-receipt/1.2 & wm-confinement-receipt/1.1 pointers (<=150 tok) to
+Sangha Whiteboard when `sangha` CLI is available.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+MAX_POINTER_BYTES = 600
+
+
+def _handoff_cache_dir() -> Path:
+    return Path(os.environ.get("WM_HANDOFF_CACHE_DIR") or str(Path.home() / ".cache" / "wm-handoff"))
+
+
+def _bridge_ledger_path() -> Path:
+    return Path(os.environ.get("WM_CPR_BRIDGE_LEDGER") or str(_handoff_cache_dir() / "cpr_bridge.jsonl"))
+
+
+def _redact_home(val: str) -> str:
+    if not val:
+        return ""
+    home_str = str(Path.home())
+    if val == home_str:
+        return "~"
+    if val.startswith(home_str + "/"):
+        return "~" + val[len(home_str) :]
+    return val
+
+
+def verify_receipt(receipt_path: Path, check_crystal_file: bool = True) -> dict:
+    if not receipt_path.is_file():
+        return {"valid": False, "schema": "", "digest": "", "sig_status": "error", "error": f"Receipt not found: {receipt_path}", "receipt": {}}
+    try:
+        rec = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"valid": False, "schema": "", "digest": "", "sig_status": "error", "error": f"Invalid JSON: {e}", "receipt": {}}
+
+    if not isinstance(rec, dict):
+        return {"valid": False, "schema": "", "digest": "", "sig_status": "error", "error": "Receipt JSON must be an object", "receipt": {}}
+
+    schema = str(rec.get("schema") or "")
+    if schema not in ("wm-receipt/1.2", "wm-confinement-receipt/1.1"):
+        return {"valid": False, "schema": schema, "digest": "", "sig_status": "error", "error": f"Unsupported schema: {schema!r}", "receipt": rec}
+
+    digest = str(rec.get("crystal_sha256") or rec.get("receipt_sha256") or "")
+    if not digest:
+        return {"valid": False, "schema": schema, "digest": "", "sig_status": "error", "error": "Missing crystal_sha256 / receipt_sha256", "receipt": rec}
+
+    if schema == "wm-receipt/1.2" and check_crystal_file:
+        cpath_str = str(rec.get("crystal_path") or "")
+        if cpath_str:
+            cp = Path(cpath_str)
+            if cp.is_file():
+                raw_crystal = cp.read_text(encoding="utf-8", errors="replace")
+                if "\n\n`crystal_sha256=" in raw_crystal:
+                    body = raw_crystal.split("\n\n`crystal_sha256=", 1)[0]
+                else:
+                    body = raw_crystal
+                recomputed = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
+                if not hmac.compare_digest(recomputed, digest):
+                    return {
+                        "valid": False,
+                        "schema": schema,
+                        "digest": digest,
+                        "sig_status": "tampered",
+                        "error": f"crystal_sha256 mismatch (expected {digest}, got {recomputed})",
+                        "receipt": rec,
+                    }
+
+    sig = rec.get("signature")
+    sig_status = "unsigned"
+    if isinstance(sig, dict) and sig.get("alg") == "hmac-sha256":
+        signing_key = os.environ.get("WM_CONFINEMENT_SIGNING_KEY", "").strip()
+        if signing_key:
+            core = {k: v for k, v in rec.items() if k != "signature"}
+            canon = json.dumps(core, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            expected_sig = hmac.new(signing_key.encode("utf-8"), canon, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(str(sig.get("sig") or ""), expected_sig):
+                return {
+                    "valid": False,
+                    "schema": schema,
+                    "digest": digest,
+                    "sig_status": "tampered",
+                    "error": "hmac signature mismatch",
+                    "receipt": rec,
+                }
+            sig_status = "verified"
+        else:
+            sig_status = "present"
+    elif isinstance(sig, dict) and sig.get("alg"):
+        sig_status = "present"
+
+    return {"valid": True, "schema": schema, "digest": digest, "sig_status": sig_status, "error": "", "receipt": rec}
+
+
+def format_pointer(rec: dict, sig_status: str) -> str:
+    schema = str(rec.get("schema") or "wm-receipt/1.2")
+    kind = str(rec.get("kind") or "handoff_crystal")
+    digest = str(rec.get("crystal_sha256") or rec.get("receipt_sha256") or "?")
+    conv = str(rec.get("conv_id") or "default")[:12]
+    surf = str(rec.get("surface") or "all")
+    model = str(rec.get("model") or "?")
+    last_ctx = int(rec.get("last_ctx") or 0)
+    flips = int(rec.get("model_flips") or 0)
+    branch = str(rec.get("git_branch") or "-")
+    edited = rec.get("edited_files") or []
+    top_files = ", ".join(Path(str(p)).name or str(p) for p in edited[:4]) if edited else "none"
+    cpath = _redact_home(str(rec.get("crystal_path") or ""))
+
+    lines = [
+        f"[CPR {schema} | {kind} | sha256={digest} | sig={sig_status}]",
+        f"- Session: `{conv}` (`{surf}`) | model=`{model}` | ctx=`{last_ctx:,}` | flips=`{flips}` | branch=`{branch}`",
+        f"- Files ({len(edited)}): `{top_files}`",
+        f"- Pointer: `wm-reset --conv {conv}`" + (f" (`{cpath}`)" if cpath else ""),
+    ]
+    out = "\n".join(lines) + "\n"
+    if len(out.encode("utf-8")) > MAX_POINTER_BYTES:
+        # Trim files/path deterministically while keeping SHA + reset command intact
+        top_files = ", ".join(Path(str(p)).name for p in edited[:2]) if edited else "none"
+        lines[2] = f"- Files ({len(edited)}): `{top_files}`"
+        lines[3] = f"- Pointer: `wm-reset --conv {conv}`"
+        out = "\n".join(lines) + "\n"
+        if len(out.encode("utf-8")) > MAX_POINTER_BYTES:
+            out = out.encode("utf-8")[: MAX_POINTER_BYTES - 1].decode("utf-8", errors="ignore") + "\n"
+    return out
+
+
+def _notify_sidecar(receipt_path: Path) -> bool:
+    disc = _handoff_cache_dir() / "sidecar.json"
+    if not disc.is_file():
+        return False
+    try:
+        info = json.loads(disc.read_text(encoding="utf-8"))
+        url = str(info.get("url") or "").rstrip("/")
+        if not url.startswith("http://127.0.0.1:"):
+            return False
+        raw = receipt_path.read_bytes()
+        req = urllib.request.Request(
+            f"{url}/api/receipt?recorded=1",
+            data=raw,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=0.3) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def _resolve_sangha_bin() -> str | None:
+    env_b = os.environ.get("WM_SANGHA_BIN", "").strip()
+    if env_b:
+        return env_b if Path(env_b).is_file() else None
+    w = shutil.which("sangha")
+    if w:
+        return w
+    lb = Path.home() / ".local" / "bin" / "sangha"
+    return str(lb) if lb.is_file() else None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Verify wm-receipt/1.2 CPR files and bridge <=150-tok pointers to Sangha & Sidecar.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    pv = sub.add_parser("verify", help="Verify a receipt JSON (+ crystal sha256 & optional HMAC-SHA256)")
+    pv.add_argument("receipt", help="Path to receipt JSON file")
+    pv.add_argument("--no-crystal-check", action="store_true", help="Skip re-hashing crystal markdown file")
+
+    pp = sub.add_parser("pointer", help="Verify receipt and print <=600B CPR pointer summary")
+    pp.add_argument("--receipt", required=True, help="Path to receipt JSON file")
+
+    pb = sub.add_parser("publish", help="Verify receipt, append to local CPR ledger, notify sidecar, and post <=600B pointer to Sangha")
+    pb.add_argument("--receipt", required=True, help="Path to receipt JSON file")
+    pb.add_argument("--target", default="@all", help="Sangha target mention (default: @all)")
+    pb.add_argument("--room", default="", help="Optional Sangha room")
+    pb.add_argument("--scope", default="", help="Optional Sangha scope")
+    pb.add_argument("--type", dest="post_type", default="handoff", help="Sangha post type (default: handoff)")
+    pb.add_argument("--title", default="", help="Optional Sangha dispatch title")
+    pb.add_argument("--local-only", action="store_true", help="Record locally / notify sidecar without calling sangha CLI")
+    pb.add_argument("--dry-run", action="store_true", help="Verify and build pointer without writing ledger or posting")
+
+    pt = sub.add_parser("tail", help="Show recent entries from local CPR bridge ledger")
+    pt.add_argument("--limit", type=int, default=10)
+    pt.add_argument("--json", action="store_true")
+
+    args = ap.parse_args()
+
+    if args.cmd == "verify":
+        res = verify_receipt(Path(args.receipt), check_crystal_file=not args.no_crystal_check)
+        out = {k: v for k, v in res.items() if k != "receipt"}
+        print(json.dumps(out, indent=2))
+        sys.exit(0 if res["valid"] else 2)
+
+    if args.cmd == "pointer":
+        res = verify_receipt(Path(args.receipt))
+        if not res["valid"]:
+            sys.stderr.write(f"wm-cpr-bridge: verification failed: {res['error']}\n")
+            sys.exit(2)
+        sys.stdout.write(format_pointer(res["receipt"], res["sig_status"]))
+        return
+
+    if args.cmd == "publish":
+        rp = Path(args.receipt)
+        res = verify_receipt(rp)
+        if not res["valid"]:
+            sys.stderr.write(f"wm-cpr-bridge: verification failed: {res['error']}\n")
+            sys.exit(2)
+        rec = res["receipt"]
+        pointer = format_pointer(rec, res["sig_status"])
+        pointer_bytes = len(pointer.encode("utf-8"))
+        conv = str(rec.get("conv_id") or "default")[:12]
+        digest = res["digest"]
+        title = args.title or f"CPR Handoff {conv} (sha256={digest})"
+
+        sangha_posted = False
+        sidecar_notified = False
+        ledger = _bridge_ledger_path()
+
+        if not args.dry_run:
+            if not args.local_only:
+                sangha_bin = _resolve_sangha_bin()
+                if sangha_bin:
+                    cmd = [
+                        sangha_bin,
+                        "post",
+                        "--target",
+                        args.target,
+                        "--title",
+                        title,
+                        "--type",
+                        args.post_type,
+                        "--provenance",
+                        "computed",
+                        "--no-similarity",
+                        "--body",
+                        pointer,
+                    ]
+                    if args.room:
+                        cmd.extend(["--room", args.room])
+                    if args.scope:
+                        cmd.extend(["--scope", args.scope])
+                    try:
+                        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                        sangha_posted = proc.returncode == 0
+                    except Exception:
+                        sangha_posted = False
+
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "schema": res["schema"],
+                "digest": digest,
+                "sig_status": res["sig_status"],
+                "conv_id": conv,
+                "model": str(rec.get("model") or ""),
+                "pointer_bytes": pointer_bytes,
+                "crystal_path": _redact_home(str(rec.get("crystal_path") or "")),
+                "receipt_path": _redact_home(str(rp)),
+                "sangha_target": args.target,
+                "sangha_posted": sangha_posted,
+            }
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            with ledger.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            sidecar_notified = _notify_sidecar(rp)
+
+        summary = {
+            "valid": True,
+            "schema": res["schema"],
+            "digest": digest,
+            "sig_status": res["sig_status"],
+            "pointer_bytes": pointer_bytes,
+            "ledger_path": _redact_home(str(ledger)),
+            "sidecar_notified": sidecar_notified,
+            "sangha_posted": sangha_posted,
+            "pointer": pointer,
+        }
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+
+    if args.cmd == "tail":
+        lp = _bridge_ledger_path()
+        rows = []
+        if lp.is_file():
+            for line in lp.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        pass
+        rows = rows[-max(1, args.limit) :]
+        if args.json:
+            print(json.dumps({"ledger": _redact_home(str(lp)), "entries": rows}, indent=2))
+        else:
+            for r in rows:
+                print(
+                    f"{str(r.get('ts') or '')[:19]} | {r.get('schema')} | sha={r.get('digest')} | "
+                    f"sig={r.get('sig_status')} | sangha={r.get('sangha_posted')} | {r.get('conv_id')}"
+                )
+
+
+if __name__ == "__main__":
+    main()

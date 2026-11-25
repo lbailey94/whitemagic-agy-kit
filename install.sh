@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# WhiteMagic AGY Turbo Kit v4.5.0 — Idempotent Cross-Platform Installer (macOS + Linux)
+# WhiteMagic AGY Turbo Kit v4.5.1 — Idempotent Cross-Platform Installer (macOS + Linux)
 # Installs:
 #   1. Zero-dependency Rust binaries `wm-squeeze`, `wm-codegraph`, & Safe-Rust `muninn-engine` -> ~/.local/bin/
-#   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` & `tricameral_dispatch` MCPs; or `--sync-global`)
+#   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` & `tricameral_dispatch` MCPs + resident sidecar; or `--sync-global`)
 #   3. Hardened `INK-Q/agy-fast` plugin (--auto-update off) if Node >= 20 is available (preserves existing valid installs)
 #   4. Disables 6 unused heavy official plugins (-10.4k tokens/session) if present
-#   5. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `agy-token-audit`, `wm-local-digest`, `wm-dream`, `wm-handoff`, `wm-reset`, `wm-models`, `wm-huginn`, `wm-muninn`, `wm-tricameral`, `wm-tricameral-mcp`, `statusline.py`)
+#   5. Portable CLI tools (`wm-sim`, `agy-bench`, `agy-mode`, `agy-token-audit`, `wm-local-digest`, `wm-dream`, `wm-handoff`, `wm-reset`, `wm-cpr-bridge`, `wm-models`, `wm-huginn`, `wm-muninn`, `wm-tricameral`, `wm-tricameral-mcp`, `statusline.py`)
 #   6. Non-destructive `~/.gemini/antigravity-cli/settings.json` safe allowlist + statusLine tuning (timestamped backup; leaves model untouched)
 #   7. Selective `"eager": true` MCP promotion for locally detected `wm3` / `whitemagic_gen3` / `firecrawl-local-mcp`
 #   8. Optional Tricameral spore pull (`--with-huginn` | `--with-ravens` | `--with-tricameral`) via `wm-models`
@@ -145,7 +145,7 @@ hp.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 print(f"Updated global {hp}")
 PY
 else
-    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.5.0 ==="
+    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.5.1 ==="
     # Build fused TS MCP & benchmark bundle if needed (probe PATH, ~/.local/bin, nvm, homebrew, volta, fnm)
     TURBO_MCP_DIR="${KIT_DIR}/tools/agy-turbo-mcp"
     NODE_BIN=""
@@ -307,7 +307,7 @@ if [ "$KEEP_HEAVY_PLUGINS" -eq 0 ] && command -v agy >/dev/null 2>&1; then
 fi
 
 echo "=== 5. Installing portable CLI tools, model manifest & cache-warmth statusline ==="
-for tool in wm-sim agy-bench agy-mode agy-token-audit wm-local-digest wm-dream wm-handoff wm-reset wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-fleet wm-grok-mcp wm-vps wm-triage; do
+for tool in wm-sim agy-bench agy-mode agy-token-audit wm-local-digest wm-dream wm-handoff wm-reset wm-cpr-bridge wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-fleet wm-grok-mcp wm-vps wm-triage; do
     if [ -f "${KIT_DIR}/bin/${tool}" ]; then
         install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
     fi

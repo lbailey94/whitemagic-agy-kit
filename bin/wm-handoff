@@ -260,6 +260,9 @@ def main():
     ap.add_argument("--cwd", default=os.getcwd(), help="Git working directory to snapshot")
     ap.add_argument("--out", help="Optional output markdown file path")
     ap.add_argument("--emit-receipt", help="Optional output path for canonical wm-receipt/1.2 JSON")
+    ap.add_argument("--publish-sangha", action="store_true", help="Verify receipt and publish a <=150-tok CPR pointer via wm-cpr-bridge")
+    ap.add_argument("--target", default="@all", help="Sangha target mention for --publish-sangha (default: @all)")
+    ap.add_argument("--room", default="", help="Optional Sangha room for --publish-sangha")
     ap.add_argument("--swarm-map", metavar="REPO_DIR", help="Emit a <=600-token shared codemap for fresh swarm workers and exit")
     ap.add_argument("--save-wm3", action="store_true", help="Also persist handoff crystal to WhiteMagic Gen3 (wm3 / wm-gen3)")
     args = ap.parse_args()
@@ -362,9 +365,37 @@ def main():
     else:
         sys.stdout.write(crystal)
 
+    receipt_path = None
     if args.emit_receipt:
+        receipt_path = Path(args.emit_receipt)
+    elif args.publish_sangha:
+        cache_dir = Path(os.environ.get("WM_HANDOFF_CACHE_DIR") or str(Path.home() / ".cache" / "wm-handoff"))
+        san = "".join(c for c in st["conv_id"] if c.isascii() and (c.isalnum() or c in "_-"))[:20] or "default"
+        receipt_path = cache_dir / f"latest_{san}.receipt.json"
+
+    if receipt_path is not None:
         receipt = build_receipt_v12(st, gs, surf, digest, crystal, tp, args.out)
-        _write_text_atomic(Path(args.emit_receipt), json.dumps(receipt, indent=2) + "\n")
+        _write_text_atomic(receipt_path, json.dumps(receipt, indent=2) + "\n")
+
+    if args.publish_sangha and receipt_path is not None:
+        bridge_bin = (
+            os.environ.get("WM_CPR_BRIDGE_BIN", "").strip()
+            or str(Path(__file__).resolve().parent / "wm-cpr-bridge")
+        )
+        if not Path(bridge_bin).is_file():
+            bridge_bin = shutil.which("wm-cpr-bridge") or str(Path.home() / ".local" / "bin" / "wm-cpr-bridge")
+        if Path(bridge_bin).is_file():
+            bcmd = [sys.executable, "-S", str(bridge_bin), "publish", "--receipt", str(receipt_path), "--target", args.target]
+            if args.room:
+                bcmd.extend(["--room", args.room])
+            try:
+                br = subprocess.run(bcmd, capture_output=True, text=True, timeout=4)
+                if br.returncode != 0:
+                    sys.stderr.write(f"wm-handoff: --publish-sangha warning: {br.stderr or br.stdout}\n")
+            except Exception as exc:
+                sys.stderr.write(f"wm-handoff: --publish-sangha warning: {exc}\n")
+        else:
+            sys.stderr.write("wm-handoff: wm-cpr-bridge binary not found; skipped --publish-sangha\n")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+{
+  "command": "python3",
+  "args": [
+    "-S",
+    "-B",
+    "server.py"
+  ],
+  "restart_policy": "always",
+  "display_name": "WhiteMagic AGY Telemetry & Handoff",
+  "description": "Zero-dependency local sidecar showing live AGY cache-hit/model-flip telemetry, ready CliffCompaction handoff crystals, wm-receipt/1.2 CPR ledger, and Sangha bridge status.",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "WhiteMagic AGY Telemetry",
+    "views": [
+      {
+        "title": "WhiteMagic AGY Telemetry",
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE"
+      }
+    ]
+  }
+}

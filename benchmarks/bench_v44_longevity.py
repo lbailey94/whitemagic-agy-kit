@@ -595,9 +595,106 @@ def benchmark_v450_orchestration_and_rust_pretool(app_limit: int = 10, cli_limit
     }
 
 
+def benchmark_v451_sidecar_cpr_and_plugin_scoping() -> dict:
+    """Measure Sidecar cold start/HTTP latency/RSS, CPR pointer vs crystal size, and live Turn-0 plugin savings."""
+    import signal
+    import urllib.request
+
+    srv_py = KIT_DIR / "plugin" / "sidecars" / "wm-sidecar" / "server.py"
+    handoff_bin = str(KIT_DIR / "bin" / "wm-handoff")
+    bridge_bin = str(KIT_DIR / "bin" / "wm-cpr-bridge")
+    sim_bin = str(KIT_DIR / "bin" / "wm-sim")
+
+    cold_start_ms = 0.0
+    health_lats = []
+    status_lats = []
+    rss_mb = 0.0
+    crystal_bytes = 0
+    pointer_bytes = 0
+
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        tp = td_p / "tp.jsonl"
+        tp.write_text(
+            "\n".join([
+                json.dumps({"type": "USER_INPUT", "content": "Benchmark v4.5.1 sidecar and CPR bridge"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-high", "input_tokens": 35000, "cache_read_tokens": 95000,
+                            "tool_calls": [{"name": "edit_file", "args": {"Path": "plugin/sidecars/wm-sidecar/server.py"}}]}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        c_md = td_p / "latest_bench451.md"
+        c_rec = td_p / "latest_bench451.receipt.json"
+        subprocess.run([handoff_bin, "--transcript", str(tp), "--cwd", str(KIT_DIR), "--out", str(c_md), "--emit-receipt", str(c_rec)], capture_output=True, text=True, check=True)
+        crystal_bytes = c_md.stat().st_size
+        r_ptr = subprocess.run([bridge_bin, "pointer", "--receipt", str(c_rec)], capture_output=True, text=True, check=True)
+        pointer_bytes = len(r_ptr.stdout.encode("utf-8"))
+
+        env_sc = {**os.environ, "ANTIGRAVITY_SIDECAR_WEB_PORT": "0", "WM_HANDOFF_CACHE_DIR": str(td_p)}
+        t0 = time.perf_counter()
+        proc = subprocess.Popen(["python3", "-S", "-B", str(srv_py)], env=env_sc, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            disc = td_p / "sidecar.json"
+            url = ""
+            for _ in range(100):
+                if disc.is_file():
+                    info = json.loads(disc.read_text(encoding="utf-8"))
+                    url = info["url"]
+                    try:
+                        with urllib.request.urlopen(f"{url}/healthz", timeout=1) as r:
+                            if r.status == 200:
+                                cold_start_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                                break
+                    except Exception:
+                        pass
+                time.sleep(0.01)
+
+            for _ in range(30):
+                t1 = time.perf_counter()
+                with urllib.request.urlopen(f"{url}/healthz", timeout=2) as r:
+                    r.read()
+                health_lats.append((time.perf_counter() - t1) * 1000.0)
+                t2 = time.perf_counter()
+                with urllib.request.urlopen(f"{url}/api/status", timeout=2) as r:
+                    r.read()
+                status_lats.append((time.perf_counter() - t2) * 1000.0)
+
+            st_file = Path(f"/proc/{proc.pid}/status")
+            if st_file.is_file():
+                for line in st_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.startswith("VmRSS:"):
+                        kb = int(line.split()[1])
+                        rss_mb = round(kb / 1024.0, 1)
+                        break
+        finally:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=4)
+
+    health_lats.sort()
+    status_lats.sort()
+    r_sc = subprocess.run([sim_bin, "audit", "--scope-plugins", str(KIT_DIR), "--json"], capture_output=True, text=True, check=True)
+    sc_j = json.loads(r_sc.stdout)
+
+    return {
+        "sidecar_cold_start_ms": cold_start_ms,
+        "sidecar_healthz_med_ms": round(statistics.median(health_lats), 2) if health_lats else 0.0,
+        "sidecar_healthz_p95_ms": round(health_lats[int(len(health_lats) * 0.95) - 1], 2) if health_lats else 0.0,
+        "sidecar_status_med_ms": round(statistics.median(status_lats), 2) if status_lats else 0.0,
+        "sidecar_status_p95_ms": round(status_lats[int(len(status_lats) * 0.95) - 1], 2) if status_lats else 0.0,
+        "sidecar_rss_mb": rss_mb,
+        "cpr_crystal_bytes": crystal_bytes,
+        "cpr_pointer_bytes": pointer_bytes,
+        "cpr_pointer_est_tokens": pointer_bytes // 4,
+        "cpr_reduction_pct": round(100.0 * (1.0 - pointer_bytes / max(crystal_bytes, 1)), 1),
+        "scope_plugins_unmatched": sc_j.get("unmatched_enabled_plugins", []),
+        "scope_plugins_savings_tok": sc_j.get("savings_est_tokens", 0),
+        "scope_plugins_current_dom_tok": sc_j.get("current_enabled_domain_tokens", 0),
+    }
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Benchmark whitemagic-agy-kit v4.5.0 longevity, self-heal, and Rust hooks")
-    ap.add_argument("--out", default=str(KIT_DIR / "benchmarks" / "RESULTS_2026-11-25_v450.md"), help="Output Markdown receipt path")
+    ap = argparse.ArgumentParser(description="Benchmark whitemagic-agy-kit v4.5.1 longevity, Rust PreToolUse, sidecar & CPR bridge")
+    ap.add_argument("--out", default=str(KIT_DIR / "benchmarks" / "RESULTS_2026-11-25_v451.md"), help="Output Markdown receipt path")
     args = ap.parse_args()
 
     spills = replay_pre_tool_spills()
@@ -605,6 +702,7 @@ def main():
     prefix = measure_prefix_footprint()
     hud = replay_longevity_hud()
     v450 = benchmark_v450_orchestration_and_rust_pretool()
+    v451 = benchmark_v451_sidecar_cpr_and_plugin_scoping()
 
     report = {
         "spills_replay": spills,
@@ -612,15 +710,15 @@ def main():
         "prefix_footprint": prefix,
         "hud_replay": hud,
         "v450_rust_pretool_and_orchestration": v450,
+        "v451_sidecar_cpr_and_scoping": v451,
     }
     print(json.dumps(report, indent=2))
 
-    lat = spills["latency_v441_vs_v442"]
     v45_lat = v450["pre_rust_vs_py"]
     md = [
-        "# WhiteMagic AGY Turbo Kit `v4.5.0` — Rust `PreToolUse`, Ping-Pong Auto-Crystal & Orchestrator Guards",
+        "# WhiteMagic AGY Turbo Kit `v4.5.1` — Resident Sidecar UI, Sangha CPR Bridge & Turn-0 Plugin Scoping",
         "",
-        "## 1. Historical `run_command` Spill & Squeeze Replay (`v4.3.0` → `v4.4.0` → `v4.4.1` → `v4.5.0`)",
+        "## 1. Historical `run_command` Spill & Squeeze Replay (`v4.3.0` → `v4.4.0` → `v4.4.1` → `v4.5.1`)",
         "",
         f"- **Commands replayed (`10` App + `12` CLI newest sessions):** `{spills['commands_scanned']}`",
         f"- **Commands intercepted by `wm-squeeze`:** `{spills['v43_squeezed']}` (`v4.3.0`) → `{spills['v440_squeezed']}` (`v4.4.0`) → `{spills['v441_squeezed']}` (`v4.4.1`) → **`{spills['v442_squeezed']}` (`v4.4.2+`, `+{spills['delta_vs_v43_pct']}%` vs `v4.3.0`)**",
@@ -628,7 +726,7 @@ def main():
         "",
         "### `PreToolUse` Latency: Python `pre_tool_guard.py` vs Compiled Rust `wm-squeeze --pre-tool` (30 runs each)",
         "",
-        "| Tool Scenario | Python (`v4.4.2`) | Rust `--pre-tool` (`v4.5.0`) | Rust p95 | Speedup | Exact Parity |",
+        "| Tool Scenario | Python (`v4.4.2`) | Rust `--pre-tool` (`v4.5.x`) | Rust p95 | Speedup | Exact Parity |",
         "| :--- | ---: | ---: | ---: | ---: | :---: |",
     ]
     for sc in ("read_file", "mcp_noop", "swarm_add", "run_command"):
@@ -646,7 +744,7 @@ def main():
             "",
             "## 3. Turn-0 Rule & Plugin Frontmatter Footprint",
             "",
-            f"- **Plugin `AGENTS.md`:** `{prefix['agents_v43_bytes']:,} B` (`v4.3.0`) → **`{prefix['agents_v441_bytes']:,} B` (`v4.5.0`, `{prefix['agents_delta_pct']}%`)**",
+            f"- **Plugin `AGENTS.md`:** `{prefix['agents_v43_bytes']:,} B` (`v4.3.0`) → **`{prefix['agents_v441_bytes']:,} B` (`v4.5.1`, `{prefix['agents_delta_pct']}%`)**",
             f"- **Global `GEMINI.md` (local user rules):** `{prefix['gemini_md_bytes']:,} B`",
             f"- **Enabled plugins skill frontmatter:** `{prefix['enabled_skills_total']}` skills across `{len(prefix['enabled_plugins'])}` plugins = `{prefix['enabled_frontmatter_bytes']:,} B` (~`{prefix['enabled_frontmatter_est_tokens']:,}` tok)",
             "",
@@ -660,14 +758,19 @@ def main():
     md.extend(
         [
             "",
-            "## 4. Zero-Token `PostInvocation` Rust HUD (`wm-squeeze --hud`) & Ping-Pong Auto-Crystal Corpus Replay",
+            "## 4. Zero-Token `PostInvocation` Rust HUD (`wm-squeeze --hud`) & Orchestration Replay",
             "",
             f"- **Turns replayed (`8` App + `12` CLI sessions):** `{hud['turns_replayed']}` across `{hud['sessions_replayed']}` sessions",
             f"- **Alerts emitted (`user_markdown` only):** `{hud['alerts_fired']}` (`{hud['alert_rate_pct']}%` of turns across `{hud['sessions_with_alerts']}` sessions)",
-            f"- **Alert breakdown:** `{json.dumps(hud['alerts_by_kind'])}`",
             f"- **Rust `wm-squeeze --hud` vs Python (30 runs):** median **`{hud['hud_rust_median_ms']} ms`** (p95 `{hud['hud_rust_p95_ms']} ms`) vs `{hud['hud_py_median_ms']} ms` (**`{hud['hud_rust_speedup_x']}×` faster**, parity=`{hud['hud_py_rust_parity']}`)",
-            f"- **Orchestration & Auto-Crystal Corpus Replay (`{v450['corpus_sessions']}` newest sessions):** `{v450['total_flips']}` cross-model flips (**`{v450['total_flip_unc_tokens']:,}` uncached tokens** burned on flips), `{v450['pingpong_sessions']}` ping-pong sessions (`>=2` flips), `{v450['auto_crystal_eligible_sessions']}` eligible for `Stop` auto-crystal (`wm-receipt/1.2`), `{v450['total_exit_plan']}` `exit_plan_mode` transitions (`{v450['total_one_turn_neon']}` 1-turn Neon plans), `{v450['cross_session_dup_reads']}` cross-session duplicate read paths",
+            f"- **Orchestration & Auto-Crystal Corpus Replay (`{v450['corpus_sessions']}` newest sessions):** `{v450['total_flips']}` flips (**`{v450['total_flip_unc_tokens']:,}` uncached tok**), `{v450['pingpong_sessions']}` ping-pong sessions, `{v450['auto_crystal_eligible_sessions']}` auto-crystal eligible, `{v450['total_exit_plan']}` `exit_plan_mode` (`{v450['total_one_turn_neon']}` 1-turn Neon), `{v450['cross_session_dup_reads']}` cross-session dup reads",
             f"- **Shared Swarm Map (`wm-handoff --swarm-map .`):** **`{v450['swarm_map_bytes']:,} B` (~`{v450['swarm_map_est_tokens']}` tokens)**",
+            "",
+            "## 5. Resident Sidecar UI, Sangha CPR Bridge & Turn-0 Plugin Scoping (`v4.5.1`)",
+            "",
+            f"- **Sidecar (`plugin/sidecars/wm-sidecar/`):** cold start **`{v451['sidecar_cold_start_ms']} ms`** · RSS **`{v451['sidecar_rss_mb']} MB`** · `GET /healthz` median **`{v451['sidecar_healthz_med_ms']} ms`** (p95 `{v451['sidecar_healthz_p95_ms']} ms`) · `GET /api/status` median **`{v451['sidecar_status_med_ms']} ms`** (p95 `{v451['sidecar_status_p95_ms']} ms`)",
+            f"- **Sangha CPR Pointer (`wm-cpr-bridge`):** **`{v451['cpr_pointer_bytes']} B` (~`{v451['cpr_pointer_est_tokens']}` tokens)** vs `{v451['cpr_crystal_bytes']:,} B` full crystal (**`-{v451['cpr_reduction_pct']}%`** wire size on board dispatches)",
+            f"- **Turn-0 Plugin Bloat Scoper (`wm-sim audit --scope-plugins .`):** flagged `{v451['scope_plugins_unmatched']}` -> saves **`~{v451['scope_plugins_savings_tok']:,}` Turn-0 tokens** per systems/CLI session",
             "",
         ]
     )
