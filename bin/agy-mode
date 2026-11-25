@@ -41,13 +41,23 @@ PROFILES = {
 }
 
 
-def print_status(recent=30):
-    brain = Path.home() / ".gemini" / "antigravity-cli" / "brain"
-    logs = sorted(
-        glob.glob(str(brain / "*" / ".system_generated" / "logs" / "transcript.jsonl")),
-        key=os.path.getmtime,
-        reverse=True,
-    )[:recent]
+SURFACE_BRAINS = {
+    "app": Path.home() / ".gemini" / "antigravity" / "brain",
+    "ide": Path.home() / ".gemini" / "antigravity-ide" / "brain",
+    "cli": Path.home() / ".gemini" / "antigravity-cli" / "brain",
+}
+
+
+def print_status(recent=30, surface="all"):
+    surfaces = ("app", "ide", "cli") if surface == "all" else (surface,)
+    all_logs = []
+    for surf in surfaces:
+        bdir = SURFACE_BRAINS.get(surf)
+        if bdir and bdir.is_dir():
+            for lp in glob.glob(str(bdir / "*" / ".system_generated" / "logs" / "transcript.jsonl")):
+                all_logs.append((os.path.getmtime(lp), lp))
+    all_logs.sort(key=lambda x: x[0], reverse=True)
+    logs = [lp for _, lp in all_logs[:recent]]
     stats = defaultdict(lambda: [0, 0, 0, 0])  # turns, unc, cac, out
     for lp in logs:
         with open(lp, encoding="utf-8", errors="replace") as fh:
@@ -97,12 +107,17 @@ def main():
             cleaned.append(a)
 
     if not cleaned or cleaned[0] in ("-h", "--help"):
-        print("Usage: agy-mode <longevity|orchestrator|deep|turbo|status> [--dry-run] [agy args...]")
+        print("Usage: agy-mode <longevity|orchestrator|deep|turbo|status> [--surface all|app|ide|cli] [--dry-run] [agy args...]")
         return
 
     profile = cleaned[0]
     if profile == "status":
-        print_status()
+        surf = "all"
+        if "--surface" in cleaned[1:]:
+            idx = cleaned.index("--surface")
+            if idx + 1 < len(cleaned) and cleaned[idx + 1] in ("all", "app", "ide", "cli"):
+                surf = cleaned[idx + 1]
+        print_status(surface=surf)
         return
     if profile not in PROFILES:
         sys.stderr.write(f"agy-mode: unknown profile '{profile}'. Choose: {', '.join(PROFILES)} or status\n")

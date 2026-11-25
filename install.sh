@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WhiteMagic AGY Turbo Kit v4.1.0 — Idempotent Cross-Platform Installer (macOS + Linux)
+# WhiteMagic AGY Turbo Kit v4.4.0 — Idempotent Cross-Platform Installer (macOS + Linux)
 # Installs:
 #   1. Zero-dependency Rust binaries `wm-squeeze`, `wm-codegraph`, & Safe-Rust `muninn-engine` -> ~/.local/bin/
 #   2. Native Antigravity plugin `whitemagic-agy-kit` (+ eager `code_graph` & `tricameral_dispatch` MCPs; or `--sync-global`)
@@ -83,10 +83,9 @@ if [ "$SYNC_GLOBAL" -eq 1 ]; then
     cp "${KIT_DIR}/plugin/hooks/session_start_brief.py" "${HOME}/.gemini/config/hooks/session_start_brief.py"
     cp "${KIT_DIR}/plugin/hooks/pre_tool_guard.py" "${HOME}/.gemini/config/hooks/pre_tool_guard.py"
     cp "${KIT_DIR}/plugin/hooks/post_tool_sim.py" "${HOME}/.gemini/config/hooks/post_tool_sim.py"
+    cp "${KIT_DIR}/plugin/hooks/longevity_hud.py" "${HOME}/.gemini/config/hooks/longevity_hud.py"
     cp "${KIT_DIR}/plugin/hooks/stop_telemetry.py" "${HOME}/.gemini/config/hooks/stop_telemetry.py"
     chmod +x "${HOME}/.gemini/config/hooks/"*.py
-    mkdir -p "${HOME}/.gemini/config/skills/huginn-tricameral-router"
-    cp "${KIT_DIR}/plugin/skills/huginn-tricameral-router/SKILL.md" "${HOME}/.gemini/config/skills/huginn-tricameral-router/SKILL.md"
     python3 - <<'PY'
 import json
 from pathlib import Path
@@ -103,7 +102,7 @@ hooks = {
         "enabled": True,
         "PreToolUse": [
             {
-                "matcher": "run_command|read_file|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall|mcp_whitemagic_whitemagic_gen3_session_continuity|mcp_whitemagic_whitemagic_gen3_memory_recall",
+                "matcher": "run_command|read_file|write_file|edit_file|manage_task|mcp_whitemagic-agy-kit_fast_run_checks|mcp_whitemagic-agy-kit_fast_apply_edits|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits|mcp_whitemagic_session_continuity|mcp_whitemagic_memory_recall|mcp_whitemagic_whitemagic_gen3_session_continuity|mcp_whitemagic_whitemagic_gen3_memory_recall|mcp_wm-research-engine_research_hunt|mcp_firecrawl_firecrawl_scrape",
                 "hooks": [
                     {"type": "command", "command": "python3 -S -B ~/.gemini/config/hooks/pre_tool_guard.py", "timeout": 5}
                 ],
@@ -114,11 +113,17 @@ hooks = {
         "enabled": True,
         "PostToolUse": [
             {
-                "matcher": "run_command|call_mcp_tool|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits",
+                "matcher": "run_command|read_file|write_file|edit_file|call_mcp_tool|mcp_whitemagic-agy-kit_fast_run_checks|mcp_whitemagic-agy-kit_fast_apply_edits|mcp_agy-fast_fast_run_checks|mcp_agy-fast_fast_apply_edits",
                 "hooks": [
                     {"type": "command", "command": "python3 -S -B ~/.gemini/config/hooks/post_tool_sim.py", "timeout": 5}
                 ],
             }
+        ],
+    },
+    "agy-longevity-hud": {
+        "enabled": True,
+        "PostInvocation": [
+            {"type": "command", "command": "python3 -S -B ~/.gemini/config/hooks/longevity_hud.py", "timeout": 3}
         ],
     },
     "agy-stop-telemetry": {
@@ -132,20 +137,34 @@ hp.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 print(f"Updated global {hp}")
 PY
 else
-    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.1.0 ==="
-    # Build fused TS MCP & benchmark bundle if needed
+    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.4.0 ==="
+    # Build fused TS MCP & benchmark bundle if needed (probe PATH, ~/.local/bin, nvm, homebrew, volta, fnm)
     TURBO_MCP_DIR="${KIT_DIR}/tools/agy-turbo-mcp"
-    NODE_BIN="$(command -v node || true)"
-    if [ -z "$NODE_BIN" ]; then
-        NODE_BIN="$(ls -1d "${HOME}"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -n 1 || true)"
-    fi
+    NODE_BIN=""
+    for cand in \
+        "$(command -v node 2>/dev/null || true)" \
+        "${LOCAL_BIN}/node" \
+        $(ls -1d "${HOME}"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V -r || true) \
+        /opt/homebrew/bin/node \
+        /usr/local/bin/node \
+        "${HOME}/.volta/bin/node" \
+        $(ls -1d "${HOME}"/.fnm/node-versions/*/installation/bin/node 2>/dev/null | sort -V -r || true); do
+        if [ -n "$cand" ] && [ -x "$cand" ]; then
+            NODE_BIN="$cand"
+            break
+        fi
+    done
     if [ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ]; then
-        ln -sf "$NODE_BIN" "${LOCAL_BIN}/node"
+        if [ "$NODE_BIN" != "${LOCAL_BIN}/node" ]; then
+            ln -sf "$NODE_BIN" "${LOCAL_BIN}/node"
+        fi
         if [ -d "$TURBO_MCP_DIR" ] && [ ! -f "${KIT_DIR}/plugin/dist/mcp-server.mjs" -o "${TURBO_MCP_DIR}/src/mcp-server.ts" -nt "${KIT_DIR}/plugin/dist/mcp-server.mjs" ]; then
             if [ -d "${TURBO_MCP_DIR}/node_modules" ] && command -v npm >/dev/null 2>&1; then
                 (cd "$TURBO_MCP_DIR" && npm run build)
             fi
         fi
+    else
+        echo "[WARN] Node.js (>=20) not found; fused 5-tool 'fast' MCP will fall back to 1-tool 'codegraph' MCP."
     fi
 
     TARGET_PLUGIN="${PLUGINS_DIR}/whitemagic-agy-kit"
@@ -156,7 +175,7 @@ else
     chmod +x "${TARGET_PLUGIN}/hooks/"*.py
 
     python3 - "$LOCAL_BIN" "$TARGET_PLUGIN" "${HOME}/.gemini/config/mcp_config.json" <<'PY'
-import json, shutil, sys
+import glob, json, os, shutil, sys
 from pathlib import Path
 
 local_bin = Path(sys.argv[1])
@@ -164,14 +183,27 @@ target_plugin = Path(sys.argv[2])
 global_mcp_path = Path(sys.argv[3])
 servers = {}
 
-node_bin = local_bin / "node"
-if not node_bin.is_file():
+def resolve_node() -> Path | None:
+    cands = [local_bin / "node"]
     which_node = shutil.which("node")
     if which_node:
-        node_bin = Path(which_node)
+        cands.append(Path(which_node))
+    home = Path.home()
+    for pat in (
+        str(home / ".nvm" / "versions" / "node" / "*" / "bin" / "node"),
+        str(home / ".fnm" / "node-versions" / "*" / "installation" / "bin" / "node"),
+    ):
+        for p in sorted(glob.glob(pat), reverse=True):
+            cands.append(Path(p))
+    cands.extend([Path("/opt/homebrew/bin/node"), Path("/usr/local/bin/node"), home / ".volta" / "bin" / "node"])
+    for c in cands:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c
+    return None
 
+node_bin = resolve_node()
 mcp_js = target_plugin / "dist" / "mcp-server.mjs"
-if node_bin.is_file() and mcp_js.is_file():
+if node_bin and mcp_js.is_file():
     servers["fast"] = {
         "command": str(node_bin),
         "args": [str(mcp_js)],
@@ -184,6 +216,7 @@ if node_bin.is_file() and mcp_js.is_file():
         },
     }
 else:
+    print(f"[WARN] Fused 'fast' MCP unavailable (node={node_bin}, mcp_js={mcp_js.is_file()}); falling back to 'codegraph'-only MCP.", file=sys.stderr)
     cg = local_bin / "wm-codegraph"
     if cg.is_file():
         servers["codegraph"] = {
@@ -266,7 +299,7 @@ if [ "$KEEP_HEAVY_PLUGINS" -eq 0 ] && command -v agy >/dev/null 2>&1; then
 fi
 
 echo "=== 5. Installing portable CLI tools, model manifest & cache-warmth statusline ==="
-for tool in wm-sim agy-bench agy-mode agy-token-audit wm-local-digest wm-dream wm-handoff wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-mcp wm-vps wm-triage; do
+for tool in wm-sim agy-bench agy-mode agy-token-audit wm-local-digest wm-dream wm-handoff wm-models wm-huginn wm-muninn wm-tricameral wm-tricameral-mcp wm-grok-swarm wm-grok-fleet wm-grok-mcp wm-vps wm-triage; do
     if [ -f "${KIT_DIR}/bin/${tool}" ]; then
         install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
     fi
@@ -399,7 +432,12 @@ if cfg_path.is_file():
             "mcp(whitemagic-agy-kit_fast/batch_search)",
             "mcp(whitemagic-agy-kit_fast/read_slices)",
             "mcp(whitemagic-agy-kit_fast/code_graph)",
+            "mcp(whitemagic-agy-kit_codegraph/*)",
             "mcp(tricameral/*)",
+            "mcp(grok/grok_dispatch)",
+            "mcp(firecrawl/firecrawl_scrape)",
+            "mcp(wm-research-engine/research_hunt)",
+            "mcp(wm-research-engine/research_daydream)",
         ):
             if pat not in gallow:
                 gallow.append(pat)

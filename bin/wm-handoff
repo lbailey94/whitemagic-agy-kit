@@ -21,7 +21,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-BRAIN = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+SURFACE_BRAINS = {
+    "app": Path.home() / ".gemini" / "antigravity" / "brain",
+    "ide": Path.home() / ".gemini" / "antigravity-ide" / "brain",
+    "cli": Path.home() / ".gemini" / "antigravity-cli" / "brain",
+}
 
 
 def parse_ts(v):
@@ -33,17 +37,20 @@ def parse_ts(v):
         return None
 
 
-def latest_transcript(conv_prefix=None):
-    logs = sorted(
-        glob.glob(str(BRAIN / "*" / ".system_generated" / "logs" / "transcript.jsonl")),
-        key=os.path.getmtime,
-        reverse=True,
-    )
+def latest_transcript(conv_prefix=None, surface="all"):
+    surfaces = ("app", "ide", "cli") if surface == "all" else (surface,)
+    logs = []
+    for surf in surfaces:
+        bdir = SURFACE_BRAINS.get(surf)
+        if bdir and bdir.is_dir():
+            for lp in glob.glob(str(bdir / "*" / ".system_generated" / "logs" / "transcript.jsonl")):
+                logs.append((os.path.getmtime(lp), Path(lp), surf))
+    logs.sort(key=lambda x: x[0], reverse=True)
     if conv_prefix:
-        for lp in logs:
-            if Path(lp).parents[2].name.startswith(conv_prefix):
-                return Path(lp)
-    return Path(logs[0]) if logs else None
+        for _, lp, surf in logs:
+            if lp.parents[2].name.startswith(conv_prefix):
+                return lp, surf
+    return (logs[0][1], logs[0][2]) if logs else (None, "")
 
 
 def git_state(cwd):
@@ -60,6 +67,17 @@ def git_state(cwd):
         return {"branch": branch, "status": st, "diff_stat": diff_stat, "recent_commits": log_3}
     except Exception:
         return None
+
+
+def _unwrap_json_str(v):
+    if isinstance(v, str) and len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        try:
+            u = json.loads(v)
+            if isinstance(u, str):
+                return u
+        except Exception:
+            pass
+    return v
 
 
 def extract_verbatim_state(tp):
@@ -101,15 +119,22 @@ def extract_verbatim_state(tp):
                     except Exception:
                         args = {}
                 if nm in ("edit_file", "write_file") and args.get("Path"):
-                    p = str(args["Path"])
+                    p = str(_unwrap_json_str(args["Path"]))
                     if p not in edited_files:
                         edited_files.append(p)
-                elif nm == "mcp_agy-fast_fast_apply_edits":
-                    for ed in (args.get("edits") or []):
-                        if isinstance(ed, dict) and ed.get("path"):
-                            p = str(ed["path"])
-                            if p not in edited_files:
-                                edited_files.append(p)
+                elif nm in ("mcp_agy-fast_fast_apply_edits", "mcp_whitemagic-agy-kit_fast_apply_edits"):
+                    edits = args.get("edits") or []
+                    if isinstance(edits, str):
+                        try:
+                            edits = json.loads(edits)
+                        except Exception:
+                            edits = []
+                    if isinstance(edits, list):
+                        for ed in edits:
+                            if isinstance(ed, dict) and ed.get("path"):
+                                p = str(_unwrap_json_str(ed["path"]))
+                                if p not in edited_files:
+                                    edited_files.append(p)
         elif t == "GENERIC":
             c = str(o.get("content") or "")
             if any(k in c for k in ("FAIL", "Error:", "Traceback", "error[E", "Command exited with code 1", "Command exited with code 2")):
@@ -137,12 +162,13 @@ def extract_verbatim_state(tp):
 def main():
     ap = argparse.ArgumentParser(description="Emit a zero-paraphrase CliffCompaction handoff crystal for clean session resets.")
     ap.add_argument("--conv", help="Conversation ID prefix (defaults to newest transcript)")
+    ap.add_argument("--surface", choices=["all", "app", "ide", "cli"], default="all", help="AGY surface to scan (default: all)")
     ap.add_argument("--cwd", default=os.getcwd(), help="Git working directory to snapshot")
     ap.add_argument("--out", help="Optional output markdown file path")
     ap.add_argument("--save-wm3", action="store_true", help="Also persist handoff crystal to WhiteMagic Gen3 (wm3 / wm-gen3)")
     args = ap.parse_args()
 
-    tp = latest_transcript(args.conv)
+    tp, surf = latest_transcript(args.conv, surface=args.surface)
     if not tp:
         sys.stderr.write("wm-handoff: no AGY transcript found.\n")
         sys.exit(1)
@@ -151,8 +177,8 @@ def main():
     gs = git_state(args.cwd)
 
     lines = [
-        f"# Verbatim Handoff Crystal (CliffCompaction | source={st['conv_id'][:8]})",
-        f"- **Prior Session:** `{st['conv_id'][:12]}` | model=`{st['model'] or '?'}` | ctx=`{st['last_ctx']:,}` tok | last_hit=`{st['last_hit']}%` | idle=`{st['idle_sec']}s`",
+        f"# Verbatim Handoff Crystal (CliffCompaction | source={st['conv_id'][:8]} | surface={surf})",
+        f"- **Prior Session:** `{st['conv_id'][:12]}` (`{surf}`) | model=`{st['model'] or '?'}` | ctx=`{st['last_ctx']:,}` tok | last_hit=`{st['last_hit']}%` | idle=`{st['idle_sec']}s`",
     ]
     if st["last_ctx"] >= 100_000 and (st["idle_sec"] or 0) >= 180:
         est_save = max(0, st["last_ctx"] - 2000)

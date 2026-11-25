@@ -1334,17 +1334,169 @@ def test_v41_token_burn_shield():
     check("install.sh no longer appends invalid write_file(.env)", 'existing_deny.append("write_file(.env)")' not in inst_txt)
 
 
+def test_v44_ide_longevity_shield():
+    print("\n9. v4.4.0 App/IDE Parity, Quote-Aware Squeeze, Wide-Line Guard, Longevity HUD & Multi-Surface CLIs:")
+    HUD_HOOK = _HOOKS_DIR / "longevity_hud.py"
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        # 9a) Quote-aware PreToolUse wm-squeeze (quoted rg, find, git log --format ARE squeezed; $VAR/pipes/unquoted glob untouched)
+        (td_path / "sample.py").write_text("foo = 1\nbar = 2\n", encoding="utf-8")
+        for label, cmd in [
+            ("quoted rg alternation", f'rg -n "foo|bar" {td}'),
+            ("quoted find glob", f'find {td} -name "*.py"'),
+            ("quoted git format", f'git -C {td} log --format="%h %s" -n 5'),
+        ]:
+            rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}})
+            d = json.loads(out)
+            ow = (d.get("overwrite") or {}).get("CommandLine", "")
+            check(f"{label} -> rewritten with --safe", rc == 0 and d.get("decision") == "allow" and "--safe" in ow, ow)
+
+        # Verify rewritten quoted rg & find actually execute cleanly
+        _, out_rg, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": f'rg -n "foo|bar" {td}'}}})
+        ow_rg = (json.loads(out_rg).get("overwrite") or {}).get("CommandLine", "")
+        p_rg = subprocess.run(["bash", "-c", ow_rg], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1", "WM_SQUEEZE_NO_CACHE": "1"})
+        check("rewritten quoted rg executes cleanly & finds matches", p_rg.returncode == 0 and "foo = 1" in p_rg.stdout and "bar = 2" in p_rg.stdout)
+
+        for label, cmd in [
+            ("double-quoted $VAR", f'rg -n "$VAR" {td}'),
+            ("piped rg", f'rg -n foo {td} | head -n 5'),
+            ("unquoted find glob", f'find {td} -name *.py'),
+        ]:
+            rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}})
+            d = json.loads(out)
+            check(f"untouched ({label})", rc == 0 and "overwrite" not in d)
+
+        # 9b) Standalone python3 -c wrapping (large stdout capped, exit code preserved, piped untouched)
+        py_big = 'python3 -c "for i in range(400): print(f\'row {i}: \' + \'x\' * 45)"'
+        rc, out, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": py_big}}})
+        rew_py = (json.loads(out).get("overwrite") or {}).get("CommandLine", "")
+        check("python3 -c rewritten with pipefail + wm-squeeze --pipe", rc == 0 and "set -o pipefail;" in rew_py and "--pipe" in rew_py)
+        p_py = subprocess.run(["bash", "-c", rew_py], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"})
+        check("rewritten python3 -c caps stdout <=8.4KB & rc=0", p_py.returncode == 0 and len(p_py.stdout.encode("utf-8")) <= 8400 and "[wm-squeeze:" in p_py.stdout)
+
+        py_fail = 'python3 -c "import sys; print(\'fail\'); sys.exit(4)"'
+        _, out_pf, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": py_fail}}})
+        rew_pf = (json.loads(out_pf).get("overwrite") or {}).get("CommandLine", "")
+        p_pf = subprocess.run(["bash", "-c", rew_pf], capture_output=True, text=True, env={**os.environ, "WM_SQUEEZE_NO_STATS": "1"})
+        check("rewritten failing python3 -c preserves exit code 4", p_pf.returncode == 4)
+
+        _, out_pipe, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "run_command", "args": {"CommandLine": 'python3 -c "print(1)" | head -n 1'}}})
+        check("piped python3 -c untouched", "overwrite" not in json.loads(out_pipe))
+
+        # 9c) Wide-line JSONL file (>24KB, avg >400B/line) clamped to <=50L even on explicit 1..150 span
+        wide_jsonl = td_path / "wide.jsonl"
+        wide_jsonl.write_text("\n".join(json.dumps({"i": i, "blob": "A" * 600}) for i in range(80)) + "\n", encoding="utf-8")
+        tr_lo = td_path / "tr_lo.jsonl"
+        tr_lo.write_text(json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 8000, "cache_read_tokens": 32000, "model": "gemini-4-hydrogen-xhigh"}) + "\n")
+        rc, out, _, _ = run_hook(
+            PRE_HOOK,
+            {"conversationId": "v44-wide-jsonl", "stepIdx": 1, "transcriptPath": str(tr_lo), "toolCall": {"name": "read_file", "args": {"Path": str(wide_jsonl), "StartLine": 1, "EndLine": 150}}},
+        )
+        check("wide-line JSONL StartLine=1..150 clamped to EndLine=50", rc == 0 and json.loads(out).get("overwrite") == {"EndLine": 50}, out)
+
+        # 9d) Research Engine & Firecrawl MCP budgeters + hooks.json matcher coverage
+        _, out_rh, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "mcp_wm-research-engine_research_hunt", "args": {"problem": "cache", "limit": 20}}})
+        check("research_hunt limit=20 clamped to 8", json.loads(out_rh).get("overwrite") == {"limit": 8})
+        _, out_fc, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "mcp_firecrawl_firecrawl_scrape", "args": {"url": "https://example.com"}}})
+        check("firecrawl_scrape defaults markdown_only=True", json.loads(out_fc).get("overwrite") == {"markdown_only": True})
+        _, out_fc_fmt, _, _ = run_hook(PRE_HOOK, {"toolCall": {"name": "mcp_firecrawl_firecrawl_scrape", "args": {"url": "https://example.com", "format": "html"}}})
+        check("firecrawl_scrape with explicit format untouched", "overwrite" not in json.loads(out_fc_fmt))
+        hooks_cfg = json.loads((KIT / "plugin" / "hooks.json").read_text(encoding="utf-8"))
+        pre_matcher = hooks_cfg["data-loss-and-token-guard"]["PreToolUse"][0]["matcher"]
+        check(
+            "hooks.json PreToolUse covers research_hunt & firecrawl_scrape + PostInvocation HUD",
+            "mcp_wm-research-engine_research_hunt" in pre_matcher and "mcp_firecrawl_firecrawl_scrape" in pre_matcher and "agy-longevity-hud" in hooks_cfg,
+        )
+
+        # 9e) Zero-token PostInvocation Longevity HUD (longevity_hud.py)
+        app_brain = td_path / ".gemini" / "antigravity" / "brain" / "v44-hud-app" / ".system_generated" / "logs"
+        app_brain.mkdir(parents=True)
+        tr_app = app_brain / "transcript.jsonl"
+        tr_app.write_text(json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 10000, "cache_read_tokens": 80000, "model": "gemini-4-hydrogen-xhigh", "step_index": 1}) + "\n")
+        rc, out, _, ms = run_hook(HUD_HOOK, {"conversationId": "v44-hud-app-1", "transcriptPath": str(tr_app), "invocationNum": 1})
+        check("HUD <120k -> silent {}", rc == 0 and json.loads(out) == {}, f"{ms:.1f}ms")
+
+        tr_app.write_text(tr_app.read_text() + json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 10000, "cache_read_tokens": 115000, "model": "gemini-4-hydrogen-xhigh", "step_index": 2}) + "\n")
+        rc, out, _, _ = run_hook(HUD_HOOK, {"conversationId": "v44-hud-app-1", "transcriptPath": str(tr_app), "invocationNum": 2})
+        d = json.loads(out)
+        sm = d.get("injectSteps", [{}])[0].get("systemMessage", {})
+        check("HUD App 125k -> zero-token user_markdown Context Watch", rc == 0 and sm.get("systemMessage") == "" and "Context Watch" in sm.get("metadata", {}).get("user_markdown", ""))
+
+        # Repeat at 128k (without compaction) -> silent {}
+        tr_app.write_text(tr_app.read_text() + json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 3000, "cache_read_tokens": 125000, "model": "gemini-4-hydrogen-xhigh", "step_index": 3}) + "\n")
+        rc, out, _, _ = run_hook(HUD_HOOK, {"conversationId": "v44-hud-app-1", "transcriptPath": str(tr_app), "invocationNum": 3})
+        check("HUD 128k repeat -> silent {} (rate-limited)", rc == 0 and json.loads(out) == {})
+
+        # Cross 205k -> Context Cliff alert
+        tr_app.write_text(tr_app.read_text() + json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 8000, "cache_read_tokens": 197000, "model": "gemini-4-hydrogen-xhigh", "step_index": 4}) + "\n")
+        rc, out, _, _ = run_hook(HUD_HOOK, {"conversationId": "v44-hud-app-1", "transcriptPath": str(tr_app), "invocationNum": 4})
+        d = json.loads(out)
+        um = d.get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", "")
+        check("HUD 205k -> Context Cliff alert", rc == 0 and "Context Cliff" in um)
+
+        # Post-compaction CHECKPOINT resets threshold flags
+        tr_app.write_text(tr_app.read_text() + json.dumps({"type": "CHECKPOINT", "content": "compacted"}) + "\n" + json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 5000, "cache_read_tokens": 120000, "model": "gemini-4-hydrogen-xhigh", "step_index": 5}) + "\n")
+        rc, out, _, _ = run_hook(HUD_HOOK, {"conversationId": "v44-hud-app-1", "transcriptPath": str(tr_app), "invocationNum": 5})
+        um = json.loads(out).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", "")
+        check("HUD post-CHECKPOINT epoch reset re-arms 120k watch", rc == 0 and "Context Watch" in um)
+
+        # CLI Model flip >=50k uncached fires alert; VANILLA=1 stays silent
+        cli_brain = td_path / ".gemini" / "antigravity-cli" / "brain" / "v44-hud-cli" / ".system_generated" / "logs"
+        cli_brain.mkdir(parents=True)
+        tr_cli = cli_brain / "transcript.jsonl"
+        tr_cli.write_text(
+            "\n".join([
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 10000, "cache_read_tokens": 90000, "model": "gemini-4-neon-xhigh", "step_index": 1}),
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 110000, "cache_read_tokens": 0, "model": "gemini-4-hydrogen-xhigh", "step_index": 2}),
+            ]) + "\n"
+        )
+        rc, out, _, _ = run_hook(HUD_HOOK, {"conversationId": "v44-hud-cli-1", "transcriptPath": str(tr_cli), "invocationNum": 2})
+        um_flip = json.loads(out).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", "")
+        check("HUD CLI model flip unc=110k -> Model Flip alert", rc == 0 and "Model Flip Cache Eviction" in um_flip)
+
+        rc, out_v, _, _ = run_hook(HUD_HOOK, {"conversationId": "v44-hud-cli-2", "transcriptPath": str(tr_cli), "invocationNum": 2}, env_extra={"WM_AGY_BENCH_VANILLA": "1"})
+        check("HUD WM_AGY_BENCH_VANILLA=1 -> {}", rc == 0 and json.loads(out_v) == {})
+
+        # Cold miss (<50% hit at >=80k without model flip)
+        tr_cold = app_brain / "cold.jsonl"
+        tr_cold.write_text(
+            "\n".join([
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 10000, "cache_read_tokens": 120000, "model": "gemini-4-hydrogen-xhigh", "step_index": 1}),
+                json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 140000, "cache_read_tokens": 0, "model": "gemini-4-hydrogen-xhigh", "step_index": 2}),
+            ]) + "\n"
+        )
+        rc, out_c, _, _ = run_hook(HUD_HOOK, {"conversationId": "v44-hud-cold-1", "transcriptPath": str(tr_cold), "invocationNum": 6})
+        um_cold = json.loads(out_c).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", "")
+        check("HUD cold miss 140k (0% hit) -> Cold Cache Miss alert", rc == 0 and "Cold Cache Miss" in um_cold)
+
+    # 9f) Multi-surface CLIs (wm-handoff, agy-token-audit, agy-mode, agy-bench, wm-sim)
+    p_ho = subprocess.run([str(LOCAL_BIN / "wm-handoff"), "--surface", "app", "--cwd", str(KIT)], capture_output=True, text=True)
+    check("wm-handoff --surface app emits crystal", p_ho.returncode == 0 and "surface=app" in p_ho.stdout and "crystal_sha256=" in p_ho.stdout)
+    p_au = subprocess.run([str(LOCAL_BIN / "agy-token-audit"), "--surface", "app", "--recent", "3", "--json"], capture_output=True, text=True)
+    ok_au = p_au.returncode == 0 and any(s.get("surface") == "app" for s in json.loads(p_au.stdout).get("sessions", []))
+    check("agy-token-audit --surface app --recent 3 --json succeeds", ok_au)
+    p_md = subprocess.run([str(LOCAL_BIN / "agy-mode"), "status", "--surface", "all"], capture_output=True, text=True)
+    check("agy-mode status --surface all succeeds", p_md.returncode == 0 and "AGY Model Cache" in p_md.stdout)
+    p_ab = subprocess.run([str(LOCAL_BIN / "agy-bench"), "--surface", "app", "--recent", "3", "--credits"], capture_output=True, text=True)
+    check("agy-bench --surface app --credits succeeds", p_ab.returncode == 0 and "Overall cache hit rate" in p_ab.stdout)
+    p_sim = subprocess.run([str(LOCAL_BIN / "wm-sim"), "audit"], capture_output=True, text=True)
+    check("wm-sim audit confirms fast MCP VALID", p_sim.returncode == 0 and "whitemagic-agy-kit MCP: VALID" in p_sim.stdout)
+
+
 def main():
-    test_wm_squeeze()
-    test_pre_tool_hook()
-    test_statusline_and_lifecycle()
-    test_tricameral_v31()
-    test_v4_fusion()
-    test_bwrap_confinement()
-    test_signed_confinement_receipts()
-    test_remote_confinement_attestation()
-    test_v41_token_burn_shield()
-    print(f"\n=== Wave 3/4/v4.1 Test Summary: {PASS} passed, {FAIL} failed ===")
+    with tempfile.TemporaryDirectory(prefix="agy_hook_state_") as state_td:
+        os.environ["WM_HOOK_STATE_DIR"] = state_td
+        test_wm_squeeze()
+        test_pre_tool_hook()
+        test_statusline_and_lifecycle()
+        test_tricameral_v31()
+        test_v4_fusion()
+        test_bwrap_confinement()
+        test_signed_confinement_receipts()
+        test_remote_confinement_attestation()
+        test_v41_token_burn_shield()
+        test_v44_ide_longevity_shield()
+    print(f"\n=== Wave 3/4/v4.4 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

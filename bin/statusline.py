@@ -65,9 +65,10 @@ def resolve_transcript(data):
         return Path(tp)
     cid = data.get("conversation_id") or data.get("conversationId") or data.get("session_id")
     if cid:
-        cand = Path.home() / ".gemini" / "antigravity-cli" / "brain" / str(cid) / ".system_generated" / "logs" / "transcript.jsonl"
-        if cand.is_file():
-            return cand
+        for surf in ("antigravity-cli", "antigravity", "antigravity-ide"):
+            cand = Path.home() / ".gemini" / surf / "brain" / str(cid) / ".system_generated" / "logs" / "transcript.jsonl"
+            if cand.is_file():
+                return cand
     return None
 
 

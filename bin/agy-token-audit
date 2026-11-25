@@ -15,11 +15,35 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-BRAIN_DIR = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+SURFACE_BRAINS = {
+    "app": Path.home() / ".gemini" / "antigravity" / "brain",
+    "ide": Path.home() / ".gemini" / "antigravity-ide" / "brain",
+    "cli": Path.home() / ".gemini" / "antigravity-cli" / "brain",
+}
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 SWARM_NAME_CID_RE = re.compile(r'"name"\s*:\s*"([^"]+)"[^}]*?"conversation_id"\s*:\s*"([0-9a-f-]{36})"')
 SWARM_CID_NAME_RE = re.compile(r'"conversation_id"\s*:\s*"([0-9a-f-]{36})"[^}]*?"name"\s*:\s*"([^"]+)"')
+
+
+def find_transcript(conv_id: str, surface: str = "all") -> tuple[Path | None, str]:
+    surfaces = ("app", "ide", "cli") if surface == "all" else (surface,)
+    for surf in surfaces:
+        bdir = SURFACE_BRAINS.get(surf)
+        if not bdir or not bdir.is_dir():
+            continue
+        tf = bdir / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+        if tf.is_file():
+            return tf, surf
+    if len(conv_id) >= 6:
+        for surf in surfaces:
+            bdir = SURFACE_BRAINS.get(surf)
+            if not bdir or not bdir.is_dir():
+                continue
+            for tf in sorted(bdir.glob(f"{conv_id}*/.system_generated/logs/transcript.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+                if tf.is_file():
+                    return tf, surf
+    return None, ""
 
 
 def sanitize_report(text: str) -> str:
@@ -32,12 +56,13 @@ def sanitize_report(text: str) -> str:
     return text
 
 
-def discover_swarm_workers(coord_id: str) -> list[tuple[str, str]]:
+def discover_swarm_workers(coord_id: str, surface: str = "all") -> list[tuple[str, str]]:
     """Auto-discover swarm worker conversation_ids and names from coordinator transcript."""
-    tf = BRAIN_DIR / coord_id / ".system_generated" / "logs" / "transcript.jsonl"
-    found: list[tuple[str, str]] = [("coordinator", coord_id)]
-    seen = {coord_id}
-    if not tf.is_file():
+    tf, _ = find_transcript(coord_id, surface=surface)
+    resolved_coord = tf.parents[2].name if tf else coord_id
+    found: list[tuple[str, str]] = [("coordinator", resolved_coord)]
+    seen = {resolved_coord}
+    if not tf or not tf.is_file():
         return found
 
     pending_names: list[str] = []
@@ -83,10 +108,10 @@ def discover_swarm_workers(coord_id: str) -> list[tuple[str, str]]:
     return found
 
 
-def audit_transcript(label: str, conv_id: str) -> dict[str, Any]:
-    tf = BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
-    if not tf.is_file():
-        return {"label": label, "conv_id": conv_id, "missing": True}
+def audit_transcript(label: str, conv_id: str, surface: str = "all") -> dict[str, Any]:
+    tf, surf = find_transcript(conv_id, surface=surface)
+    if not tf or not tf.is_file():
+        return {"label": label, "conv_id": conv_id, "surface": surf or "-", "missing": True}
 
     turns = 0
     unc_sum = cac_sum = out_sum = 0
@@ -162,7 +187,8 @@ def audit_transcript(label: str, conv_id: str) -> dict[str, Any]:
     hit_pct = round(100.0 * cac_sum / max(unc_sum + cac_sum, 1), 1)
     return {
         "label": label,
-        "conv_id": conv_id,
+        "conv_id": tf.parents[2].name,
+        "surface": surf,
         "missing": False,
         "turns": turns,
         "hit_pct": hit_pct,
@@ -219,21 +245,21 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def format_table(rows: list[dict[str, Any]], agg: dict[str, Any]) -> str:
     lines = [
         f"=== AGY Token & Cache Forensics ({agg['sessions_audited']} sessions | {agg['turns']} turns | {agg['hit_pct']}% hit) ===",
-        f"{'SESSION':18s} | {'TRN':>3s} | {'HIT%':>5s} | {'T0_UNC':>7s} | {'TOT_UNC':>8s} | {'TOT_CAC':>8s} | {'TOT_OUT':>7s} | {'MAX_UNC':>7s} | {'FLP':>3s} | {'G30':>3s} | {'CMP':>3s} | {'HK':>2s}",
-        "-" * 105,
+        f"{'SESSION':16s} | {'SRF':>3s} | {'TRN':>3s} | {'HIT%':>5s} | {'T0_UNC':>7s} | {'TOT_UNC':>8s} | {'TOT_CAC':>8s} | {'TOT_OUT':>7s} | {'MAX_UNC':>7s} | {'FLP':>3s} | {'G30':>3s} | {'CMP':>3s} | {'HK':>2s}",
+        "-" * 109,
     ]
     for r in rows:
         if r.get("missing"):
-            lines.append(f"{r['label'][:18]:18s} | MISSING")
+            lines.append(f"{r['label'][:16]:16s} | {r.get('surface', '-'):>3s} | MISSING")
             continue
         lines.append(
-            f"{r['label'][:18]:18s} | {r['turns']:3d} | {r['hit_pct']:4.1f}% | {r['t0_unc']/1000:6.1f}k | "
+            f"{r['label'][:16]:16s} | {r.get('surface', '-'):>3s} | {r['turns']:3d} | {r['hit_pct']:4.1f}% | {r['t0_unc']/1000:6.1f}k | "
             f"{r['tot_unc']/1e6:7.2f}M | {r['tot_cac']/1e6:7.2f}M | {r['tot_out']/1000:6.1f}k | "
             f"{r['max_unc']/1000:6.1f}k | {r['flips']:3d} | {r['gaps30']:3d} | {r['compactions']:3d} | {r['hook_hits']:2d}"
         )
-    lines.append("-" * 105)
+    lines.append("-" * 109)
     lines.append(
-        f"{'TOTAL':18s} | {agg['turns']:3d} | {agg['hit_pct']:4.1f}% | {'':>7s} | "
+        f"{'TOTAL':16s} | {'ALL':>3s} | {agg['turns']:3d} | {agg['hit_pct']:4.1f}% | {'':>7s} | "
         f"{agg['tot_unc']/1e6:7.2f}M | {agg['tot_cac']/1e6:7.2f}M | {agg['tot_out']/1000:6.1f}k | "
         f"{agg['max_unc']/1000:6.1f}k | {agg['flips']:3d} | {agg['gaps30']:3d} | {agg['compactions']:3d} | {agg['hook_hits']:2d}"
     )
@@ -250,7 +276,7 @@ def format_table(rows: list[dict[str, Any]], agg: dict[str, Any]) -> str:
 
 def build_markdown_report(rows: list[dict[str, Any]], agg: dict[str, Any], target_label: str) -> str:
     md = [
-        f"# Antigravity CLI Token & Prefix-Cache Telemetry Report ({target_label})",
+        f"# Antigravity Token & Prefix-Cache Telemetry Report ({target_label})",
         "",
         f"- **Sessions Audited:** `{agg['sessions_audited']}`",
         f"- **Total Turns:** `{agg['turns']}`",
@@ -262,14 +288,14 @@ def build_markdown_report(rows: list[dict[str, Any]], agg: dict[str, Any], targe
         "",
         "## Per-Session Breakdown",
         "",
-        "| Session | Turns | Cache Hit | Turn-0 Unc | Uncached In | Cached In | Output Tok | Max Single Unc | Flips | >=30s Gaps | Compactions |",
-        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Session | Surface | Turns | Cache Hit | Turn-0 Unc | Uncached In | Cached In | Output Tok | Max Single Unc | Flips | >=30s Gaps | Compactions |",
+        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for r in rows:
         if r.get("missing"):
             continue
         md.append(
-            f"| `{r['label'][:22]}` | {r['turns']} | {r['hit_pct']}% | {r['t0_unc']/1000:.1f}k | "
+            f"| `{r['label'][:22]}` | `{r.get('surface', '-')}` | {r['turns']} | {r['hit_pct']}% | {r['t0_unc']/1000:.1f}k | "
             f"{r['tot_unc']/1e6:.2f}M | {r['tot_cac']/1e6:.2f}M | {r['tot_out']/1000:.1f}k | "
             f"{r['max_unc']/1000:.1f}k | {r['flips']} | {r['gaps30']} | {r['compactions']} |"
         )
@@ -287,7 +313,7 @@ def build_markdown_report(rows: list[dict[str, Any]], agg: dict[str, Any], targe
     md.extend(
         [
             "",
-            "## Empirical Takeaways & Mitigations Implemented (`whitemagic-agy-kit v4.1.0`)",
+            "## Empirical Takeaways & Mitigations Implemented (`whitemagic-agy-kit v4.4.0`)",
             "",
             "1. **Orchestrator Model-Flip Cache Eviction:** Alternating between models (`Neon <-> Hydrogen`) on large contexts (`150k-327k`) dropped prefix cache hits to `0%` on flip turns. Mitigation: pin `/swarm` coordinators to a single model (`agy-mode longevity`).",
             "2. **Wide-Span `read_file` Context Bloat:** Explicit `StartLine=1, EndLine=800` slices bypassed unbounded-only read guards and triggered compaction spikes (`384k` uncached). Mitigation: clamp any span >250 lines (`150L` above `120k` ctx, `120L` on burst reads).",
@@ -301,8 +327,9 @@ def build_markdown_report(rows: list[dict[str, Any]], agg: dict[str, Any], targe
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Forensic token & prefix-cache audit for Antigravity CLI sessions and swarms.")
+    ap = argparse.ArgumentParser(description="Forensic token & prefix-cache audit for Antigravity App/IDE/CLI sessions and swarms.")
     ap.add_argument("--recent", type=int, default=15, help="Audit N most recent sessions (default 15)")
+    ap.add_argument("--surface", choices=["all", "app", "ide", "cli"], default="all", help="AGY surface to scan (default: all)")
     ap.add_argument("--conv", type=str, help="Audit a single conversation ID (auto-discovers spawned swarm workers if present)")
     ap.add_argument("--swarm", type=str, help="Audit a swarm coordinator ID and all its spawned workers")
     ap.add_argument("--json", action="store_true", help="Print JSON output")
@@ -310,24 +337,27 @@ def main() -> int:
     args = ap.parse_args()
 
     targets: list[tuple[str, str]] = []
-    target_label = f"recent-{args.recent}"
+    target_label = f"recent-{args.recent}-{args.surface}"
     if args.swarm:
-        targets = discover_swarm_workers(args.swarm)
+        targets = discover_swarm_workers(args.swarm, surface=args.surface)
         target_label = f"swarm-{args.swarm[:8]}"
     elif args.conv:
-        targets = discover_swarm_workers(args.conv)
+        targets = discover_swarm_workers(args.conv, surface=args.surface)
         target_label = f"conv-{args.conv[:8]}"
     else:
-        logs = sorted(
-            BRAIN_DIR.glob("*/.system_generated/logs/transcript.jsonl"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )[: max(1, args.recent)]
-        for lp in logs:
+        surfaces = ("app", "ide", "cli") if args.surface == "all" else (args.surface,)
+        all_logs = []
+        for surf in surfaces:
+            bdir = SURFACE_BRAINS.get(surf)
+            if bdir and bdir.is_dir():
+                for lp in bdir.glob("*/.system_generated/logs/transcript.jsonl"):
+                    all_logs.append((lp.stat().st_mtime, lp))
+        all_logs.sort(key=lambda x: x[0], reverse=True)
+        for _, lp in all_logs[: max(1, args.recent)]:
             cid = lp.parents[2].name
             targets.append((cid[:14], cid))
 
-    rows = [audit_transcript(lbl, cid) for lbl, cid in targets]
+    rows = [audit_transcript(lbl, cid, surface=args.surface) for lbl, cid in targets]
     agg = aggregate(rows)
 
     if args.report_md:

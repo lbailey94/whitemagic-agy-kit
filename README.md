@@ -1,7 +1,8 @@
-# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v4.1.0 — Token-Burn Shield + Fused Turbo+Fast Edition)
+# WhiteMagic AGY Turbo Kit (`whitemagic-agy-kit` v4.4.0 — App/IDE Parity & Longevity Shield)
 
-Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity CLI (`agy 1.5.14+`), Desktop 2.0, and IDE optimization suite fusing `whitemagic-agy-kit` and `INK-Q/agy-fast` (MIT) into a single unified plugin:
-- **Token-Burn Shield (`v4.1.0`):** Forensic `agy-token-audit` CLI (`--recent`, `--conv`, `--swarm`, `--report-md`), wide-span & burst `read_file` auto-clamping (`>250L` / `150L` above `120k` ctx / `120L` burst), multiline inline `python3 - <<'PY'` heredoc `wm-squeeze --pipe` auto-wrapping, portable `[Env-Write Guard]` (`force_ask` on `.env*` secrets, fixing AGY sandbox relative deny-rule errors), automatic user/plugin skill deduplication, and `110/110` passing regression tests.
+Cross-platform (**macOS Apple Silicon/Intel + Linux**) Antigravity App 2.0, Antigravity IDE, and CLI (`agy 1.5.14+`) optimization suite fusing `whitemagic-agy-kit` and `INK-Q/agy-fast` (MIT) into a single unified plugin:
+- **App/IDE Parity & Longevity Shield (`v4.4.0`):** Quote-aware `PreToolUse` `wm-squeeze` (`+38.6%` more commands squeezed across `3,497` real commands, eliminating quoted `rg`/`find` bypasses), standalone `python3 -c` `wm-squeeze --pipe` wrapping, wide-line JSON/JSONL `<=50L` `read_file` clamping, Firecrawl/Research Engine MCP auto-budgeting, zero-token `PostInvocation` App/IDE Longevity HUD (`0` model tokens, `2.48%` alert rate on `7,188` replayed turns), multi-surface (`app`+`ide`+`cli`) companion CLIs, hardened Node/MCP wiring, deduplicated `AGENTS.md` (`-26.6%` bytes), and `139/139` passing regression tests ([`benchmarks/RESULTS_2026-11-25_v44.md`](./benchmarks/RESULTS_2026-11-25_v44.md)).
+- **Token-Burn Shield (`v4.1.0`):** Forensic `agy-token-audit` CLI (`--recent`, `--conv`, `--swarm`, `--report-md`), wide-span & burst `read_file` auto-clamping (`>250L` / `150L` above `120k` ctx / `120L` burst), multiline inline `python3 - <<'PY'` heredoc `wm-squeeze --pipe` auto-wrapping, portable `[Env-Write Guard]` (`force_ask` on `.env*` secrets, fixing AGY sandbox relative deny-rule errors), and automatic user/plugin skill deduplication.
 - **5-Tool Eager Stdio MCP (`whitemagic-agy-kit_fast`):** `batch_search` (auto-collapses lockfile diffs), `apply_edits` (safe unique line-drift auto-relocate + trailing-whitespace unique fallback + `wm-squeeze` inline `verify`), `read_slices`, `run_checks` (CoACT `wm-squeeze` compression + 300s git-aware cache in `compact` mode), and `code_graph` (`wm-codegraph` AST/call-graph).
 - **Unified Zero-Jitter `SessionStart` (`session_start_brief.py`):** Single `<2.6 KB` Turn-0 digest combining cached preflight brief + SIM ledger + Dream digest + compact workspace snapshot (suppressing `$HOME` noise).
 - **Deterministic `PreToolUse` Guards, `wm-squeeze v3`, `wm-handoff`, `Tricameral CyberBrain`, & SIM Memory.**
@@ -10,7 +11,12 @@ Built from empirical offline forensics across `50` real sessions (`12,740` turns
 
 ---
 
-## Headline Empirical Results ([Benchmarks](./benchmarks/RESULTS_2026-11-21.md) · [v4.1.0 Swarm Telemetry](./benchmarks/AGY_SWARM_TOKEN_TELEMETRY_REPORT_2026-11-23.md))
+## Headline Empirical Results ([v4.4.0 Benchmarks](./benchmarks/RESULTS_2026-11-25_v44.md) · [v3/Wave4 Benchmarks](./benchmarks/RESULTS_2026-11-21.md) · [v4.1.0 Swarm Telemetry](./benchmarks/AGY_SWARM_TOKEN_TELEMETRY_REPORT_2026-11-23.md))
+
+- **App/IDE Parity & Longevity Shield (`v4.4.0`, [RESULTS_2026-11-25_v44.md](./benchmarks/RESULTS_2026-11-25_v44.md)):**
+  - **22-Session Historical Replay (`3,497` `run_command` calls):** `533 → 739` commands auto-squeezed (**`+38.6%`**), catching `118` `python3 -c` and `53` quoted `rg` commands; `plugin/rules/AGENTS.md` cut **`-26.6%`** (`3,573 B → 2,621 B`).
+  - **20-Session `PostInvocation` Longevity HUD Replay (`7,188` turns):** `178` alerts (`2.48%` alert rate: `167` model-flip warnings, `6` `120k` watches, `2` `200k` cliffs, `6` cold misses) with **`0` model tokens** added.
+  - **Live `agy -p` Head-to-Head (`Vanilla` vs `v4.4.0`, `Gemini 4 Hydrogen (High)`):** `28.68s → 20.11s` (**`-29.9%` wall-time**), `1 → 0` disk spills (**`-100%`**), `2` `PreToolUse` rewrites (`rg` + `python3 -c`), `0` hook errors.
 
 - **Live 19-Session `/swarm` Before vs. After (`v4.1.0` Token-Burn Shield, `agy-token-audit --swarm`):**
   - **Avg uncached input / worker:** `0.57M → 0.175M` (**`-69.4%`**) · **Avg total input / worker:** `8.99M → 1.89M` (**`-79.0%`**) · **Avg output / worker:** `111.5k → 52.6k` (**`-52.8%`**)

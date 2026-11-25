@@ -20,9 +20,10 @@ def main():
     tool_call = payload.get("toolCall") or {}
     tool_name = str(tool_call.get("name") or "unknown")
     args = tool_call.get("args") or {}
-    raw_out = payload.get("result") or payload.get("output") or payload.get("toolOutput") or ""
+    raw_out = payload.get("result") or payload.get("output") or payload.get("toolOutput")
     out_str = raw_out if isinstance(raw_out, str) else (json.dumps(raw_out) if raw_out else "")
     write_content = str(args.get("Content") or "") if tool_name == "write_file" else ""
+    edit_content = str(args.get("Replacement") or "") if tool_name == "edit_file" else ""
 
     spill_bytes = 0
     spill_kind = ""
@@ -33,6 +34,9 @@ def main():
         elif len(write_content) > 25000:
             spill_bytes = len(write_content)
             spill_kind = "large_write_file"
+        elif len(edit_content) > 25000:
+            spill_bytes = len(edit_content)
+            spill_kind = "large_edit_file"
 
     if err or spill_bytes > 0:
         import re

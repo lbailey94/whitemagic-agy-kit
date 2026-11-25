@@ -200,6 +200,19 @@ def cmd_audit(args):
     else:
         print("   - mcp_config.json: not configured")
 
+    kit_mcp = plugins_dir / "whitemagic-agy-kit" / "mcp_config.json"
+    if kit_mcp.exists():
+        try:
+            kmd = json.loads(kit_mcp.read_text(encoding="utf-8"))
+            kservers = list((kmd.get("mcpServers") or {}).keys())
+            node_avail = bool(shutil.which("node") or (HOME / ".local" / "bin" / "node").is_file())
+            if "fast" not in kservers and node_avail:
+                print(f"   - whitemagic-agy-kit MCP: {kservers} [WARN degraded: fast MCP missing — re-run ./install.sh]")
+            else:
+                print(f"   - whitemagic-agy-kit MCP: VALID ({len(kservers)} servers: {', '.join(kservers)}) [OK]")
+        except Exception as e:
+            print(f"   - whitemagic-agy-kit MCP: INVALID JSON ({e})")
+
     if skills_dir.exists():
         skills = sorted(p.name for p in skills_dir.iterdir() if p.is_dir() and (p / "SKILL.md").exists())
         print(f"   - custom skills ({len(skills)}): {', '.join(skills)}")
@@ -309,12 +322,20 @@ def cmd_prefix_hash(args):
             total_bytes += len(data)
             h.update(f"rule:{rf.name}\n".encode() + data + b"\n")
             print(f"  RULE  {rf.name:28s}: {len(data):6,} B (~{len(data)//4:4,} tok)")
-    mcp_dir = HOME / ".gemini" / "antigravity-cli" / "mcp"
-    if mcp_dir.is_dir():
-        for jf in sorted(mcp_dir.glob("*/*.json")):
-            with jf.open("rb") as _jfh:
-                data = _jfh.read()
-            h.update(f"mcp:{jf.parent.name}/{jf.name}\n".encode() + data + b"\n")
+    seen_mcp_tools = set()
+    for surf in ("antigravity-cli", "antigravity", "antigravity-ide"):
+        mcp_dir = HOME / ".gemini" / surf / "mcp"
+        if mcp_dir.is_dir():
+            for jf in sorted(mcp_dir.glob("*/*.json")):
+                mkey = f"{jf.parent.name}/{jf.name}"
+                if mkey in seen_mcp_tools:
+                    continue
+                seen_mcp_tools.add(mkey)
+                with jf.open("rb") as _jfh:
+                    data = _jfh.read()
+                h.update(f"mcp:{mkey}\n".encode() + data + b"\n")
+    if seen_mcp_tools:
+        print(f"  MCP cached schemas hashed         : {len(seen_mcp_tools)} tools (across cli/app/ide)")
     skills_dir = HOME / ".gemini" / "config" / "skills"
     if skills_dir.is_dir():
         sk_bytes = 0

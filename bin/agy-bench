@@ -22,10 +22,12 @@ HOME = Path.home()
 BENCH_JS = HOME / ".gemini" / "config" / "plugins" / "whitemagic-agy-kit" / "dist" / "benchmark.mjs"
 if not BENCH_JS.exists():
     BENCH_JS = HOME / ".gemini" / "config" / "plugins" / "agy-fast" / "dist" / "benchmark.mjs"
-BRAIN_DIRS = [
-    HOME / ".gemini" / "antigravity-cli" / "brain",
-    HOME / ".gemini" / "antigravity" / "brain",
-]
+SURFACE_BRAINS = {
+    "cli": HOME / ".gemini" / "antigravity-cli" / "brain",
+    "app": HOME / ".gemini" / "antigravity" / "brain",
+    "ide": HOME / ".gemini" / "antigravity-ide" / "brain",
+}
+BRAIN_DIRS = list(SURFACE_BRAINS.values())
 OUT_DIR = HOME / ".local" / "share" / "whitemagic" / "agy_benchmarks"
 SQUEEZE_STATS = HOME / ".local" / "share" / "whitemagic" / "wm_squeeze_stats.jsonl"
 CFG_JSON = HOME / ".gemini" / "config" / "config.json"
@@ -51,9 +53,10 @@ def parse_ts(v):
         return None
 
 
-def measure_extended_and_credits(recent=30, since=None):
+def measure_extended_and_credits(recent=30, since=None, surface="all"):
     all_logs = []
-    for bdir in BRAIN_DIRS:
+    scan_dirs = list(SURFACE_BRAINS.values()) if surface == "all" else [SURFACE_BRAINS[surface]]
+    for bdir in scan_dirs:
         if bdir.is_dir():
             all_logs.extend(glob.glob(str(bdir / "*" / ".system_generated" / "logs" / "transcript.jsonl")))
     logs = sorted(
@@ -250,7 +253,7 @@ def run_capture(args):
         agy_fast_md = proc.stdout.strip()
         af_metrics = parse_agy_fast_md(agy_fast_md)
 
-    custom = measure_extended_and_credits(recent=args.recent, since=args.since)
+    custom = measure_extended_and_credits(recent=args.recent, since=args.since, surface=args.surface)
     plugins = measure_plugin_overhead()
     squeeze = measure_squeeze_savings()
 
@@ -344,6 +347,7 @@ def run_compare(args):
 def main():
     p = argparse.ArgumentParser(description="AGY CLI offline benchmark & credit/cache A/B comparator")
     p.add_argument("--recent", type=int, default=30, help="Number of recent sessions to analyze (default: 30)")
+    p.add_argument("--surface", choices=["all", "app", "ide", "cli"], default="all", help="AGY surface to scan (default: all)")
     p.add_argument("--since", help="ISO timestamp filter (e.g. 2026-11-21T12:00:00-05:00)")
     p.add_argument("--split-usage", action="store_true", help="Split metrics by sessions with vs without agy-fast")
     p.add_argument("--credits", action="store_true", help="Print per-model credit longevity & inter-turn cache decay tables")

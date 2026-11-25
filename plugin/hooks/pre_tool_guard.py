@@ -98,13 +98,16 @@ def _write_json_atomic(path: Path, payload_obj) -> None:
     os.replace(tmp, path)
 
 SHELL_META_RE = re.compile(r"[|><;`\n$*?\[\]{}]|(?<!&)&(?!&)|(?:^|\s)~")
+_UNQUOTED_UNSAFE_CHARS = set("|><;`\n$*?[]{}()")
+_DOUBLE_QUOTED_UNSAFE_CHARS = set("$`\n")
+_PY_SAFE_FLAGS = {"-u", "-B", "-S", "-O", "-E", "-s", "-q"}
 MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".pdf")
 BINARY_EXTS = (
     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".pdf", ".zip", ".gz", ".tar",
     ".zst", ".xz", ".bz2", ".bin", ".exe", ".so", ".dylib", ".dll", ".o", ".a",
     ".wasm", ".sqlite", ".db", ".gguf", ".safetensors", ".pt", ".pth", ".mp3", ".mp4", ".wav",
 )
-STATE_DIR = Path("/tmp/agy-hook-state")
+STATE_DIR = Path(os.environ.get("WM_HOOK_STATE_DIR", "/tmp/agy-hook-state"))
 
 
 def emit(obj):
@@ -274,6 +277,142 @@ def is_safe_squeezable(cmd_base, cmd_args):
     return False
 
 
+def _has_unsafe_shell_meta(s: str, allow_quoted_newline: bool = False) -> bool:
+    """Quote-aware shell metacharacter check so quoted rg/find/git patterns still squeeze safely."""
+    in_single = False
+    in_double = False
+    escaped = False
+    n = len(s)
+    for i, ch in enumerate(s):
+        if escaped:
+            escaped = False
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+        if in_double:
+            if ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_double = False
+            elif ch == "\n":
+                if not allow_quoted_newline:
+                    return True
+            elif ch in _DOUBLE_QUOTED_UNSAFE_CHARS:
+                return True
+            continue
+        # Outside quotes
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == "'":
+            in_single = True
+            continue
+        if ch == '"':
+            in_double = True
+            continue
+        if ch in _UNQUOTED_UNSAFE_CHARS:
+            return True
+        if ch == "&":
+            prev_amp = i > 0 and s[i - 1] == "&"
+            next_amp = i + 1 < n and s[i + 1] == "&"
+            if not (prev_amp ^ next_amp):
+                return True
+        if ch == "~" and (i == 0 or s[i - 1].isspace()):
+            return True
+    return in_single or in_double or escaped
+
+
+def _split_top_level_and(s: str):
+    """Split on unquoted `&&` only; returns None on unmatched quotes or escapes."""
+    parts = []
+    cur = []
+    in_single = False
+    in_double = False
+    escaped = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if escaped:
+            cur.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if in_single:
+            cur.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            cur.append(ch)
+            if ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "\\":
+            cur.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "&" and i + 1 < n and s[i + 1] == "&":
+            # Reject `&&&`
+            if i + 2 < n and s[i + 2] == "&":
+                return None
+            parts.append("".join(cur).strip())
+            cur = []
+            i += 2
+            continue
+        cur.append(ch)
+        i += 1
+    if in_single or in_double or escaped:
+        return None
+    parts.append("".join(cur).strip())
+    return parts
+
+
+def _maybe_wrap_python_dash_c(s: str):
+    """Wrap standalone `python3 -c "..."` (single or multiline) through `wm-squeeze --pipe`."""
+    cleaned = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
+    if not cleaned:
+        return None
+    parts = _split_top_level_and(cleaned)
+    if not parts or len(parts) != 1:
+        return None
+    if _has_unsafe_shell_meta(cleaned, allow_quoted_newline=True):
+        return None
+    try:
+        toks = shlex.split(cleaned)
+    except Exception:
+        return None
+    if len(toks) < 3 or os.path.basename(toks[0]) not in ("python3", "python"):
+        return None
+    try:
+        c_idx = toks.index("-c", 1)
+    except ValueError:
+        return None
+    if c_idx >= len(toks) - 1 or not all(t in _PY_SAFE_FLAGS for t in toks[1:c_idx]):
+        return None
+    sq_bin = find_wm_squeeze()
+    if not sq_bin:
+        return None
+    return f"set -o pipefail; {cleaned} 2>&1 | {shlex.quote(sq_bin)} --pipe --kind generic"
+
+
 def maybe_squeeze_command(cmd_line):
     if os.environ.get("WM_SQUEEZE_OFF") == "1":
         return None
@@ -301,19 +440,26 @@ def maybe_squeeze_command(cmd_line):
                     )
                     return "\n".join([new_first] + lines[1:])
 
+    # Safe standalone `python3 -c "..."` output cap (single or multiline)
+    if os.environ.get("WM_SQUEEZE_HEREDOC_OFF") != "1":
+        wrapped_py = _maybe_wrap_python_dash_c(s)
+        if wrapped_py:
+            return wrapped_py
+
     # Strip harmless trailing 2>&1 / 2>/dev/null (wm-squeeze captures stdout + stderr)
     s = re.sub(r"(?:\s+(?:2>&1|2>/dev/null))+\s*$", "", s).strip()
     if not s:
         return None
 
+    parts = _split_top_level_and(s)
+    if not parts:
+        return None
+
     cwd_arg = None
-    # Support safe `cd <dir> && <simple_cmd>` pattern
-    if "&&" in s:
-        parts = s.split("&&")
-        if len(parts) != 2:
-            return None
-        left, right = parts[0].strip(), parts[1].strip()
-        if SHELL_META_RE.search(left) or SHELL_META_RE.search(right):
+    # Support safe `cd <dir> && <simple_cmd>` pattern (quote-aware)
+    if len(parts) == 2:
+        left, right = parts[0], parts[1]
+        if not left or not right or _has_unsafe_shell_meta(left) or _has_unsafe_shell_meta(right):
             return None
         try:
             ltoks = shlex.split(left)
@@ -324,8 +470,8 @@ def maybe_squeeze_command(cmd_line):
             return None
         cwd_arg = ltoks[1]
         toks = rtoks
-    else:
-        if SHELL_META_RE.search(s) or "&&" in s:
+    elif len(parts) == 1:
+        if _has_unsafe_shell_meta(s):
             return None
         try:
             toks = shlex.split(s)
@@ -333,6 +479,8 @@ def maybe_squeeze_command(cmd_line):
             return None
         if not toks:
             return None
+    else:
+        return None
 
     # Allow safe read-only env var prefixes (e.g., PYTHONPATH=. pytest) while rejecting arbitrary env mutations
     safe_env_keys = {"PYTHONPATH", "RUST_BACKTRACE", "RUST_LOG", "NO_COLOR", "CARGO_TERM_COLOR"}
@@ -361,6 +509,21 @@ def maybe_squeeze_command(cmd_line):
     out.append("--")
     out.extend(toks)
     return " ".join(shlex.quote(x) for x in out)
+
+
+def is_wide_line_file(path_obj, size: int) -> bool:
+    """Detect minified JSON / wide JSONL files (>24 KB, avg >400 B/line) to avoid 46 KB output spills."""
+    if size <= 24576:
+        return False
+    try:
+        with open(path_obj, "rb") as f:
+            chunk = f.read(8192)
+        if not chunk or b"\x00" in chunk[:1024]:
+            return False
+        newlines = chunk.count(b"\n")
+        return newlines == 0 or (len(chunk) / max(newlines, 1)) > 400.0
+    except Exception:
+        return False
 
 
 def file_exceeds_lines(path_obj, threshold=250):
@@ -488,22 +651,28 @@ def handle_read_file(args, payload):
     conv_id = str(payload.get("conversationId") or "")
     step_idx = int(payload.get("stepIdx") or 0)
 
-    # C2: Auto-clamp unbounded, unbounded-tail, or wide-span (>250L / >200L@120k) reads
+    # C2: Auto-clamp unbounded, unbounded-tail, wide-span (>250L / >200L@120k), or wide-line files (>50L)
     if b_off is None and os.environ.get("WM_READ_CLAMP_OFF") != "1":
-        # Fast-path: explicitly bounded <=150L slices can never trigger clamping — skip disk line scan!
-        already_compact = (
-            s_line is not None
-            and e_line is not None
-            and (int(e_line) - int(s_line) + 1) <= 150
-        )
+        span = None
+        if s_line is not None and e_line is not None:
+            try:
+                span = int(e_line) - int(s_line) + 1
+            except Exception:
+                span = None
+        wide_lines = (span is None or span > 50) and is_wide_line_file(p, st.st_size)
+        # Fast-path: explicitly bounded <=150L (or <=50L on wide-line files) cannot trigger clamping
+        already_compact = span is not None and span <= (50 if wide_lines else 150)
         if not already_compact:
             cur_ctx = latest_ctx_tokens(transcript)
             max_span = 150 if cur_ctx >= 120_000 else 200
             clamp_trigger = 200 if cur_ctx >= 120_000 else 250
-            is_large_file = file_exceeds_lines(p, threshold=clamp_trigger)
+            if wide_lines:
+                max_span = min(max_span, 50)
+                clamp_trigger = min(clamp_trigger, 60)
+            is_large_file = wide_lines or file_exceeds_lines(p, threshold=clamp_trigger)
             if is_large_file and conv_id and step_idx > 0:
                 if track_and_check_burst(conv_id, abs_p, step_idx):
-                    max_span = min(max_span, 120)
+                    max_span = min(max_span, 120 if not wide_lines else 50)
 
             if s_line is None and e_line is None:
                 if is_large_file:
@@ -560,6 +729,9 @@ def handle_whitemagic_mcp(tool_name, args):
         lim = args.get("limit")
         if isinstance(lim, (int, float)) and lim > 8:
             return {"decision": "allow", "overwrite": {"limit": 8}}
+    elif tool_name == "mcp_firecrawl_firecrawl_scrape":
+        if args.get("markdown_only") is None and args.get("format") is None:
+            return {"decision": "allow", "overwrite": {"markdown_only": True}}
     return {"decision": "allow"}
 
 
@@ -699,13 +871,14 @@ def main():
         emit(handle_manage_task(args, payload))
         return
 
-    # 4. WhiteMagic & Research Engine MCP auto-budget enforcement
+    # 4. WhiteMagic, Research Engine & Firecrawl MCP auto-budget enforcement
     if tool_name in (
         "mcp_whitemagic_session_continuity",
         "mcp_whitemagic_memory_recall",
         "mcp_whitemagic_whitemagic_gen3_session_continuity",
         "mcp_whitemagic_whitemagic_gen3_memory_recall",
         "mcp_wm-research-engine_research_hunt",
+        "mcp_firecrawl_firecrawl_scrape",
     ):
         emit(handle_whitemagic_mcp(tool_name, args))
         return
