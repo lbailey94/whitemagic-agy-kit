@@ -246,6 +246,14 @@ def extract_workspace_dir(payload):
 
 
 def main():
+    host = "agy"
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--host" and i + 1 < len(args):
+            host = args[i + 1].strip().lower()
+        elif a.startswith("--host="):
+            host = a.split("=", 1)[1].strip().lower()
+
     if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
         sys.stdout.write("{}")
         sys.stdout.flush()
@@ -270,15 +278,18 @@ def main():
     if len(msg.encode("utf-8")) > 2550:
         msg = _fit_utf8_lines(msg, 2550)
 
-    out = {
-        "injectSteps": [
-            {
-                "systemMessage": {
-                    "systemMessage": msg
+    if host == "cursor":
+        out = {"additional_context": msg}
+    else:
+        out = {
+            "injectSteps": [
+                {
+                    "systemMessage": {
+                        "systemMessage": msg
+                    }
                 }
-            }
-        ]
-    }
+            ]
+        }
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
 

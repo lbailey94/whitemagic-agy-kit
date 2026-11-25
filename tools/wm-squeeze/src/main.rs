@@ -1485,7 +1485,10 @@ fn run_post_tool(host: HostKind) {
     }
 
     // Ultra-fast clean path (<2ms total runtime): small payload with no error field cannot fail or spill
-    if stdin_buf.len() <= 16_000 && !stdin_buf.contains("\"error\"") {
+    if stdin_buf.len() <= 16_000
+        && !stdin_buf.contains("\"error\"")
+        && !stdin_buf.contains("\"error_message\"")
+    {
         let _ = host;
         println!("{{}}");
         return;
@@ -1494,25 +1497,48 @@ fn run_post_tool(host: HostKind) {
     if host != HostKind::Agy {
         let payload = extract_top_level_fields(
             &stdin_buf,
-            &["error", "tool_name", "tool_input", "tool_response", "output", "session_id", "conversation_id", "command"],
+            &[
+                "error",
+                "error_message",
+                "failure_type",
+                "tool_name",
+                "tool_input",
+                "tool_response",
+                "tool_output",
+                "output",
+                "session_id",
+                "conversation_id",
+                "command",
+                "cwd",
+                "model",
+            ],
         );
         let err_raw = payload
-            .get("error")
+            .get("error_message")
+            .or_else(|| payload.get("error"))
             .map(|s| s.trim())
             .filter(|s| !s.is_empty() && *s != "false" && *s != "null");
         let conv_id = payload
-            .get("session_id")
-            .or_else(|| payload.get("conversation_id"))
+            .get("conversation_id")
+            .or_else(|| payload.get("session_id"))
             .map(|s| s.as_str())
             .unwrap_or("");
         let tool_name = payload.get("tool_name").map(|s| s.as_str()).unwrap_or("shell");
+        let ti = payload.get("tool_input").map(|s| s.as_str()).unwrap_or("");
+        let ti_f = if ti.trim_start().starts_with('{') {
+            extract_top_level_fields(ti, &["command", "cmd", "path", "file_path"])
+        } else {
+            HashMap::new()
+        };
+        let cmd = ti_f
+            .get("command")
+            .or_else(|| ti_f.get("cmd"))
+            .or_else(|| ti_f.get("path"))
+            .or_else(|| ti_f.get("file_path"))
+            .cloned()
+            .or_else(|| payload.get("command").cloned())
+            .unwrap_or_default();
         if let Some(err_str) = err_raw {
-            let ti = payload.get("tool_input").map(|s| s.as_str()).unwrap_or("");
-            let cmd = extract_top_level_fields(ti, &["command", "cmd"])
-                .get("command")
-                .cloned()
-                .or_else(|| payload.get("command").cloned())
-                .unwrap_or_default();
             let ledger_path = env::var("WM_SIM_LEDGER")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -1528,17 +1554,55 @@ fn run_post_tool(host: HostKind) {
                 }
                 let cmd_clean = truncate_chars(&redact_secrets(&cmd), 160);
                 let err_clean = truncate_chars(&redact_secrets(err_str), 200);
+                let ftype = payload.get("failure_type").map(|s| s.as_str()).unwrap_or("");
                 let line = format!(
-                    "{{\"event\":\"tool_failure\",\"host\":\"{}\",\"ts\":\"{}\",\"conversation_id\":\"{}\",\"tool\":\"{}\",\"cmd_preview\":\"{}\",\"error\":\"{}\"}}\n",
+                    "{{\"event\":\"tool_failure\",\"host\":\"{}\",\"ts\":\"{}\",\"conversation_id\":\"{}\",\"tool\":\"{}\",\"failure_type\":\"{}\",\"cmd_preview\":\"{}\",\"error\":\"{}\"}}\n",
                     host.as_str(),
                     utc_iso_now(),
                     json_escape(conv_id),
                     json_escape(tool_name),
+                    json_escape(ftype),
                     json_escape(&cmd_clean),
                     json_escape(&err_clean),
                 );
                 if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(lp) {
                     let _ = f.write_all(line.as_bytes());
+                }
+            }
+        } else {
+            let out_len = payload
+                .get("tool_output")
+                .or_else(|| payload.get("tool_response"))
+                .or_else(|| payload.get("output"))
+                .map(|s| s.len())
+                .unwrap_or(0);
+            if out_len > 16_000 {
+                let telem_path = env::var("WM_AGY_TELEMETRY")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        env::var("HOME")
+                            .ok()
+                            .map(|h| PathBuf::from(h).join(".local/share/whitemagic/agy_telemetry.jsonl"))
+                    });
+                if let Some(tp) = telem_path {
+                    if let Some(parent) = tp.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let preview = truncate_chars(&redact_secrets(&cmd), 160);
+                    let line = format!(
+                        "{{\"event\":\"tool_spill\",\"kind\":\"output_spill\",\"host\":\"{}\",\"ts\":\"{}\",\"conv_id\":\"{}\",\"tool\":\"{}\",\"bytes\":{},\"preview\":\"{}\"}}\n",
+                        host.as_str(),
+                        utc_iso_now(),
+                        json_escape(&truncate_chars(conv_id, 16)),
+                        json_escape(tool_name),
+                        out_len,
+                        json_escape(&preview),
+                    );
+                    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(tp) {
+                        let _ = f.write_all(line.as_bytes());
+                    }
                 }
             }
         }
@@ -1933,10 +1997,10 @@ fn emit_pretool_decision(host: HostKind, decision: &str, reason: &str) {
         }
         HostKind::Cursor => {
             let perm = if decision == "deny" { "deny" } else { "ask" };
+            let esc = json_escape(reason);
             println!(
-                "{{\"permission\":\"{}\",\"agent_message\":\"{}\"}}",
-                perm,
-                json_escape(reason)
+                "{{\"permission\":\"{}\",\"user_message\":\"{}\",\"agent_message\":\"{}\"}}",
+                perm, esc, esc
             );
         }
     }
@@ -3402,7 +3466,7 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str) {
     let tool_name = payload.get("tool_name").map(|s| s.trim()).unwrap_or("");
     let ti_raw = payload.get("tool_input").map(|s| s.as_str()).unwrap_or("");
     let ti_fields = if ti_raw.trim_start().starts_with('{') {
-        extract_top_level_fields(ti_raw, &["command", "cmd", "file_path", "path", "input", "patch", "query", "limit", "token_budget"])
+        extract_top_level_fields(ti_raw, &["command", "cmd", "file_path", "path", "offset", "limit", "input", "patch", "query", "token_budget"])
     } else {
         HashMap::new()
     };
@@ -3436,6 +3500,59 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str) {
             let reason = format!("[Env-Write Guard] Modifying secrets file `{}` requires explicit user confirmation.", base);
             emit_pretool_decision(host, "force_ask", &reason);
             return;
+        }
+        emit_pretool_allow(host);
+        return;
+    }
+
+    // 1b. Cursor Read bounding: clamp unbounded huge text/wide-JSONL reads (>400L / wide >60L) via updated_input
+    if host == HostKind::Cursor && matches!(tool_name, "Read" | "read_file") {
+        let has_explicit_limit = ti_fields
+            .get("limit")
+            .map(|s| !s.trim().is_empty() && s.trim() != "null")
+            .unwrap_or(false);
+        if !has_explicit_limit {
+            let (path_key, raw_p) = if let Some(p) = ti_fields.get("path").filter(|s| !s.trim().is_empty()) {
+                ("path", p.trim())
+            } else if let Some(p) = ti_fields.get("file_path").filter(|s| !s.trim().is_empty()) {
+                ("file_path", p.trim())
+            } else {
+                ("path", "")
+            };
+            if !raw_p.is_empty() {
+                let low = raw_p.to_ascii_lowercase();
+                let is_media = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".svg"]
+                    .iter()
+                    .any(|ext| low.ends_with(ext));
+                let p_obj = Path::new(raw_p);
+                if !is_media && p_obj.is_file() {
+                    if let Ok(meta) = fs::metadata(p_obj) {
+                        let sz = meta.len();
+                        let wide = is_wide_line_file_rs(p_obj, sz);
+                        let clamp_to = if wide {
+                            Some(50usize)
+                        } else if file_exceeds_lines_rs(p_obj, 400, sz) {
+                            Some(250usize)
+                        } else {
+                            None
+                        };
+                        if let Some(lim) = clamp_to {
+                            let off: i64 = ti_fields
+                                .get("offset")
+                                .and_then(|s| s.trim().parse::<i64>().ok())
+                                .unwrap_or(1);
+                            println!(
+                                "{{\"permission\":\"allow\",\"updated_input\":{{\"{}\":\"{}\",\"offset\":{},\"limit\":{}}}}}",
+                                path_key,
+                                json_escape(raw_p),
+                                off,
+                                lim
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
         }
         emit_pretool_allow(host);
         return;
@@ -3475,12 +3592,42 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str) {
         emit_pretool_allow(host);
         return;
     }
+
+    // In Cursor: beforeShellExecution enforces permission=ask (does NOT support updated_input),
+    // while preToolUse supports updated_input (does NOT enforce permission=ask).
+    if host == HostKind::Cursor && raw_event == "beforeShellExecution" {
+        if let Some(reason) = check_destructive_cmd(cmd_line) {
+            let msg = format!("[Data-Loss Guard] {}. Confirm explicitly before proceeding.", reason);
+            emit_pretool_decision(host, "force_ask", &msg);
+            return;
+        }
+        if contains_kekkai_sensitive(cmd_line) {
+            emit_pretool_decision(
+                host,
+                "force_ask",
+                "[Kekkai Guard] Command references sensitive credentials or protected directories; confirm explicitly.",
+            );
+            return;
+        }
+        emit_pretool_allow(host);
+        return;
+    }
+
     if let Some(reason) = check_destructive_cmd(cmd_line) {
+        if host == HostKind::Cursor {
+            // Defer to beforeShellExecution where Cursor enforces interactive `ask`
+            emit_pretool_allow(host);
+            return;
+        }
         let msg = format!("[Data-Loss Guard] {}. Confirm explicitly before proceeding.", reason);
         emit_pretool_decision(host, "force_ask", &msg);
         return;
     }
     if contains_kekkai_sensitive(cmd_line) {
+        if host == HostKind::Cursor {
+            emit_pretool_allow(host);
+            return;
+        }
         emit_pretool_decision(
             host,
             "force_ask",

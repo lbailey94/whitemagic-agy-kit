@@ -2158,10 +2158,22 @@ def test_v460_multihost_codex_cursor_and_cpr_translate():
         str(ce),
     )
 
-    # 14b) wm-squeeze --pre-tool --host cursor across events + --post-tool
-    rc, cu1 = run_sq(["--pre-tool", "--host", "cursor", "--event", "beforeShellExecution"], {"command": "git diff --stat", "conversation_id": "cur-1"})
+    # 14b) wm-squeeze --pre-tool --host cursor across events + --post-tool + sessionStart/stop
+    rc, cu0 = run_sq(["--pre-tool", "--host", "cursor", "--event", "beforeShellExecution"], {"command": "git diff --stat", "conversation_id": "cur-1"})
     check(
-        "wm-squeeze --host cursor beforeShellExecution -> permission=allow + updated_input",
+        "wm-squeeze --host cursor beforeShellExecution safe -> permission=allow (no updated_input)",
+        rc == 0 and cu0.get("permission") == "allow" and "updated_input" not in cu0,
+        str(cu0),
+    )
+    rc, cu0_ask = run_sq(["--pre-tool", "--host", "cursor", "--event", "beforeShellExecution"], {"command": "git push --force origin main", "conversation_id": "cur-1"})
+    check(
+        "wm-squeeze --host cursor beforeShellExecution destructive -> permission=ask + user_message",
+        rc == 0 and cu0_ask.get("permission") == "ask" and "user_message" in cu0_ask and "agent_message" in cu0_ask,
+        str(cu0_ask),
+    )
+    rc, cu1 = run_sq(["--pre-tool", "--host", "cursor", "--event", "preToolUse"], {"tool_name": "Shell", "tool_input": {"command": "git diff --stat"}, "conversation_id": "cur-1"})
+    check(
+        "wm-squeeze --host cursor preToolUse Shell -> permission=allow + updated_input",
         rc == 0 and cu1.get("permission") == "allow" and "wm-squeeze --safe -- git diff --stat" in cu1.get("updated_input", {}).get("command", ""),
         str(cu1),
     )
@@ -2179,6 +2191,58 @@ def test_v460_multihost_codex_cursor_and_cpr_translate():
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
+        # Cursor preToolUse Read unbounded huge file -> clamped to limit=250; explicit limit untouched
+        big_file = td_path / "big.txt"
+        big_file.write_text("\n".join(f"line_{i:04d} padding text for size" for i in range(520)) + "\n", encoding="utf-8")
+        rc_r1, cu_r1 = run_sq(["--pre-tool", "--host", "cursor", "--event", "preToolUse"], {"tool_name": "Read", "tool_input": {"path": str(big_file)}})
+        rc_r2, cu_r2 = run_sq(["--pre-tool", "--host", "cursor", "--event", "preToolUse"], {"tool_name": "Read", "tool_input": {"path": str(big_file), "limit": 500}})
+        check(
+            "wm-squeeze --host cursor preToolUse Read clamps unbounded >400L file but honors explicit limit",
+            rc_r1 == 0 and cu_r1.get("updated_input", {}).get("limit") == 250 and cu_r1.get("updated_input", {}).get("path") == str(big_file)
+            and rc_r2 == 0 and "updated_input" not in cu_r2,
+            f"r1={cu_r1} r2={cu_r2}",
+        )
+        # Cursor postToolUseFailure (error_message) -> sim_ledger.jsonl & postToolUse spill -> agy_telemetry.jsonl
+        cu_sim = td_path / "cursor_sim.jsonl"
+        cu_tel = td_path / "cursor_tel.jsonl"
+        env_cu_pt = {**os.environ, "WM_SIM_LEDGER": str(cu_sim), "WM_AGY_TELEMETRY": str(cu_tel)}
+        r_fail = subprocess.run(
+            [str(SQ_BIN), "--post-tool", "--host", "cursor"],
+            input=json.dumps({"tool_name": "Shell", "tool_input": {"command": "pytest -q"}, "error_message": "Command timed out after 30s", "failure_type": "timeout", "conversation_id": "cur-fail-1"}),
+            capture_output=True, text=True, env=env_cu_pt, timeout=5,
+        )
+        r_sp = subprocess.run(
+            [str(SQ_BIN), "--post-tool", "--host", "cursor"],
+            input=json.dumps({"tool_name": "Shell", "tool_input": {"command": "cat huge.log"}, "tool_output": "x" * 17000, "conversation_id": "cur-sp-1"}),
+            capture_output=True, text=True, env=env_cu_pt, timeout=5,
+        )
+        sim_txt = cu_sim.read_text(encoding="utf-8") if cu_sim.is_file() else ""
+        tel_txt = cu_tel.read_text(encoding="utf-8") if cu_tel.is_file() else ""
+        check(
+            "wm-squeeze --post-tool --host cursor logs error_message->SIM and >16KB tool_output->telemetry",
+            r_fail.returncode == 0 and '"host":"cursor"' in sim_txt and '"failure_type":"timeout"' in sim_txt
+            and r_sp.returncode == 0 and '"event":"tool_spill"' in tel_txt and '"host":"cursor"' in tel_txt,
+            f"sim={sim_txt!r} tel={tel_txt!r}",
+        )
+        # Cursor sessionStart & stop hooks
+        r_ss = subprocess.run(
+            [sys.executable, "-S", "-B", str(KIT / "plugin" / "hooks" / "session_start_brief.py"), "--host", "cursor"],
+            input=json.dumps({"workspace_roots": [str(KIT)], "conversation_id": "cur-ss-1"}),
+            capture_output=True, text=True, env=env_cu_pt, timeout=5,
+        )
+        ss_j = json.loads(r_ss.stdout) if r_ss.returncode == 0 and r_ss.stdout.strip() else {}
+        r_st = subprocess.run(
+            [sys.executable, "-S", "-B", str(KIT / "plugin" / "hooks" / "stop_telemetry.py"), "--host", "cursor"],
+            input=json.dumps({"conversation_id": "cur-st-1", "model": "gemini-4-neon", "status": "completed", "loop_count": 0, "workspace_roots": [str(KIT)]}),
+            capture_output=True, text=True, env=env_cu_pt, timeout=5,
+        )
+        tel_after_stop = cu_tel.read_text(encoding="utf-8") if cu_tel.is_file() else ""
+        check(
+            "session_start_brief.py & stop_telemetry.py --host cursor emit native Cursor schemas",
+            r_ss.returncode == 0 and isinstance(ss_j.get("additional_context"), str) and "Workspace Snapshot" in ss_j.get("additional_context", "") and "injectSteps" not in ss_j
+            and r_st.returncode == 0 and json.loads(r_st.stdout) == {} and '"conv_id": "cur-st-1"' in tel_after_stop,
+            f"ss={list(ss_j.keys())} st={r_st.stdout!r}",
+        )
         # 14c) wm-reset --launcher codex & cursor --dry-run
         cache_dir = td_path / "cache"
         cache_dir.mkdir()
@@ -2290,13 +2354,16 @@ def test_v460_multihost_codex_cursor_and_cpr_translate():
         cu_hooks = json.loads((fake_home / ".cursor" / "hooks.json").read_text(encoding="utf-8")) if (fake_home / ".cursor" / "hooks.json").is_file() else {}
         cu_mcp = json.loads((fake_home / ".cursor" / "mcp.json").read_text(encoding="utf-8")) if (fake_home / ".cursor" / "mcp.json").is_file() else {}
         check(
-            "install.sh --hosts codex,cursor configures hooks+wm_fast while preserving existing entries",
+            "install.sh --hosts codex,cursor configures hooks+wm_fast+rules+agents while preserving existing entries",
             r_inst.returncode == 0
             and len(cx_hooks.get("hooks", {}).get("PreToolUse", [])) == 1
             and "[mcp_servers.wm_fast]" in cx_toml
             and '[plugins."unified-computer-use@openai-bundled"]\nenabled = true' in cx_toml
             and cu_hooks.get("version") == 1
-            and "beforeShellExecution" in cu_hooks.get("hooks", {})
+            and all(ev in cu_hooks.get("hooks", {}) for ev in ("sessionStart", "beforeShellExecution", "beforeMCPExecution", "preToolUse", "postToolUse", "postToolUseFailure", "stop"))
+            and (fake_home / ".cursor" / "rules" / "whitemagic-turbo.mdc").is_file()
+            and (fake_home / ".cursor" / "agents" / "fresh-verifier.md").is_file()
+            and (fake_home / ".cursor" / "hooks" / "session_start_brief.py").is_file()
             and "whitemagic" in cu_mcp.get("mcpServers", {})
             and "wm_fast" in cu_mcp.get("mcpServers", {}),
             r_inst.stderr[-300:] if r_inst.returncode != 0 else "",

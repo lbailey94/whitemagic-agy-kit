@@ -188,10 +188,45 @@ def _maybe_auto_crystal(payload: dict, stats: dict, now: float) -> None:
 
 
 def main():
+    host = "agy"
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--host" and i + 1 < len(args):
+            host = args[i + 1].strip().lower()
+        elif a.startswith("--host="):
+            host = a.split("=", 1)[1].strip().lower()
+
     if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
-        sys.stdout.write(json.dumps({"decision": "allow"}))
+        sys.stdout.write("{}" if host == "cursor" else json.dumps({"decision": "allow"}))
         sys.stdout.flush()
         return
+
+    if host == "cursor":
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+            now = time.time()
+            roots = payload.get("workspace_roots")
+            cwd = payload.get("cwd") or (roots[0] if isinstance(roots, list) and roots else "")
+            conv_id = str(payload.get("conversation_id") or payload.get("session_id") or "")[:16]
+            rec = {
+                "ts": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+                "ts_epoch": int(now),
+                "host": "cursor",
+                "conv_id": conv_id,
+                "model": str(payload.get("model") or payload.get("model_id") or ""),
+                "reason": str(payload.get("status") or ""),
+                "loop_count": int(payload.get("loop_count") or 0),
+                "cwd": str(cwd or ""),
+            }
+            TELEM_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(TELEM_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        sys.stdout.write("{}")
+        sys.stdout.flush()
+        return
+
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         tp = payload.get("transcriptPath") or ""

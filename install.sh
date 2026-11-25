@@ -79,14 +79,17 @@ echo "=== 1. Building Rust binaries: wm-squeeze, wm-codegraph & Safe-Rust muninn
 if [ "${WM_SKIP_CARGO:-0}" -eq 1 ]; then
     echo "Skipping Cargo build (WM_SKIP_CARGO=1)"
 elif command -v cargo >/dev/null 2>&1; then
+    SQ_TARGET="${CARGO_TARGET_DIR:-${KIT_DIR}/tools/wm-squeeze/target}"
+    CG_TARGET="${CARGO_TARGET_DIR:-${KIT_DIR}/tools/wm-codegraph/target}"
+    TRI_TARGET="${CARGO_TARGET_DIR:-${KIT_DIR}/tools/wm-tricameral-engine/target}"
     cargo build --release --manifest-path "${KIT_DIR}/tools/wm-squeeze/Cargo.toml"
-    install_bin "${KIT_DIR}/tools/wm-squeeze/target/release/wm-squeeze" "${LOCAL_BIN}/wm-squeeze"
+    install_bin "${SQ_TARGET}/release/wm-squeeze" "${LOCAL_BIN}/wm-squeeze"
     cargo build --release --manifest-path "${KIT_DIR}/tools/wm-codegraph/Cargo.toml"
-    install_bin "${KIT_DIR}/tools/wm-codegraph/target/release/wm-codegraph" "${LOCAL_BIN}/wm-codegraph"
+    install_bin "${CG_TARGET}/release/wm-codegraph" "${LOCAL_BIN}/wm-codegraph"
     echo "Installed ${LOCAL_BIN}/wm-squeeze & ${LOCAL_BIN}/wm-codegraph"
     if [ "$SKIP_TRICAMERAL_ENGINE" -eq 0 ] && [ -f "${KIT_DIR}/tools/wm-tricameral-engine/Cargo.toml" ]; then
         if cargo build --release --manifest-path "${KIT_DIR}/tools/wm-tricameral-engine/Cargo.toml"; then
-            install_bin "${KIT_DIR}/tools/wm-tricameral-engine/target/release/muninn-engine" "${LOCAL_BIN}/muninn-engine"
+            install_bin "${TRI_TARGET}/release/muninn-engine" "${LOCAL_BIN}/muninn-engine"
             echo "Installed ${LOCAL_BIN}/muninn-engine (Safe-Rust Tricameral Engine)"
         else
             echo "[warn] muninn-engine build failed (requires Rust >= 1.88 / edition 2024); continuing without Tricameral engine."
@@ -672,18 +675,63 @@ PY
 fi
 
 if [ "$HAS_CURSOR" -eq 1 ]; then
-    echo "=== 7c. Configuring Cursor adapter (~/.cursor/hooks.json & ~/.cursor/mcp.json) ==="
-    mkdir -p "${HOME}/.cursor"
-    FAST_MJS="${FAST_MCP_DIR}/mcp-server.mjs" NODE_CMD="${NODE_BIN:-node}" python3 - <<'PY'
+    echo "=== 7c. Configuring Cursor adapter (~/.cursor/{hooks.json,mcp.json,hooks,rules,agents}) ==="
+    mkdir -p "${HOME}/.cursor/hooks" "${HOME}/.cursor/rules" "${HOME}/.cursor/agents"
+    cp "${KIT_DIR}/plugin/hooks/session_start_brief.py" "${HOME}/.cursor/hooks/session_start_brief.py"
+    cp "${KIT_DIR}/plugin/hooks/stop_telemetry.py" "${HOME}/.cursor/hooks/stop_telemetry.py"
+    chmod +x "${HOME}/.cursor/hooks/session_start_brief.py" "${HOME}/.cursor/hooks/stop_telemetry.py"
+
+    cat > "${HOME}/.cursor/rules/whitemagic-turbo.mdc" <<'MDC'
+---
+description: WhiteMagic Turbo+Fast tool routing, bounded context hygiene, and SIM continuity
+alwaysApply: true
+---
+
+# WhiteMagic Turbo+Fast Directives (Cursor)
+
+## 1. Tool Routing & Token Hygiene (`user-wm_fast` + Built-ins)
+
+| Task | Preferred Tool | Why |
+| :--- | :--- | :--- |
+| >=2 searches, globs, or read-only `git` | `user-wm_fast` `batch_search` | Concurrent `rg`/git (<70ms), <=8.8 KB cap |
+| Symbol defs, callers, impact, skeleton | `user-wm_fast` `code_graph` | <6ms Rust AST/call-graph, saves 85-99% tokens |
+| Map unfamiliar >300L files (10-20/batch) | `user-wm_fast` `read_slices` | Exact line ranges in 1 call; <=120L slices |
+| >=2 multi-hunk/multi-file edits + verify | `user-wm_fast` `apply_edits` | Atomic hunks + drift relocate + squeezed verify |
+| >=2 build/lint/test or noisy commands | `user-wm_fast` `run_checks` | Concurrent + `wm-squeeze` CoACT + 300s git cache |
+| 1-4 small files (<300L) or known ranges | `Read` (parallel, bounded) | Fast direct read; unbounded >400L clamped by hook |
+
+## 2. Compute Pyramid & Safety
+- **4-Tier Routing:** `tricameral_dispatch` ($0 local Huginn/Muninn/Valkyrie) -> `user-wm_fast` -> `grok_dispatch` (parallel read-only audits / isolated worktrees) -> primary model.
+- **SIM & Continuity:** Run `wm-sim query "<topic>" --include-failures` before editing harnesses/benchmarks; log verified outcomes via `wm-sim log`. Record major milestones with `session_checkpoint`.
+- **Verification & Handoffs:** Dispatch `fresh-verifier` (read-only) for unbiased post-edit checks; use `wm-cpr-bridge` / `wm-handoff` / `wm-reset --launcher cursor` for compact handoffs.
+MDC
+
+    cat > "${HOME}/.cursor/agents/fresh-verifier.md" <<'AGENT'
+---
+name: fresh-verifier
+description: Independent read-only verification agent. Inspects git status/diff and runs exact build, lint, and test commands in a clean unforked context; emits <=150-token verbatim PASS/FAIL receipt.
+model: inherit
+readonly: true
+---
+
+You are an unbiased verification reviewer operating in a clean, unforked context window.
+- Never modify tracked source files or start a second local `wm3 serve`.
+- Inspect `git status --short`, `git diff`, and bounded slices (`<=150L`) of changed files.
+- Execute the exact stated build/lint/test commands (2x when idempotency is requested) via `run_checks` (`outputMode: "full"`) or `Shell`.
+- Report only directly observed outputs: PASS/FAIL status, exact case counts/timings, and verbatim diagnostic lines on failure (`<=150` tokens).
+AGENT
+
+    FAST_MJS="${FAST_MCP_DIR}/mcp-server.mjs" NODE_CMD="${NODE_BIN:-node}" LOCAL_BIN_DIR="${LOCAL_BIN}" python3 - <<'PY'
 import json, os, shutil
 from datetime import datetime
 from pathlib import Path
 
 home = Path.home()
 cursor_dir = home / ".cursor"
+local_bin = Path(os.environ.get("LOCAL_BIN_DIR") or str(home / ".local" / "bin"))
 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-# 1. Merge ~/.cursor/hooks.json (version: 1)
+# 1. Merge ~/.cursor/hooks.json (version: 1) cleanly across all 7 Cursor hook events
 hooks_path = cursor_dir / "hooks.json"
 if hooks_path.is_file():
     shutil.copy2(hooks_path, hooks_path.with_name(f"hooks.json.bak-{ts}"))
@@ -699,26 +747,63 @@ hdata["version"] = 1
 hooks = hdata.setdefault("hooks", {})
 
 def _strip_wm(items):
-    return [it for it in (items or []) if not (isinstance(it, dict) and "wm-squeeze" in str(it.get("command", "")))]
+    out = []
+    for it in (items or []):
+        cmd = str(it.get("command", "")) if isinstance(it, dict) else ""
+        if any(tok in cmd for tok in ("wm-squeeze", "session_start_brief.py", "stop_telemetry.py")):
+            continue
+        out.append(it)
+    return out
 
-for ev, extra in (
-    ("beforeShellExecution", {}),
-    ("beforeMCPExecution", {"matcher": "wm_fast|whitemagic"}),
-    ("preToolUse", {}),
-):
-    lst = _strip_wm(hooks.get(ev))
-    entry = dict(extra)
-    entry["command"] = (
-        f'if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze --pre-tool --host cursor --event {ev}; '
-        f'elif [ -x "$HOME/.local/bin/wm-squeeze" ]; then exec "$HOME/.local/bin/wm-squeeze" --pre-tool --host cursor --event {ev}; fi'
+def _sq_cmd(flags: str) -> str:
+    return (
+        f'if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze {flags}; '
+        f'elif [ -x "$HOME/.local/bin/wm-squeeze" ]; then exec "$HOME/.local/bin/wm-squeeze" {flags}; fi'
     )
+
+cursor_specs = (
+    ("sessionStart", {
+        "command": 'python3 -S -B "$HOME/.cursor/hooks/session_start_brief.py" --host cursor',
+        "timeout": 5,
+    }),
+    ("beforeShellExecution", {
+        "command": _sq_cmd("--pre-tool --host cursor --event beforeShellExecution"),
+        "timeout": 5,
+    }),
+    ("beforeMCPExecution", {
+        "matcher": "wm_fast|whitemagic|tricameral|grok|firecrawl|wm-research-engine|whitemagic_gen4",
+        "command": _sq_cmd("--pre-tool --host cursor --event beforeMCPExecution"),
+        "timeout": 5,
+    }),
+    ("preToolUse", {
+        "matcher": "Shell|Read|Write|StrReplace",
+        "command": _sq_cmd("--pre-tool --host cursor --event preToolUse"),
+        "timeout": 5,
+    }),
+    ("postToolUse", {
+        "matcher": "Shell|MCP:.*",
+        "command": _sq_cmd("--post-tool --host cursor"),
+        "timeout": 5,
+    }),
+    ("postToolUseFailure", {
+        "command": _sq_cmd("--post-tool --host cursor"),
+        "timeout": 5,
+    }),
+    ("stop", {
+        "command": 'python3 -S -B "$HOME/.cursor/hooks/stop_telemetry.py" --host cursor',
+        "timeout": 5,
+    }),
+)
+
+for ev, entry in cursor_specs:
+    lst = _strip_wm(hooks.get(ev))
     lst.append(entry)
     hooks[ev] = lst
 
 hooks_path.write_text(json.dumps(hdata, indent=2) + "\n", encoding="utf-8")
-print(f"Updated {hooks_path} (beforeShellExecution, beforeMCPExecution, preToolUse)")
+print(f"Updated {hooks_path} ({', '.join(ev for ev, _ in cursor_specs)})")
 
-# 2. Merge wm_fast into ~/.cursor/mcp.json without disturbing whitemagic
+# 2. Merge wm_fast + locally present sovereign MCP servers into ~/.cursor/mcp.json without disturbing whitemagic
 mcp_path = cursor_dir / "mcp.json"
 if mcp_path.is_file():
     shutil.copy2(mcp_path, mcp_path.with_name(f"mcp.json.bak-{ts}"))
@@ -735,8 +820,31 @@ node_cmd = os.environ.get("NODE_CMD") or "node"
 fast_mjs = os.environ.get("FAST_MJS") or ""
 if fast_mjs and Path(fast_mjs).is_file():
     servers["wm_fast"] = {"command": node_cmd, "args": [fast_mjs]}
-    mcp_path.write_text(json.dumps(mdata, indent=2) + "\n", encoding="utf-8")
-    print(f"Updated {mcp_path} servers={list(servers.keys())}")
+
+def _find_local(name: str) -> str | None:
+    cand = local_bin / name
+    if cand.is_file() and os.access(cand, os.X_OK):
+        return str(cand)
+    return shutil.which(name)
+
+tri_mcp = _find_local("wm-tricameral-mcp")
+if tri_mcp and _find_local("muninn-engine"):
+    servers.setdefault("tricameral", {"command": tri_mcp, "args": []})
+
+grok_mcp = _find_local("wm-grok-mcp")
+if grok_mcp and _find_local("cursor-agent"):
+    servers.setdefault("grok", {"command": grok_mcp, "args": []})
+
+fc_mcp = _find_local("firecrawl-local-mcp")
+if fc_mcp:
+    servers.setdefault("firecrawl", {"command": fc_mcp, "env": {"FIRECRAWL_CLOUD": "off"}})
+
+wm4_mcp = _find_local("wm4-mcp")
+if wm4_mcp:
+    servers.setdefault("whitemagic_gen4", {"command": wm4_mcp, "args": ["--mcp"]})
+
+mcp_path.write_text(json.dumps(mdata, indent=2) + "\n", encoding="utf-8")
+print(f"Updated {mcp_path} servers={list(servers.keys())}")
 PY
 fi
 
