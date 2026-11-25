@@ -3,6 +3,7 @@
 
 // src/mcp-server.ts
 import fs8 from "node:fs";
+import os5 from "node:os";
 import path9 from "node:path";
 
 // src/protocol/mcp.ts
@@ -6316,6 +6317,28 @@ function clampInt2(val, min, max, fallback) {
 
 // src/mcp-server.ts
 var SERVER_VERSION = "4.0.0";
+function recordFastTelemetry(tool, outText, wallMs, isError) {
+  if (process.env.WM_FAST_NO_STATS === "1") return;
+  try {
+    const statsPath = process.env.WM_FAST_STATS || path9.join(os5.homedir(), ".local", "share", "whitemagic", "wm_fast_stats.jsonl");
+    fs8.mkdirSync(path9.dirname(statsPath), { recursive: true });
+    const row = JSON.stringify({
+      ts: Math.floor(Date.now() / 1e3),
+      tool,
+      out: Buffer.byteLength(outText, "utf8"),
+      wall_ms: Math.max(0, Math.round(wallMs)),
+      err: isError
+    });
+    fs8.appendFileSync(statsPath, row + "\n", "utf8");
+  } catch {
+  }
+}
+async function wrapFastTool(tool, fn) {
+  const t0 = Date.now();
+  const res = await fn();
+  recordFastTelemetry(tool, res.text ?? "", Date.now() - t0, Boolean(res.isError));
+  return res;
+}
 function buildApplyEditsToolDefinition(compat) {
   const preferStringEdits = compat.editsFormat === "string";
   const editsSchema = preferStringEdits ? {
@@ -6550,7 +6573,7 @@ function createAgyFastServer(options = {}) {
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runBatchSearch(resolved.value);
+      return wrapFastTool("batch_search", () => runBatchSearch(resolved.value));
     }
   );
   server.registerTool(
@@ -6558,7 +6581,7 @@ function createAgyFastServer(options = {}) {
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runApplyEdits(resolved.value);
+      return wrapFastTool("apply_edits", () => runApplyEdits(resolved.value));
     }
   );
   server.registerTool(
@@ -6612,7 +6635,7 @@ function createAgyFastServer(options = {}) {
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runReadSlices(resolved.value);
+      return wrapFastTool("read_slices", () => runReadSlices(resolved.value));
     }
   );
   server.registerTool(
@@ -6676,7 +6699,7 @@ function createAgyFastServer(options = {}) {
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runChecks(resolved.value);
+      return wrapFastTool("run_checks", () => runChecks(resolved.value));
     }
   );
   server.registerTool(
@@ -6721,7 +6744,7 @@ function createAgyFastServer(options = {}) {
     async (args) => {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runCodeGraph(resolved.value);
+      return wrapFastTool("code_graph", () => runCodeGraph(resolved.value));
     }
   );
   return server;

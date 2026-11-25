@@ -86,7 +86,7 @@ def ensure_daemon(engine: Path, spore: Path, sock_path: Path) -> bool:
         "--weights", str(spore),
         "--shells", "3",
         "--r-loops", "2",
-        "--rep-penalty", "1.0",
+        "--rep-penalty", "1.08",
         "--prefill-chunk", "16",
         "--energy-halt", "0.95",
         "--daemon", str(sock_path),
@@ -97,7 +97,7 @@ def ensure_daemon(engine: Path, spore: Path, sock_path: Path) -> bool:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    deadline = time.time() + 6.0
+    deadline = time.time() + 15.0
     while time.time() < deadline:
         if sock_path.exists():
             try:
@@ -128,7 +128,7 @@ def run_one(engine: Path, weights: Path, sock_path: Path, prompt: str, mac_6d: L
         "max_new": max_new,
         "r_loops": r_loops,
         "shells": shells,
-        "rep_penalty": 1.0,
+        "rep_penalty": 1.08,
         "mac_6d": mac_6d,
         "save_state": save_hms,
         "load_state": load_hms,
@@ -144,7 +144,7 @@ def run_one(engine: Path, weights: Path, sock_path: Path, prompt: str, mac_6d: L
         "--weights", str(weights),
         "--shells", str(shells),
         "--r-loops", str(r_loops),
-        "--rep-penalty", "1.0",
+        "--rep-penalty", "1.08",
         "--prefill-chunk", "16",
         "--energy-halt", "0.95",
         "--batch-jsonl", str(in_p),
@@ -178,8 +178,8 @@ def main() -> None:
     try:
         engine = resolve_engine_bin()
         m_w = resolve_spore(
-            ["muninn5_clean_school_v3_s3.tm7b", "muninn5_clean_school_s3.tm7b", "muninn4_school_v2_s3.tm7b", "muninn4_gpu_school_s3.tm7b", "muninn4_wso_school_grad.tm7b", "muninn4_wso_plateau.tm7b"],
-            "Muninn-5 / Muninn-4",
+            ["muninn6_school_v4.tm7b", "muninn5_clean_school_v3_s3.tm7b", "muninn5_clean_school_s3.tm7b", "muninn4_school_v2_s3.tm7b", "muninn4_gpu_school_s3.tm7b", "muninn4_wso_school_grad.tm7b", "muninn4_wso_plateau.tm7b"],
+            "Muninn-6 / Muninn-5 / Muninn-4",
             "ravens",
         )
     except FileNotFoundError as exc:
@@ -188,8 +188,8 @@ def main() -> None:
 
     try:
         h_w: Path | None = resolve_spore(
-            ["huginn2_clean_school_s3.tm7b", "huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"],
-            "Huginn-2 / Huginn-1",
+            ["huginn3_school_v4.tm7b", "huginn2_clean_school_s3.tm7b", "huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"],
+            "Huginn-3 / Huginn-2 / Huginn-1",
             "huginn",
         )
     except FileNotFoundError:
@@ -206,21 +206,40 @@ def main() -> None:
     if args.mode == "handoff":
         hms_p = Path(args.hms_path).expanduser()
         hms_p.parent.mkdir(parents=True, exist_ok=True)
+        mac_hms = [0.90, 0.0, 0.95, 0.85, 0.90, 0.80]
         prompt = f"[UPD_ERASE] [MAC_GAL] L=+0.90 O=+0.00 T=+0.95 E=+0.85 V=+0.90 C=+0.80\n{args.query}\n[USR] What is the current active value of {args.key}?\n[AST]"
         row = run_one(
-            engine, m_w, MUNINN_SOCK, prompt, [0.90, 0.0, 0.95, 0.85, 0.90, 0.80],
+            engine, m_w, MUNINN_SOCK, prompt, mac_hms,
             r_loops=2, shells=3, max_new=args.max_new,
             save_hms=str(hms_p), load_hms=str(hms_p) if hms_p.exists() else "",
         )
+        m_txt = row.get("gen_text", "").replace("[EOS]", "").strip()
+        m_margin = float(row.get("pick_margin", 0.0))
+        m_ms = float(row.get("elapsed_ms", 0.0))
+        organ_used = m_w.name
+        if h_w is not None and ("<think>" in m_txt or m_margin < 4.5):
+            h_row = run_one(
+                engine, h_w, HUGINN_SOCK, prompt, mac_hms,
+                r_loops=2, shells=3, max_new=args.max_new,
+                save_hms="", load_hms="",
+            )
+            h_txt = h_row.get("gen_text", "").replace("[EOS]", "").strip()
+            h_margin = float(h_row.get("pick_margin", 0.0))
+            if h_margin > m_margin and "<think>" not in h_txt:
+                m_txt = h_txt
+                m_margin = h_margin
+                m_ms += float(h_row.get("elapsed_ms", 0.0))
+                organ_used = f"{m_w.name}+{h_w.name}(conformal)"
         print(json.dumps({
-            "organ": m_w.name,
+            "organ": organ_used,
             "mode": "handoff",
             "transport": "unix_socket_daemon",
             "hms_path": str(hms_p),
             "hologram_saved_bytes": row.get("hologram_saved_bytes", 0),
             "hologram_saved_mb": round(int(row.get("hologram_saved_bytes", 0)) / (1024.0 * 1024.0), 3),
-            "elapsed_ms": row.get("elapsed_ms", 0.0),
-            "output": row.get("gen_text", "").replace("[EOS]", "").strip(),
+            "elapsed_ms": round(m_ms, 2),
+            "conformal_pick_margin": round(m_margin, 3),
+            "output": m_txt,
         }, indent=2))
         return
 

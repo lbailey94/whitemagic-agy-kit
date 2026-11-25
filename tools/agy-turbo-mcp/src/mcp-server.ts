@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { McpStdioServer, type McpToolDefinition } from "./protocol/mcp.js";
 import { MCP_CALL_BUDGET_SEC } from "./utils/exec-utils.js";
@@ -15,6 +16,41 @@ import { runReadSlices, type ReadSlicesInput } from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
 
 const SERVER_VERSION = "4.0.0";
+
+function recordFastTelemetry(
+  tool: string,
+  outText: string,
+  wallMs: number,
+  isError: boolean,
+): void {
+  if (process.env.WM_FAST_NO_STATS === "1") return;
+  try {
+    const statsPath =
+      process.env.WM_FAST_STATS ||
+      path.join(os.homedir(), ".local", "share", "whitemagic", "wm_fast_stats.jsonl");
+    fs.mkdirSync(path.dirname(statsPath), { recursive: true });
+    const row = JSON.stringify({
+      ts: Math.floor(Date.now() / 1000),
+      tool,
+      out: Buffer.byteLength(outText, "utf8"),
+      wall_ms: Math.max(0, Math.round(wallMs)),
+      err: isError,
+    });
+    fs.appendFileSync(statsPath, row + "\n", "utf8");
+  } catch {
+    // Telemetry is strictly fail-open.
+  }
+}
+
+async function wrapFastTool(
+  tool: string,
+  fn: () => Promise<{ text: string; isError?: boolean }>,
+): Promise<{ text: string; isError?: boolean }> {
+  const t0 = Date.now();
+  const res = await fn();
+  recordFastTelemetry(tool, res.text ?? "", Date.now() - t0, Boolean(res.isError));
+  return res;
+}
 
 export interface AgyFastServerOptions {
   env?: NodeJS.ProcessEnv;
@@ -283,7 +319,7 @@ export function createAgyFastServer(
     async (args) => {
       const resolved = resolveToolArgs<BatchSearchInput>(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runBatchSearch(resolved.value);
+      return wrapFastTool("batch_search", () => runBatchSearch(resolved.value));
     },
   );
 
@@ -292,7 +328,7 @@ export function createAgyFastServer(
     async (args) => {
       const resolved = resolveToolArgs<ApplyEditsInput>(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runApplyEdits(resolved.value);
+      return wrapFastTool("apply_edits", () => runApplyEdits(resolved.value));
     },
   );
 
@@ -348,7 +384,7 @@ export function createAgyFastServer(
     async (args) => {
       const resolved = resolveToolArgs<ReadSlicesInput>(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runReadSlices(resolved.value);
+      return wrapFastTool("read_slices", () => runReadSlices(resolved.value));
     },
   );
 
@@ -414,7 +450,7 @@ export function createAgyFastServer(
     async (args) => {
       const resolved = resolveToolArgs<RunChecksInput>(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runChecks(resolved.value);
+      return wrapFastTool("run_checks", () => runChecks(resolved.value));
     },
   );
 
@@ -461,7 +497,7 @@ export function createAgyFastServer(
     async (args) => {
       const resolved = resolveToolArgs<CodeGraphInput>(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
-      return runCodeGraph(resolved.value);
+      return wrapFastTool("code_graph", () => runCodeGraph(resolved.value));
     },
   );
 

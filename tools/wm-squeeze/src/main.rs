@@ -135,6 +135,48 @@ fn print_stats() {
         "wm-squeeze v3: {} cmds ({} cache hits) | raw {:.1} KB -> out {:.1} KB | saved {:.1} KB ({:.1}%, ~{} tok) | overflow files: {}",
         count, hits, raw_sum as f64 / 1024.0, out_sum as f64 / 1024.0, saved as f64 / 1024.0, pct, saved / 4, spills
     );
+    let fast_path = env::var("WM_FAST_STATS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var("HOME").unwrap_or_default())
+                .join(".local/share/whitemagic/wm_fast_stats.jsonl")
+        });
+    if let Ok(fc) = fs::read_to_string(&fast_path) {
+        let (mut f_calls, mut f_out, mut f_ms, mut f_err) = (0usize, 0usize, 0usize, 0usize);
+        for line in fc.lines() {
+            if !line.starts_with('{') {
+                continue;
+            }
+            let get_n = |key: &str| -> usize {
+                line.find(key)
+                    .and_then(|i| {
+                        let rest = &line[i + key.len()..];
+                        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        num.parse().ok()
+                    })
+                    .unwrap_or(0)
+            };
+            f_calls += 1;
+            f_out += get_n("\"out\":");
+            f_ms += get_n("\"wall_ms\":");
+            if line.contains("\"err\":true") {
+                f_err += 1;
+            }
+        }
+        if f_calls > 0 {
+            println!(
+                "wm-fast MCP:   {} calls ({} err) | inline out {:.1} KB (avg {} B/call, ~{} tok) | avg {} ms",
+                f_calls,
+                f_err,
+                f_out as f64 / 1024.0,
+                f_out / f_calls,
+                f_out / 4,
+                f_ms / f_calls
+            );
+        }
+    }
 }
 
 fn fast_git_head(dir: &Path) -> Option<String> {

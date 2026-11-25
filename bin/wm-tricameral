@@ -109,8 +109,8 @@ def ensure_daemon(engine: Path, spore: Path, sock_path: Path) -> bool:
     return False
 
 
-def run_one(engine: Path, weights: Path, prompt: str, r_loops: int, shells: int, max_new: int, sock_path: Path | None = None, soft_prompt: str = "") -> Dict[str, Any]:
-    req = {
+def run_one(engine: Path, weights: Path, prompt: str, r_loops: int, shells: int, max_new: int, sock_path: Path | None = None, soft_prompt: str = "", mac_6d: List[float] | None = None) -> Dict[str, Any]:
+    req: Dict[str, Any] = {
         "id": "tri_q",
         "prompt": prompt,
         "max_new": max_new,
@@ -119,6 +119,8 @@ def run_one(engine: Path, weights: Path, prompt: str, r_loops: int, shells: int,
         "rep_penalty": 1.0,
         "soft_prompt": soft_prompt,
     }
+    if mac_6d is not None:
+        req["mac_6d"] = mac_6d
     if sock_path is not None and not soft_prompt and ensure_daemon(engine, weights, sock_path):
         return send_unix_json(sock_path, req)
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
@@ -157,8 +159,8 @@ def main() -> None:
         sys.stderr.write(f"wm-tricameral: {exc}\n")
         sys.exit(2)
 
-    h_w = find_optional_spore(["huginn2_clean_school_s3.tm7b", "huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"])
-    m_w = find_optional_spore(["muninn5_clean_school_v3_s3.tm7b", "muninn5_clean_school_s3.tm7b", "muninn4_school_v2_s3.tm7b", "muninn4_gpu_school_s3.tm7b", "muninn4_wso_school_grad.tm7b", "muninn4_wso_plateau.tm7b"])
+    h_w = find_optional_spore(["huginn3_school_v4.tm7b", "huginn2_clean_school_s3.tm7b", "huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"])
+    m_w = find_optional_spore(["muninn6_school_v4.tm7b", "muninn5_clean_school_v3_s3.tm7b", "muninn5_clean_school_s3.tm7b", "muninn4_school_v2_s3.tm7b", "muninn4_gpu_school_s3.tm7b", "muninn4_wso_school_grad.tm7b", "muninn4_wso_plateau.tm7b"])
     v_w = find_optional_spore(["valkyrie_m3_1B_school_v40_s3.tm7b", "valkyrie_m3_1B_fullcore_rlvr_s3.tm7b", "valkyrie_m3_1B_school_v35_s3.tm7b", "valkyrie_m3_leg2b_wsd_final.tm7b", "valkyrie_m3_leg2_school_s3.tm7b", "valkyrie_m3_leg2_wsd_final.tm7b"])
 
     if h_w is None:
@@ -166,9 +168,12 @@ def main() -> None:
         sys.exit(2)
 
     if args.workflow == "kekkai":
-        k_row = run_one(engine, h_w, f"[VETO_NEG0] {args.query}\n[AST]", r_loops=2, shells=3, max_new=24, sock_path=HUGINN_SOCK)
+        if "school_v4" in h_w.name or "huginn3" in h_w.name:
+            k_row = run_one(engine, h_w, f"[KEKKAI_AUDIT] {args.query}\n[AST]", r_loops=2, shells=3, max_new=36, sock_path=HUGINN_SOCK, mac_6d=[0.95, 0.0, 0.90, 1.00, 0.90, 0.0])
+        else:
+            k_row = run_one(engine, h_w, f"[VETO_NEG0] {args.query}\n[AST]", r_loops=2, shells=3, max_new=24, sock_path=HUGINN_SOCK)
         k_txt = k_row.get("gen_text", "").replace("[EOS]", "").strip()
-        veto = ("[VETO_NEG0]" in k_txt) or ("REFUSE" in k_txt.upper()) or ("REJECT" in k_txt.upper())
+        veto = ("[VETO_NEG0]" in k_txt) or (("[ALLOW]" not in k_txt) and (("REFUSE" in k_txt.upper()) or ("REJECT" in k_txt.upper())))
         print(json.dumps({
             "workflow": "kekkai",
             "veto": veto,

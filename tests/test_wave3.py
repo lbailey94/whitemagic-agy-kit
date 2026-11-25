@@ -2191,11 +2191,14 @@ def test_v460_multihost_codex_cursor_and_cpr_translate():
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-        # Cursor preToolUse Read unbounded huge file -> clamped to limit=250; explicit limit untouched
+        # Cursor preToolUse Read unbounded huge file -> clamped to default limit=250; explicit limit untouched
         big_file = td_path / "big.txt"
         big_file.write_text("\n".join(f"line_{i:04d} padding text for size" for i in range(520)) + "\n", encoding="utf-8")
-        rc_r1, cu_r1 = run_sq(["--pre-tool", "--host", "cursor", "--event", "preToolUse"], {"tool_name": "Read", "tool_input": {"path": str(big_file)}})
-        rc_r2, cu_r2 = run_sq(["--pre-tool", "--host", "cursor", "--event", "preToolUse"], {"tool_name": "Read", "tool_input": {"path": str(big_file), "limit": 500}})
+        no_prof_env = {**os.environ, "WM_GRIMOIRE_PROFILE": str(td_path / "nonexistent_profile.json")}
+        r1_p = subprocess.run([str(SQ_BIN), "--pre-tool", "--host", "cursor", "--event", "preToolUse"], input=json.dumps({"tool_name": "Read", "tool_input": {"path": str(big_file)}}), capture_output=True, text=True, env=no_prof_env, timeout=5)
+        r2_p = subprocess.run([str(SQ_BIN), "--pre-tool", "--host", "cursor", "--event", "preToolUse"], input=json.dumps({"tool_name": "Read", "tool_input": {"path": str(big_file), "limit": 500}}), capture_output=True, text=True, env=no_prof_env, timeout=5)
+        rc_r1, cu_r1 = r1_p.returncode, json.loads(r1_p.stdout.strip() or "{}")
+        rc_r2, cu_r2 = r2_p.returncode, json.loads(r2_p.stdout.strip() or "{}")
         check(
             "wm-squeeze --host cursor preToolUse Read clamps unbounded >400L file but honors explicit limit",
             rc_r1 == 0 and cu_r1.get("updated_input", {}).get("limit") == 250 and cu_r1.get("updated_input", {}).get("path") == str(big_file)

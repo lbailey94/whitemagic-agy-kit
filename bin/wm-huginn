@@ -58,7 +58,7 @@ def _model_search_dirs() -> List[Path]:
 
 
 def resolve_default_huginn_spore() -> Path:
-    names = ["huginn2_clean_school_s3.tm7b", "huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"]
+    names = ["huginn3_school_v4.tm7b", "huginn2_clean_school_s3.tm7b", "huginn1_school_s3.tm7b", "huginn1_gpu_school_s3.tm7b", "huginn1_wsd_final.tm7b"]
     for d in _model_search_dirs():
         for nm in names:
             p = d / nm
@@ -97,7 +97,7 @@ def ensure_huginn_daemon(spore: Path, sock_path: Path = DEFAULT_SOCK) -> bool:
         "--weights", str(spore),
         "--shells", "3",
         "--r-loops", "2",
-        "--rep-penalty", "1.0",
+        "--rep-penalty", "1.08",
         "--prefill-chunk", "16",
         "--energy-halt", "0.95",
         "--daemon", str(sock_path),
@@ -182,7 +182,7 @@ def main() -> None:
             "max_new": args.max_new,
             "r_loops": 2,
             "shells": 3,
-            "rep_penalty": 1.0,
+            "rep_penalty": 1.08,
             "mac_6d": [0.90, 0.0, 0.95, 0.85, 0.90, 0.80],
             "save_state": str(hms_p),
             "load_state": str(hms_p) if hms_p.exists() else "",
@@ -209,14 +209,21 @@ def main() -> None:
         prompt = f"[USR] {args.query}\n[AST]"
         mac_6d = [0.95, 0.0, 0.90, 1.00, 0.90, 0.95]
     elif args.mode == "kekkai":
-        prompt = f"[VETO_NEG0] {args.query}\n[AST]"
-        mac_6d = [0.95, 0.0, 0.90, 1.00, 0.90, -1.00]
+        if "school_v4" in spore.name or "huginn3" in spore.name:
+            prompt = f"[KEKKAI_AUDIT] {args.query}\n[AST]"
+            mac_6d = [0.95, 0.0, 0.90, 1.00, 0.90, 0.0]
+        else:
+            prompt = f"[VETO_NEG0] {args.query}\n[AST]"
+            mac_6d = [0.95, 0.0, 0.90, 1.00, 0.90, -1.00]
     elif args.mode == "squeeze":
         prompt = f"[UPD_ERASE] [MAC_GAL] L=+0.90 O=+0.00 T=+0.95 E=+0.85 V=+0.90 C=+0.80\n{args.query}\n[USR] What is the current active value of {args.key}?\n[AST]"
         mac_6d = [0.90, 0.0, 0.95, 0.85, 0.90, 0.80]
     elif args.mode == "recall-rank":
-        c_lines = "\n".join(f"#{i+1}: {c}" for i, c in enumerate(args.candidates[:5]))
-        prompt = f"[PREF_PICK] Rank these engineering options and pick the single strongest candidate.\n{c_lines}\n[USR] Pick the best option (#1-#5):\n[AST]"
+        cands = args.candidates[:5]
+        c_lines = "\n".join(f"#{i+1}: {c}" for i, c in enumerate(cands))
+        q_hdr = args.query.strip() if args.query.strip() else "Rank these engineering options and pick the single strongest candidate."
+        n_c = max(1, len(cands)) if cands else 5
+        prompt = f"[PREF_PICK] {q_hdr}\n{c_lines}\n[USR] Pick the best option (#1-#{n_c}):\n[AST]"
         mac_6d = [-0.80, 1.00, 0.90, 0.85, 0.90, 0.70]
     elif args.mode == "copilot":
         tag = "[CODE_RS]" if "rust" in args.query.lower() else "[CODE_PY]"
@@ -232,7 +239,7 @@ def main() -> None:
         "max_new": args.max_new,
         "r_loops": r_loops,
         "shells": shells,
-        "rep_penalty": 1.0,
+        "rep_penalty": 1.08,
         "mac_6d": mac_6d,
     }
 
@@ -250,7 +257,7 @@ def main() -> None:
             "--weights", str(spore),
             "--shells", str(shells),
             "--r-loops", str(r_loops),
-            "--rep-penalty", "1.0",
+            "--rep-penalty", "1.08",
             "--prefill-chunk", "16",
             "--energy-halt", "0.95",
             "--batch-jsonl", str(in_p),
@@ -283,7 +290,7 @@ def main() -> None:
         "output": txt,
     }
     if args.mode == "kekkai":
-        out_obj["veto"] = ("[VETO_NEG0]" in txt) or ("REFUSE" in txt.upper()) or ("REJECT" in txt.upper())
+        out_obj["veto"] = ("[VETO_NEG0]" in txt) or (("[ALLOW]" not in txt) and (("REFUSE" in txt.upper()) or ("REJECT" in txt.upper())))
     if args.mode == "recall-rank":
         m = re.search(r"#([1-5])", txt)
         out_obj["selected_index"] = int(m.group(1)) if m else 1

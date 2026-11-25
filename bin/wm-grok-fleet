@@ -1,0 +1,1657 @@
+#!/usr/bin/env python3
+"""
+wm-grok-fleet — High-Throughput Atomic Fleet Orchestrator for Grok 4.7+ (`cursor-agent`).
+
+Key architectural invariants:
+- SQLite WAL queue on ext4 (`~/.local/share/whitemagic/grok_fleet/fleet.db`) so locking works reliably.
+- Bulk artifacts (stream logs, full outputs, patches, SCITT receipts) stored on SD_CARD1 when available.
+- Stream-JSON NDJSON incremental capture + dual timers (inactivity stall watchdog + wall ceiling).
+- Standard non-fast model resolution by default (`WM_GROK_FAMILY`, ready for grok-4.8+).
+- Worktree harvest + optional `bwrap` confined verification via `wm-grok-swarm` + immediate prune.
+- Host RAM/disk governor + shared 429 exponential backoff.
+- Never passes `--approve-mcps` (zero `wm3` SQLite contention).
+"""
+
+from __future__ import annotations
+
+import argparse
+import codecs
+import concurrent.futures
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import random
+import re
+import selectors
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+DEFAULT_FAMILY = "grok-4.7"
+DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "whitemagic" / "grok_fleet" / "fleet.db"
+FALLBACK_ARTIFACT_ROOT = Path.home() / ".local" / "share" / "whitemagic" / "grok_fleet" / "artifacts"
+LOCAL_SWARM_BIN = Path.home() / ".local" / "bin" / "wm-grok-swarm"
+REPO_SWARM_BIN = Path(__file__).resolve().with_name("wm-grok-swarm")
+
+SHORTHAND_TIERS = ("low", "medium", "high", "xhigh")
+EXPLICIT_MODEL_RE = re.compile(
+    r"^(?:cursor-)?grok-\d+\.\d+(?:-(?:low|medium|high|xhigh))?(?:-fast)?$"
+)
+RATE_LIMIT_RE = re.compile(
+    r"(?:\b429\b|rate[\s_-]*limit|too many requests|overloaded|capacity|quota exceeded)",
+    re.IGNORECASE,
+)
+QUOTA_EXHAUSTED_RE = re.compile(
+    r"(?:quota[\s_-]*exceeded|usage[\s_-]*limit|out of usage|monthly[\s_-]*limit|"
+    r"spending[\s_-]*limit|billing[\s_-]*limit|insufficient[\s_-]*credits|"
+    r"plan[\s_-]*limit|limit[\s_-]*reached|usage[\s_-]*cap)",
+    re.IGNORECASE,
+)
+SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+CURSOR_USD_PER_1PCT = 0.96
+NO_TOOLS_BANNER = (
+    "PURE SYNTHESIS MODE: Do NOT call any file, search, or shell tools. "
+    "Respond directly in a single turn with ONLY the requested output.\n\n"
+)
+
+_SWARM_MOD_LOCK = threading.Lock()
+_SWARM_MOD_CACHE: Any = None
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sanitize_id(raw: str, max_len: int = 48) -> str:
+    cleaned = SAFE_ID_RE.sub("-", str(raw or "")).strip(".-")
+    return (cleaned[:max_len] or "item")
+
+
+def _load_exclusions_file(path: Path) -> list[str]:
+    """Load intended-design exclusion bullets from JSON list or line-delimited text/markdown."""
+    raw = path.read_text(encoding="utf-8")
+    stripped = raw.strip()
+    if not stripped:
+        return []
+    if stripped.startswith("["):
+        parsed = json.loads(stripped)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+    out: list[str] = []
+    for line in raw.splitlines():
+        item = line.strip()
+        if not item or item.startswith("#"):
+            continue
+        if item.startswith("- ") or item.startswith("* "):
+            item = item[2:].strip()
+        if item:
+            out.append(item)
+    return out
+
+
+def _load_trajectories_jsonl(path: Path, max_items: int = 3) -> list[dict[str, Any]]:
+    """Load up to the most recent `max_items` winning-trajectory exemplars from JSONL."""
+    if max_items <= 0:
+        return []
+    items: list[dict[str, Any]] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        if isinstance(obj, dict):
+            items.append(obj)
+    return items[-max_items:]
+
+
+def compose_worker_prompt(
+    base_prompt: str,
+    *,
+    intended_design_exclusions: list[str] | str | None = None,
+    forbidden_actions: list[str] | None = None,
+    winning_trajectories: list[dict[str, Any]] | None = None,
+) -> str:
+    """Place static campaign-level guardrails & exemplars BEFORE `[TASK]` for prefix-cache hits.
+
+    Returns `base_prompt` verbatim when all optional hardening blocks are empty/None.
+    """
+    sections: list[str] = []
+    if isinstance(intended_design_exclusions, str):
+        exclusions = [x.strip() for x in intended_design_exclusions.splitlines() if x.strip()]
+    else:
+        exclusions = [str(x).strip() for x in (intended_design_exclusions or []) if str(x).strip()]
+    if exclusions:
+        lines = "\n".join(f"- {x}" for x in exclusions)
+        sections.append(
+            "[INTENDED_DESIGN_EXCLUSIONS]\n"
+            "Do NOT report behaviors explicitly listed below as vulnerabilities unless a concrete "
+            "bypass breaks the documented boundary:\n"
+            f"{lines}"
+        )
+
+    forbidden = [str(x).strip() for x in (forbidden_actions or []) if str(x).strip()]
+    if forbidden:
+        lines = "\n".join(f"- {x}" for x in forbidden)
+        sections.append(f"[FORBIDDEN_ACTIONS]\n{lines}")
+
+    if winning_trajectories:
+        traj_blocks: list[str] = []
+        for idx, tr in enumerate(winning_trajectories, 1):
+            target = str(tr.get("target") or "unknown")
+            vclass = str(tr.get("vuln_class") or "general")
+            summary = str(tr.get("summary") or "").strip()
+            steps = [str(s).strip() for s in (tr.get("steps") or []) if str(s).strip()]
+            head = f"{idx}. [{vclass}] target={target}"
+            if summary:
+                head += f" — {summary}"
+            if steps:
+                head += "\n   steps: " + " -> ".join(steps)
+            traj_blocks.append(head)
+        if traj_blocks:
+            sections.append("[WINNING_TRAJECTORY_EXEMPLARS]\n" + "\n".join(traj_blocks))
+
+    if not sections:
+        return base_prompt
+    return "\n\n".join(sections) + "\n\n[TASK]\n" + base_prompt
+
+
+def _discover_removable_artifact_root() -> Path | None:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or Path.home().name
+    for base in (Path("/media"), Path("/run/media")):
+        if not base.is_dir():
+            continue
+        user_dir = base / user
+        if not user_dir.is_dir():
+            continue
+        try:
+            for mnt in sorted(user_dir.iterdir()):
+                if mnt.is_dir() and mnt.name.upper().startswith("SD_CARD") and os.access(mnt, os.W_OK):
+                    return mnt / "grok_fleet"
+        except OSError:
+            continue
+    return None
+
+
+def default_artifact_dir() -> Path:
+    env_dir = os.environ.get("WM_GROK_FLEET_ARTIFACT_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    removable = _discover_removable_artifact_root()
+    if removable is not None:
+        return removable
+    return FALLBACK_ARTIFACT_ROOT
+
+
+def default_db_path() -> Path:
+    env_db = os.environ.get("WM_GROK_FLEET_DB", "").strip()
+    return Path(env_db) if env_db else DEFAULT_DB_PATH
+
+
+def find_cursor_agent(override: str | None = None) -> str | None:
+    cand = override or os.environ.get("WM_CURSOR_AGENT_BIN", "").strip()
+    if cand:
+        p = Path(cand)
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+        hit = shutil.which(cand)
+        if hit:
+            return hit
+        return None
+    hit = shutil.which("cursor-agent")
+    if hit:
+        return hit
+    local_bin = Path.home() / ".local" / "bin" / "cursor-agent"
+    if local_bin.is_file() and os.access(local_bin, os.X_OK):
+        return str(local_bin)
+    return None
+
+
+def resolve_fleet_model(raw: str | None, family: str | None = None) -> str:
+    """Resolve tier shorthand or explicit Grok model string. Defaults to standard non-fast."""
+    fam = (family or os.environ.get("WM_GROK_FAMILY") or DEFAULT_FAMILY).strip().lower()
+    if not re.match(r"^(?:cursor-)?grok-\d+\.\d+$", fam):
+        raise ValueError(f"Invalid WM_GROK_FAMILY '{fam}'")
+
+    tok = (raw or "medium").strip().lower()
+    if tok in SHORTHAND_TIERS:
+        return f"{fam}-{tok}"
+    if tok.endswith("-fast") and tok[:-5] in SHORTHAND_TIERS:
+        return f"{fam}-{tok}"
+    if EXPLICIT_MODEL_RE.match(tok):
+        return tok
+    raise ValueError(
+        f"Unsupported Grok model '{raw}'. Use low|medium|high|xhigh|*-fast or explicit grok-X.Y-*"
+    )
+
+
+def _load_swarm_module() -> Any:
+    global _SWARM_MOD_CACHE
+    with _SWARM_MOD_LOCK:
+        if _SWARM_MOD_CACHE is not None:
+            return _SWARM_MOD_CACHE
+        prev_dont_write = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            swarm_path = REPO_SWARM_BIN if REPO_SWARM_BIN.is_file() else LOCAL_SWARM_BIN
+            if not swarm_path.is_file():
+                raise FileNotFoundError(f"wm-grok-swarm not found at {REPO_SWARM_BIN} or {LOCAL_SWARM_BIN}")
+            loader = importlib.machinery.SourceFileLoader("wm_grok_swarm_mod", str(swarm_path))
+            spec = importlib.util.spec_from_loader("wm_grok_swarm_mod", loader)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not load module spec from {swarm_path}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _SWARM_MOD_CACHE = mod
+            return mod
+        finally:
+            sys.dont_write_bytecode = prev_dont_write
+
+
+def read_mem_available_mb(meminfo_text: str | None = None) -> float:
+    text = meminfo_text
+    if text is None:
+        try:
+            text = Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return 0.0
+    for line in text.splitlines():
+        if line.startswith("MemAvailable:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1]) / 1024.0
+                except ValueError:
+                    return 0.0
+    return 0.0
+
+
+def check_host_health(
+    min_free_ram_mb: float = 1500.0,
+    min_free_root_gb: float = 8.0,
+    min_free_artifact_gb: float = 1.5,
+    artifact_dir: Path | None = None,
+    meminfo_text: str | None = None,
+    root_free_bytes: int | None = None,
+    artifact_free_bytes: int | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    art_dir = artifact_dir or default_artifact_dir()
+    ram_mb = read_mem_available_mb(meminfo_text)
+
+    if root_free_bytes is None:
+        try:
+            root_free_bytes = shutil.disk_usage("/").free
+        except OSError:
+            root_free_bytes = 0
+    if artifact_free_bytes is None:
+        probe = art_dir
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        try:
+            artifact_free_bytes = shutil.disk_usage(probe).free
+        except OSError:
+            artifact_free_bytes = 0
+
+    root_gb = root_free_bytes / (1024.0 ** 3)
+    art_gb = artifact_free_bytes / (1024.0 ** 3)
+    reasons: list[str] = []
+    if ram_mb < min_free_ram_mb:
+        reasons.append(f"MemAvailable {ram_mb:.0f} MiB < {min_free_ram_mb:.0f} MiB")
+    if root_gb < min_free_root_gb:
+        reasons.append(f"root / free {root_gb:.2f} GiB < {min_free_root_gb:.2f} GiB")
+    if art_gb < min_free_artifact_gb:
+        reasons.append(f"artifact dir free {art_gb:.2f} GiB < {min_free_artifact_gb:.2f} GiB")
+
+    snapshot = {
+        "mem_available_mb": round(ram_mb, 1),
+        "root_free_gb": round(root_gb, 2),
+        "artifact_free_gb": round(art_gb, 2),
+        "reasons": reasons,
+    }
+    return len(reasons) == 0, snapshot
+
+
+class BackoffCoordinator:
+    """Shared exponential backoff across concurrent worker threads when 429s occur."""
+
+    def __init__(self, base_sec: float = 15.0, cap_sec: float = 60.0) -> None:
+        self._lock = threading.Lock()
+        self._base = base_sec
+        self._cap = cap_sec
+        self._streak = 0
+        self._until = 0.0
+
+    def wait_if_needed(self) -> None:
+        while True:
+            with self._lock:
+                delay = self._until - time.monotonic()
+            if delay <= 0:
+                return
+            time.sleep(min(delay, 2.0))
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._streak = 0
+
+    def trigger_rate_limit(self) -> float:
+        with self._lock:
+            self._streak += 1
+            raw = min(self._cap, self._base * (2 ** (self._streak - 1)))
+            jitter = random.uniform(0.0, min(5.0, raw * 0.2))
+            wait_s = round(raw + jitter, 2)
+            target = time.monotonic() + wait_s
+            if target > self._until:
+                self._until = target
+            return wait_s
+
+
+class FleetStore:
+    """Thread-safe SQLite WAL job queue and telemetry ledger."""
+
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=15000;")
+        return conn
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS campaigns (
+                        id TEXT PRIMARY KEY,
+                        name TEXT,
+                        created_at TEXT,
+                        config_json TEXT,
+                        status TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS jobs (
+                        id TEXT PRIMARY KEY,
+                        campaign_id TEXT,
+                        name TEXT,
+                        stage TEXT,
+                        action TEXT,
+                        model TEXT,
+                        cwd TEXT,
+                        prompt_path TEXT,
+                        verify_cmd TEXT,
+                        confined INTEGER,
+                        status TEXT,
+                        attempts INTEGER,
+                        max_attempts INTEGER,
+                        priority INTEGER,
+                        session_id TEXT,
+                        resolved_model TEXT,
+                        wall_s REAL,
+                        api_ms INTEGER,
+                        input_tokens INTEGER,
+                        cache_read_tokens INTEGER,
+                        cache_write_tokens INTEGER,
+                        output_tokens INTEGER,
+                        reasoning_tokens INTEGER,
+                        stream_events INTEGER,
+                        tool_calls INTEGER,
+                        output_path TEXT,
+                        stream_log_path TEXT,
+                        patch_path TEXT,
+                        receipt_path TEXT,
+                        verify_exit_code INTEGER,
+                        error TEXT,
+                        started_at TEXT,
+                        finished_at TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_jobs_campaign_status
+                        ON jobs(campaign_id, status, priority, id);
+                    """
+                )
+            finally:
+                conn.close()
+
+    def ensure_campaign(self, campaign_id: str, name: str | None = None, config: dict | None = None) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO campaigns(id, name, created_at, config_json, status)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        campaign_id,
+                        name or campaign_id,
+                        utc_now_iso(),
+                        json.dumps(config or {}, sort_keys=True),
+                        "queued",
+                    ),
+                )
+            finally:
+                conn.close()
+
+    def set_campaign_status(self, campaign_id: str, status: str) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", (status, campaign_id))
+            finally:
+                conn.close()
+
+    def enqueue_jobs(self, campaign_id: str, rows: list[dict[str, Any]]) -> tuple[int, int]:
+        inserted = 0
+        skipped = 0
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN")
+                for row in rows:
+                    cur = conn.execute(
+                        """
+                        INSERT OR IGNORE INTO jobs(
+                            id, campaign_id, name, stage, action, model, cwd, prompt_path,
+                            verify_cmd, confined, status, attempts, max_attempts, priority,
+                            stream_events, tool_calls
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, 0, 0)
+                        """,
+                        (
+                            row["id"],
+                            campaign_id,
+                            row["name"],
+                            row["stage"],
+                            row["action"],
+                            row["model"],
+                            row["cwd"],
+                            row["prompt_path"],
+                            row["verify_cmd"],
+                            int(row["confined"]),
+                            int(row["max_attempts"]),
+                            int(row["priority"]),
+                        ),
+                    )
+                    if cur.rowcount > 0:
+                        inserted += 1
+                    else:
+                        skipped += 1
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+        return inserted, skipped
+
+    def recover_stale_running(self, campaign_id: str) -> int:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    """
+                    UPDATE jobs SET status = 'pending', error = COALESCE(error, '') || ' [recovered]'
+                    WHERE campaign_id = ? AND status = 'running'
+                    """,
+                    (campaign_id,),
+                )
+                return cur.rowcount
+            finally:
+                conn.close()
+
+    def reset_failed_to_pending(self, campaign_id: str) -> int:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'pending', attempts = 0, error = COALESCE(error, '') || ' [retried]'
+                    WHERE campaign_id = ? AND status = 'failed'
+                    """,
+                    (campaign_id,),
+                )
+                return cur.rowcount
+            finally:
+                conn.close()
+
+    def fetch_pending(self, campaign_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT * FROM jobs
+                    WHERE campaign_id = ? AND status = 'pending'
+                    ORDER BY priority DESC, id ASC
+                    """,
+                    (campaign_id,),
+                )
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    def mark_running(self, job_id: str, attempt: int) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'running', attempts = ?, started_at = ?, error = NULL
+                    WHERE id = ?
+                    """,
+                    (attempt, utc_now_iso(), job_id),
+                )
+            finally:
+                conn.close()
+
+    def update_job_result(self, job_id: str, fields: dict[str, Any]) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        vals = list(fields.values()) + [job_id]
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(f"UPDATE jobs SET {cols} WHERE id = ?", vals)
+            finally:
+                conn.close()
+
+    def campaign_summary(self, campaign_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                if campaign_id:
+                    camps = [
+                        dict(r)
+                        for r in conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchall()
+                    ]
+                    jobs = [
+                        dict(r)
+                        for r in conn.execute("SELECT * FROM jobs WHERE campaign_id = ?", (campaign_id,)).fetchall()
+                    ]
+                else:
+                    camps = [
+                        dict(r)
+                        for r in conn.execute("SELECT * FROM campaigns ORDER BY created_at DESC").fetchall()
+                    ]
+                    jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs").fetchall()]
+            finally:
+                conn.close()
+
+        counts: dict[str, int] = {}
+        wall_vals: list[float] = []
+        tot_in = tot_cr = tot_cw = tot_out = tot_reason = tot_tools = 0
+        for j in jobs:
+            st = j.get("status") or "unknown"
+            counts[st] = counts.get(st, 0) + 1
+            if j.get("wall_s") is not None:
+                wall_vals.append(float(j["wall_s"]))
+            tot_in += int(j.get("input_tokens") or 0)
+            tot_cr += int(j.get("cache_read_tokens") or 0)
+            tot_cw += int(j.get("cache_write_tokens") or 0)
+            tot_out += int(j.get("output_tokens") or 0)
+            tot_reason += int(j.get("reasoning_tokens") or 0)
+            tot_tools += int(j.get("tool_calls") or 0)
+
+        denom_in = tot_in + tot_cr
+        cache_hit_pct = round((100.0 * tot_cr / denom_in), 2) if denom_in > 0 else 0.0
+        # Reference Grok 4.7 $2/M input, $6/M output base rates (approximate 0.1x cache read)
+        est_std_usd = round(
+            (tot_in * 2.0 + tot_cr * 0.2 + tot_out * 6.0) / 1_000_000.0,
+            6,
+        )
+        return {
+            "campaigns": camps,
+            "total_jobs": len(jobs),
+            "counts": counts,
+            "wall_s_sum": round(sum(wall_vals), 2),
+            "wall_s_avg": round(sum(wall_vals) / len(wall_vals), 2) if wall_vals else 0.0,
+            "total_tool_calls": tot_tools,
+            "tokens": {
+                "input": tot_in,
+                "cache_read": tot_cr,
+                "cache_write": tot_cw,
+                "output": tot_out,
+                "reasoning": tot_reason,
+                "cache_hit_pct": cache_hit_pct,
+            },
+            "est_standard_usd": est_std_usd,
+            "est_fast_usd": round(est_std_usd * 2.0, 6),
+            "est_cursor_quota_pct": round(est_std_usd / CURSOR_USD_PER_1PCT, 2),
+        }
+
+    def export_campaign(self, campaign_id: str) -> dict[str, Any]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                camp = conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+                jobs = conn.execute(
+                    "SELECT * FROM jobs WHERE campaign_id = ? ORDER BY priority DESC, id ASC",
+                    (campaign_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+        return {
+            "campaign": dict(camp) if camp else None,
+            "summary": self.campaign_summary(campaign_id),
+            "jobs": [dict(r) for r in jobs],
+        }
+
+
+def _kill_process_group(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _locate_worktree(repo_root: Path, wt_name: str) -> Path | None:
+    cand = Path.home() / ".cursor" / "worktrees" / repo_root.name / wt_name
+    if cand.is_dir():
+        return cand
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            if line.startswith("worktree "):
+                p = Path(line.split(" ", 1)[1].strip())
+                if p.name == wt_name and p.is_dir():
+                    return p
+    return None
+
+
+def _harvest_patch(wt_path: Path, patch_dest: Path) -> None:
+    """Capture full modified + untracked diff cleanly into patch_dest."""
+    patch_dest.parent.mkdir(parents=True, exist_ok=True)
+    # Stage intent-to-add on untracked non-cache files so `git diff HEAD` includes new files cleanly
+    st = subprocess.run(
+        ["git", "-C", str(wt_path), "status", "--porcelain", "-uall"],
+        capture_output=True,
+        text=True,
+    )
+    if st.returncode == 0:
+        untracked: list[str] = []
+        for line in st.stdout.splitlines():
+            if line.startswith("?? "):
+                rel = line[3:].strip().strip('"')
+                if "__pycache__/" in rel or rel.endswith(".pyc"):
+                    continue
+                untracked.append(rel)
+        if untracked:
+            subprocess.run(
+                ["git", "-C", str(wt_path), "add", "-N", "--"] + untracked,
+                capture_output=True,
+                text=True,
+            )
+    diff_proc = subprocess.run(
+        ["git", "-C", str(wt_path), "diff", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    patch_dest.write_text(diff_proc.stdout or "", encoding="utf-8", errors="replace")
+
+
+def _prune_single_worktree(repo_root: Path, wt_path: Path | None) -> None:
+    if wt_path is not None:
+        subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(wt_path)],
+            capture_output=True,
+            text=True,
+        )
+        shutil.rmtree(wt_path, ignore_errors=True)
+        # Remove empty parent repo dir under ~/.cursor/worktrees/<repo>
+        parent = wt_path.parent
+        try:
+            if parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+    subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "prune"],
+        capture_output=True,
+        text=True,
+    )
+
+
+def exec_stream_worker(
+    job: dict[str, Any],
+    attempt: int,
+    cursor_bin: str,
+    artifact_dir: Path,
+    stall_timeout_sec: int,
+    wall_timeout_sec: int,
+    *,
+    empty_cwd: bool = False,
+    no_tools_guard: bool = False,
+    max_tool_calls: int = -1,
+    retry_wall_timeouts: bool = False,
+) -> dict[str, Any]:
+    cid = job["campaign_id"]
+    jid = job["id"]
+    action = job["action"]
+    cwd = job["cwd"]
+    prompt = Path(job["prompt_path"]).read_text(encoding="utf-8")
+    resolved_req_model = resolve_fleet_model(job.get("model"))
+
+    camp_art = artifact_dir / "campaigns" / sanitize_id(cid, 64)
+    stream_log_path = camp_art / "streams" / f"{sanitize_id(jid, 64)}.ndjson"
+    output_path = camp_art / "outputs" / f"{sanitize_id(jid, 64)}.txt"
+    stream_log_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    repo_root: Path | None = None
+    wt_name = ""
+    if action == "worktree":
+        git_chk = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+        if git_chk.returncode != 0:
+            return {
+                "ok": False,
+                "retryable": False,
+                "error": f"worktree action requires a git repo cwd (got {cwd})",
+                "wall_s": 0.0,
+            }
+        repo_root = Path(git_chk.stdout.strip())
+        wt_name = sanitize_id(f"flt-{jid}-a{attempt}", 40)
+
+    ws_override: str | None = None
+    if empty_cwd and action in ("ask", "plan"):
+        empty_dir = artifact_dir / "_empty_cwd"
+        empty_dir.mkdir(parents=True, exist_ok=True)
+        cwd = str(empty_dir)
+        ws_override = cwd
+    if no_tools_guard and action == "ask" and not prompt.startswith("PURE SYNTHESIS MODE:"):
+        prompt = NO_TOOLS_BANNER + prompt
+
+    cmd = [cursor_bin, "-p", "--output-format", "stream-json", "--model", resolved_req_model]
+    if action == "ask":
+        cmd.extend(["--mode=ask", "--trust"])
+    elif action == "plan":
+        cmd.extend(["--mode=plan", "--trust"])
+    elif action == "worktree":
+        cmd.extend(["-w", wt_name, "--skip-worktree-setup", "--force", "--trust"])
+    else:
+        return {"ok": False, "retryable": False, "error": f"invalid action: {action}", "wall_s": 0.0}
+    if ws_override is not None:
+        cmd.extend(["--workspace", ws_override])
+    cmd.append(prompt)
+
+    t0 = time.monotonic()
+    last_event_ts = t0
+    stderr_chunks: list[str] = []
+    session_id: str | None = None
+    actual_model: str = resolved_req_model
+    api_ms: int | None = None
+    usage: dict[str, Any] = {}
+    result_text: str | None = None
+    assistant_chunks: list[str] = []
+    is_error = False
+    stream_events = 0
+    tool_calls = 0
+    tool_exceeded = False
+    timeout_reason: str | None = None
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        start_new_session=True,
+    )
+
+    def _drain_stderr() -> None:
+        assert proc.stderr is not None
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        while True:
+            chunk = proc.stderr.read(8192)
+            if not chunk:
+                tail = dec.decode(b"", final=True)
+                if tail:
+                    stderr_chunks.append(tail)
+                break
+            stderr_chunks.append(dec.decode(chunk, final=False))
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    assert proc.stdout is not None
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout.fileno(), selectors.EVENT_READ)
+    dec = codecs.getincrementaldecoder("utf-8")("replace")
+    pending_buf = ""
+
+    def _process_line(raw_line: str, log_fp: Any) -> None:
+        nonlocal session_id, actual_model, api_ms, usage, result_text, is_error
+        nonlocal stream_events, tool_calls, tool_exceeded, last_event_ts
+        line = raw_line.strip()
+        if not line:
+            return
+        log_fp.write(line + "\n")
+        log_fp.flush()
+        stream_events += 1
+        last_event_ts = time.monotonic()
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(obj, dict):
+            return
+        etype = obj.get("type")
+        subtype = obj.get("subtype")
+        if obj.get("session_id") and not session_id:
+            session_id = str(obj["session_id"])
+        if etype == "system" and subtype == "init":
+            if obj.get("model"):
+                actual_model = str(obj["model"])
+        elif etype == "tool_call":
+            if subtype != "completed":
+                tool_calls += 1
+                if max_tool_calls >= 0 and tool_calls > max_tool_calls:
+                    tool_exceeded = True
+        elif etype == "assistant":
+            msg = obj.get("message") or {}
+            for block in msg.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    assistant_chunks.append(str(block["text"]))
+        elif etype == "result":
+            is_error = bool(obj.get("is_error"))
+            if obj.get("duration_api_ms") is not None:
+                api_ms = int(obj["duration_api_ms"])
+            if isinstance(obj.get("usage"), dict):
+                usage = obj["usage"]
+            if obj.get("result") is not None:
+                result_text = str(obj["result"])
+
+    try:
+        with open(stream_log_path, "w", encoding="utf-8") as log_fp:
+            eof = False
+            while not eof:
+                now = time.monotonic()
+                if tool_exceeded:
+                    timeout_reason = f"tool budget exceeded ({tool_calls} > {max_tool_calls})"
+                    _kill_process_group(proc)
+                    break
+                if now - t0 >= wall_timeout_sec:
+                    timeout_reason = f"wall timeout after {wall_timeout_sec}s"
+                    _kill_process_group(proc)
+                    break
+                if now - last_event_ts >= stall_timeout_sec:
+                    timeout_reason = f"stream stall timeout after {stall_timeout_sec}s"
+                    _kill_process_group(proc)
+                    break
+
+                events = sel.select(timeout=1.0)
+                if not events:
+                    if proc.poll() is not None:
+                        # Process exited; check once briefly for trailing bytes without blocking
+                        if not sel.select(timeout=0.05):
+                            eof = True
+                    continue
+
+                for key, _ in events:
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        eof = True
+                        break
+                    pending_buf += dec.decode(chunk, final=False)
+                    while "\n" in pending_buf:
+                        line, pending_buf = pending_buf.split("\n", 1)
+                        _process_line(line, log_fp)
+                        if tool_exceeded:
+                            break
+                    if tool_exceeded:
+                        timeout_reason = f"tool budget exceeded ({tool_calls} > {max_tool_calls})"
+                        _kill_process_group(proc)
+                        eof = True
+                        break
+
+            pending_buf += dec.decode(b"", final=True)
+            if pending_buf.strip():
+                for tail_line in pending_buf.splitlines():
+                    _process_line(tail_line, log_fp)
+    finally:
+        try:
+            sel.close()
+        except Exception:
+            pass
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            proc.wait(timeout=5)
+        stderr_thread.join(timeout=3)
+
+    wall_s = round(time.monotonic() - t0, 2)
+    stderr_str = "".join(stderr_chunks).strip()
+    final_text = result_text if result_text is not None else "".join(assistant_chunks)
+    output_path.write_text(final_text or "", encoding="utf-8")
+
+    err_msg: str | None = timeout_reason
+    if err_msg is None and (proc.returncode != 0 or is_error):
+        err_msg = (stderr_str or final_text or f"exit {proc.returncode}")[:400]
+
+    ok = (timeout_reason is None) and (proc.returncode == 0) and (not is_error)
+    combined_err = (err_msg or "") + "\n" + stderr_str + "\n" + (final_text or "")[:500]
+    quota_exhausted = (not ok) and bool(QUOTA_EXHAUSTED_RE.search(combined_err))
+    rate_limited = (not ok) and (not quota_exhausted) and bool(
+        err_msg and RATE_LIMIT_RE.search(err_msg + "\n" + stderr_str)
+    )
+
+    patch_path_str: str | None = None
+    receipt_path_str: str | None = None
+    verify_exit_code: int | None = None
+
+    if action == "worktree" and repo_root is not None and wt_name:
+        wt_path = _locate_worktree(repo_root, wt_name)
+        try:
+            if wt_path is not None and wt_path.is_dir():
+                patch_dest = camp_art / "patches" / f"{sanitize_id(jid, 64)}.patch"
+                _harvest_patch(wt_path, patch_dest)
+                patch_path_str = str(patch_dest)
+
+                if bool(job.get("confined")):
+                    vcmd = str(job.get("verify_cmd") or "git status --short")
+                    swarm_mod = _load_swarm_module()
+                    vres = swarm_mod.run_confined_verify(
+                        wt_path,
+                        vcmd,
+                        min(90, wall_timeout_sec),
+                    )
+                    rcpt = vres.get("confinement_receipt") or {}
+                    rcpt_dest = camp_art / "receipts" / f"{sanitize_id(jid, 64)}.json"
+                    rcpt_dest.parent.mkdir(parents=True, exist_ok=True)
+                    rcpt_dest.write_text(json.dumps(rcpt, indent=2), encoding="utf-8")
+                    receipt_path_str = str(rcpt_dest)
+                    raw_vcode = rcpt.get("verify_exit_code")
+                    verify_exit_code = int(raw_vcode) if raw_vcode is not None else -1
+                    if not vres.get("ok"):
+                        ok = False
+                        v_err = vres.get("error") or f"confined verify exit={verify_exit_code}"
+                        err_msg = f"{err_msg}; {v_err}" if err_msg else v_err
+            elif ok:
+                ok = False
+                err_msg = f"worktree directory missing after run: {wt_name}"
+        finally:
+            _prune_single_worktree(repo_root, wt_path)
+
+    is_stall = bool(timeout_reason and "stream stall" in timeout_reason)
+    is_wall = bool(timeout_reason and "wall timeout" in timeout_reason)
+    retryable = bool((not quota_exhausted) and (rate_limited or is_stall or (is_wall and retry_wall_timeouts)))
+    return {
+        "ok": ok,
+        "retryable": retryable,
+        "rate_limited": rate_limited,
+        "quota_exhausted": quota_exhausted,
+        "session_id": session_id,
+        "resolved_model": actual_model,
+        "wall_s": wall_s,
+        "api_ms": api_ms,
+        "input_tokens": int(usage.get("inputTokens") or 0),
+        "cache_read_tokens": int(usage.get("cacheReadTokens") or 0),
+        "cache_write_tokens": int(usage.get("cacheWriteTokens") or 0),
+        "output_tokens": int(usage.get("outputTokens") or 0),
+        "reasoning_tokens": int(usage.get("reasoningTokens") or 0),
+        "stream_events": stream_events,
+        "tool_calls": tool_calls,
+        "output_path": str(output_path),
+        "stream_log_path": str(stream_log_path),
+        "patch_path": patch_path_str,
+        "receipt_path": receipt_path_str,
+        "verify_exit_code": verify_exit_code,
+        "error": err_msg,
+    }
+
+
+def cmd_enqueue(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    art_dir = Path(args.artifact_dir) if args.artifact_dir else default_artifact_dir()
+    manifest_path = Path(args.manifest)
+    if not manifest_path.is_file():
+        print(json.dumps({"ok": False, "error": f"manifest not found: {manifest_path}"}))
+        return 1
+
+    store = FleetStore(db_path)
+    cid = sanitize_id(args.campaign, 64)
+    store.ensure_campaign(cid, name=args.name or cid, config={"manifest": str(manifest_path)})
+
+    prompts_dir = art_dir / "campaigns" / cid / "prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+
+    camp_exclusions = (
+        _load_exclusions_file(Path(args.exclusions_file))
+        if getattr(args, "exclusions_file", None)
+        else []
+    )
+    camp_forbidden = [str(x).strip() for x in (getattr(args, "forbidden", None) or []) if str(x).strip()]
+    camp_trajectories = (
+        _load_trajectories_jsonl(
+            Path(args.trajectories_file),
+            max_items=int(getattr(args, "max_trajectories", 3) or 3),
+        )
+        if getattr(args, "trajectories_file", None)
+        else []
+    )
+
+    rows: list[dict[str, Any]] = []
+    for idx, raw_line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        action = str(item.get("action") or "ask").strip().lower()
+        if action not in ("ask", "plan", "worktree"):
+            raise ValueError(f"Line {idx + 1}: invalid action '{action}'")
+        model = resolve_fleet_model(item.get("model"))
+        name = str(item.get("name") or f"job-{idx + 1}")
+        stage = str(item.get("stage") or "default")
+        cwd = str(item.get("cwd") or os.getcwd())
+        raw_id = item.get("id")
+        if raw_id:
+            jid = sanitize_id(str(raw_id), 64)
+        else:
+            digest = hashlib.sha256(f"{cid}:{idx}:{stage}:{name}".encode("utf-8")).hexdigest()[:10]
+            jid = sanitize_id(f"{stage}-{name}-{digest}", 64)
+
+        item_excl = item.get("intended_design_exclusions")
+        if isinstance(item_excl, str):
+            merged_excl = camp_exclusions + [x.strip() for x in item_excl.splitlines() if x.strip()]
+        else:
+            merged_excl = camp_exclusions + [str(x).strip() for x in (item_excl or []) if str(x).strip()]
+        merged_forb = camp_forbidden + [str(x).strip() for x in (item.get("forbidden") or []) if str(x).strip()]
+        item_traj = [t for t in (item.get("winning_trajectories") or []) if isinstance(t, dict)]
+        merged_traj = camp_trajectories + item_traj
+        has_hardening = bool(merged_excl or merged_forb or merged_traj)
+
+        if item.get("prompt_path"):
+            p_path = Path(str(item["prompt_path"]))
+            if not p_path.is_file():
+                raise FileNotFoundError(f"Line {idx + 1}: prompt_path missing: {p_path}")
+            if has_hardening:
+                composed = compose_worker_prompt(
+                    p_path.read_text(encoding="utf-8"),
+                    intended_design_exclusions=merged_excl,
+                    forbidden_actions=merged_forb,
+                    winning_trajectories=merged_traj,
+                )
+                p_file = prompts_dir / f"{jid}.txt"
+                p_file.write_text(composed, encoding="utf-8")
+                prompt_path_str = str(p_file)
+            else:
+                prompt_path_str = str(p_path)
+        else:
+            prompt_text = str(item.get("prompt") or "")
+            if not prompt_text.strip():
+                raise ValueError(f"Line {idx + 1}: prompt or prompt_path required")
+            composed = compose_worker_prompt(
+                prompt_text,
+                intended_design_exclusions=merged_excl,
+                forbidden_actions=merged_forb,
+                winning_trajectories=merged_traj,
+            )
+            p_file = prompts_dir / f"{jid}.txt"
+            p_file.write_text(composed, encoding="utf-8")
+            prompt_path_str = str(p_file)
+
+        rows.append(
+            {
+                "id": jid,
+                "name": name,
+                "stage": stage,
+                "action": action,
+                "model": model,
+                "cwd": cwd,
+                "prompt_path": prompt_path_str,
+                "verify_cmd": item.get("verify_cmd"),
+                "confined": 1 if item.get("confined") else 0,
+                "max_attempts": max(1, int(item.get("max_attempts") or 3)),
+                "priority": int(item.get("priority") or 0),
+            }
+        )
+
+    inserted, skipped = store.enqueue_jobs(cid, rows)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "campaign_id": cid,
+                "db_path": str(db_path),
+                "artifact_dir": str(art_dir),
+                "inserted": inserted,
+                "skipped_existing": skipped,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    cursor_bin = find_cursor_agent(args.cursor_bin)
+    if not cursor_bin:
+        print(json.dumps({"ok": False, "error": "cursor-agent binary not found"}))
+        return 1
+
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    art_dir = Path(args.artifact_dir) if args.artifact_dir else default_artifact_dir()
+    art_dir.mkdir(parents=True, exist_ok=True)
+    store = FleetStore(db_path)
+    cid = sanitize_id(args.campaign, 64)
+    store.recover_stale_running(cid)
+    if getattr(args, "retry_failed", False):
+        store.reset_failed_to_pending(cid)
+    store.set_campaign_status(cid, "running")
+
+    read_conc = max(1, min(24, int(args.read_concurrency)))
+    write_conc = max(1, min(6, int(args.write_concurrency)))
+    read_sem = threading.Semaphore(read_conc)
+    write_sem = threading.Semaphore(write_conc)
+    backoff = BackoffCoordinator()
+    health_lock = threading.Lock()
+    budget_lock = threading.Lock()
+    checkpoint_lock = threading.Lock()
+    budget_capped = threading.Event()
+    quota_halted = threading.Event()
+    stop_requested = threading.Event()
+    max_usd = float(getattr(args, "max_usd", 0.0) or 0.0)
+    empty_cwd = bool(getattr(args, "empty_cwd", False))
+    no_tools_guard = bool(getattr(args, "no_tools_guard", False))
+    max_tool_calls = int(getattr(args, "max_tool_calls", -1))
+    retry_wall_timeouts = bool(getattr(args, "retry_wall_timeouts", False))
+    raw_cp = getattr(args, "checkpoint_path", None)
+    raw_cjl = getattr(args, "checkpoint_jsonl", None)
+    checkpoint_path = Path(raw_cp) if raw_cp else None
+    checkpoint_jsonl = Path(raw_cjl) if raw_cjl else None
+
+    def _write_checkpoint(done_job: dict[str, Any] | None = None) -> None:
+        if checkpoint_jsonl is None and checkpoint_path is None:
+            return
+        with checkpoint_lock:
+            if checkpoint_jsonl is not None and done_job is not None:
+                checkpoint_jsonl.parent.mkdir(parents=True, exist_ok=True)
+                with checkpoint_jsonl.open("a", encoding="utf-8") as fp:
+                    fp.write(json.dumps(done_job, ensure_ascii=False) + "\n")
+                    fp.flush()
+                    os.fsync(fp.fileno())
+            if checkpoint_path is not None:
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                snap = store.export_campaign(cid)
+                tmp_p = checkpoint_path.with_name(f".{checkpoint_path.name}.tmp.{os.getpid()}")
+                with tmp_p.open("w", encoding="utf-8") as fp:
+                    json.dump(snap, fp, indent=2)
+                    fp.flush()
+                    os.fsync(fp.fileno())
+                os.replace(tmp_p, checkpoint_path)
+
+    def _budget_exceeded() -> bool:
+        if max_usd <= 0.0:
+            return False
+        if budget_capped.is_set():
+            return True
+        with budget_lock:
+            if budget_capped.is_set():
+                return True
+            cur_usd = float(store.campaign_summary(cid).get("est_standard_usd", 0.0))
+            if cur_usd >= max_usd:
+                budget_capped.set()
+                print(
+                    f"[budget] max_usd reached (${cur_usd:.4f} >= ${max_usd:.4f}); halting remaining spawns",
+                    file=sys.stderr,
+                )
+                return True
+        return False
+
+    def _halt_requested() -> bool:
+        return (
+            budget_capped.is_set()
+            or quota_halted.is_set()
+            or stop_requested.is_set()
+            or _budget_exceeded()
+        )
+
+    def _run_job_with_retries(job: dict[str, Any]) -> None:
+        sem = write_sem if job["action"] == "worktree" else read_sem
+        max_att = max(1, min(int(job.get("max_attempts") or 3), int(args.max_retries) + 1))
+
+        for attempt in range(1, max_att + 1):
+            if _halt_requested():
+                return
+            backoff.wait_if_needed()
+            with health_lock:
+                waited = 0
+                while waited < 60 and not _halt_requested():
+                    healthy, snap = check_host_health(
+                        min_free_ram_mb=args.min_free_ram_mb,
+                        min_free_root_gb=args.min_free_root_gb,
+                        artifact_dir=art_dir,
+                    )
+                    if healthy:
+                        break
+                    print(
+                        f"[governor] pausing spawn ({'; '.join(snap['reasons'])})",
+                        file=sys.stderr,
+                    )
+                    time.sleep(3)
+                    waited += 3
+
+            if _halt_requested():
+                return
+
+            with sem:
+                if _halt_requested():
+                    return
+                store.mark_running(job["id"], attempt)
+                res = exec_stream_worker(
+                    job=job,
+                    attempt=attempt,
+                    cursor_bin=cursor_bin,
+                    artifact_dir=art_dir,
+                    stall_timeout_sec=args.stall_timeout,
+                    wall_timeout_sec=args.wall_timeout,
+                    empty_cwd=empty_cwd,
+                    no_tools_guard=no_tools_guard,
+                    max_tool_calls=max_tool_calls,
+                    retry_wall_timeouts=retry_wall_timeouts,
+                )
+
+            if res["ok"]:
+                backoff.record_success()
+                fin_iso = utc_now_iso()
+                store.update_job_result(
+                    job["id"],
+                    {
+                        "status": "done",
+                        "session_id": res.get("session_id"),
+                        "resolved_model": res.get("resolved_model"),
+                        "wall_s": res.get("wall_s"),
+                        "api_ms": res.get("api_ms"),
+                        "input_tokens": res.get("input_tokens", 0),
+                        "cache_read_tokens": res.get("cache_read_tokens", 0),
+                        "cache_write_tokens": res.get("cache_write_tokens", 0),
+                        "output_tokens": res.get("output_tokens", 0),
+                        "reasoning_tokens": res.get("reasoning_tokens", 0),
+                        "stream_events": res.get("stream_events", 0),
+                        "tool_calls": res.get("tool_calls", 0),
+                        "output_path": res.get("output_path"),
+                        "stream_log_path": res.get("stream_log_path"),
+                        "patch_path": res.get("patch_path"),
+                        "receipt_path": res.get("receipt_path"),
+                        "verify_exit_code": res.get("verify_exit_code"),
+                        "error": None,
+                        "finished_at": fin_iso,
+                    },
+                )
+                _write_checkpoint({
+                    "job_id": job["id"],
+                    "stage": job.get("stage"),
+                    "model": res.get("resolved_model") or job.get("model"),
+                    "wall_s": res.get("wall_s"),
+                    "output_path": res.get("output_path"),
+                    "input_tokens": res.get("input_tokens", 0),
+                    "cache_read_tokens": res.get("cache_read_tokens", 0),
+                    "output_tokens": res.get("output_tokens", 0),
+                    "reasoning_tokens": res.get("reasoning_tokens", 0),
+                    "tool_calls": res.get("tool_calls", 0),
+                    "finished_at": fin_iso,
+                })
+                return
+
+            if res.get("quota_exhausted"):
+                quota_halted.set()
+                store.update_job_result(
+                    job["id"],
+                    {
+                        "status": "pending",
+                        "wall_s": res.get("wall_s"),
+                        "error": f"quota_paused: {res.get('error')}",
+                        "finished_at": None,
+                    },
+                )
+                _write_checkpoint(None)
+                print(
+                    "[quota] quota exhaustion detected; pausing remaining spawns cleanly",
+                    file=sys.stderr,
+                )
+                return
+
+            if res.get("rate_limited"):
+                wait_s = backoff.trigger_rate_limit()
+                print(
+                    f"[429] job={job['id']} attempt={attempt}/{max_att}; shared backoff {wait_s}s",
+                    file=sys.stderr,
+                )
+
+            if res.get("retryable") and attempt < max_att and not _halt_requested():
+                continue
+
+            store.update_job_result(
+                job["id"],
+                {
+                    "status": "failed",
+                    "session_id": res.get("session_id"),
+                    "resolved_model": res.get("resolved_model"),
+                    "wall_s": res.get("wall_s"),
+                    "api_ms": res.get("api_ms"),
+                    "input_tokens": res.get("input_tokens", 0),
+                    "cache_read_tokens": res.get("cache_read_tokens", 0),
+                    "cache_write_tokens": res.get("cache_write_tokens", 0),
+                    "output_tokens": res.get("output_tokens", 0),
+                    "reasoning_tokens": res.get("reasoning_tokens", 0),
+                    "stream_events": res.get("stream_events", 0),
+                    "tool_calls": res.get("tool_calls", 0),
+                    "output_path": res.get("output_path"),
+                    "stream_log_path": res.get("stream_log_path"),
+                    "patch_path": res.get("patch_path"),
+                    "receipt_path": res.get("receipt_path"),
+                    "verify_exit_code": res.get("verify_exit_code"),
+                    "error": res.get("error"),
+                    "finished_at": utc_now_iso(),
+                },
+            )
+            _write_checkpoint(None)
+            return
+
+    pending = store.fetch_pending(cid)
+    t_wall0 = time.monotonic()
+
+    def _on_stop_signal(_signum: int, _frame: Any) -> None:
+        stop_requested.set()
+        print(
+            "[signal] graceful drain requested; finishing in-flight workers and checkpointing",
+            file=sys.stderr,
+        )
+
+    is_main = threading.current_thread() is threading.main_thread()
+    old_sigint = signal.getsignal(signal.SIGINT) if is_main else None
+    old_sigterm = signal.getsignal(signal.SIGTERM) if is_main else None
+    try:
+        if is_main:
+            signal.signal(signal.SIGINT, _on_stop_signal)
+            signal.signal(signal.SIGTERM, _on_stop_signal)
+        if pending:
+            max_pool = min(len(pending), read_conc + write_conc)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_pool) as pool:
+                futs = [pool.submit(_run_job_with_retries, j) for j in pending]
+                for fut in concurrent.futures.as_completed(futs):
+                    fut.result()
+    finally:
+        if is_main:
+            if old_sigint is not None:
+                signal.signal(signal.SIGINT, old_sigint)
+            if old_sigterm is not None:
+                signal.signal(signal.SIGTERM, old_sigterm)
+
+    _write_checkpoint(None)
+    summary = store.campaign_summary(cid)
+    failed_cnt = summary["counts"].get("failed", 0)
+    capped = budget_capped.is_set()
+    q_halted = quota_halted.is_set()
+    interrupted = stop_requested.is_set()
+    if q_halted:
+        store.set_campaign_status(cid, "quota_paused")
+    elif interrupted:
+        store.set_campaign_status(cid, "interrupted")
+    elif capped:
+        store.set_campaign_status(cid, "budget_capped")
+    else:
+        store.set_campaign_status(cid, "completed" if failed_cnt == 0 else "completed_with_failures")
+    summary["campaign_wall_s"] = round(time.monotonic() - t_wall0, 2)
+    summary["budget_capped"] = capped
+    summary["quota_halted"] = q_halted
+    summary["interrupted"] = interrupted
+    summary["resumable_pending"] = summary["counts"].get("pending", 0)
+    summary["ok"] = failed_cnt == 0
+    print(json.dumps(summary, indent=2))
+    return 0 if failed_cnt == 0 else 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    art_dir = Path(args.artifact_dir) if args.artifact_dir else default_artifact_dir()
+    if not db_path.is_file():
+        print(json.dumps({"ok": False, "error": f"db not found: {db_path}"}))
+        return 1
+    store = FleetStore(db_path)
+    cid = sanitize_id(args.campaign, 64) if args.campaign else None
+    summary = store.campaign_summary(cid)
+    _, health = check_host_health(artifact_dir=art_dir)
+    summary["host"] = health
+    summary["ok"] = True
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print(f"Fleet DB: {db_path}")
+        print(
+            f"Jobs: {summary['total_jobs']} | counts={summary['counts']} | "
+            f"wall_sum={summary['wall_s_sum']}s (avg {summary['wall_s_avg']}s)"
+        )
+        t = summary["tokens"]
+        print(
+            f"Tokens: in={t['input']:,} cache_read={t['cache_read']:,} ({t['cache_hit_pct']}%) "
+            f"out={t['output']:,} reason={t['reasoning']:,} | est_std=${summary['est_standard_usd']:.4f} "
+            f"est_quota~{summary['est_cursor_quota_pct']}% tools={summary['total_tool_calls']}"
+        )
+        print(
+            f"Host: MemAvailable={health['mem_available_mb']} MiB | "
+            f"/ free={health['root_free_gb']} GiB | artifact free={health['artifact_free_gb']} GiB"
+        )
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    store = FleetStore(db_path)
+    data = store.export_campaign(sanitize_id(args.campaign, 64))
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    print(json.dumps({"ok": True, "out": str(out_path), "jobs": len(data["jobs"])}, indent=2))
+    return 0
+
+
+def cmd_prune_worktrees(args: argparse.Namespace) -> int:
+    wt_root = Path.home() / ".cursor" / "worktrees"
+    found: list[str] = []
+    removed: list[str] = []
+    if wt_root.is_dir():
+        for p in sorted(wt_root.glob("*/*")):
+            if not p.is_dir():
+                continue
+            found.append(str(p))
+            if args.dry_run:
+                continue
+            # Try git worktree remove via git-common-dir if available
+            gdir = subprocess.run(
+                ["git", "-C", str(p), "rev-parse", "--git-common-dir"],
+                capture_output=True,
+                text=True,
+            )
+            if gdir.returncode == 0 and gdir.stdout.strip():
+                common = Path(gdir.stdout.strip())
+                if not common.is_absolute():
+                    common = (p / common).resolve()
+                repo_root = common.parent if common.name == ".git" else common
+                subprocess.run(
+                    ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(p)],
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repo_root), "worktree", "prune"],
+                    capture_output=True,
+                    text=True,
+                )
+            shutil.rmtree(p, ignore_errors=True)
+            removed.append(str(p))
+        if not args.dry_run:
+            for parent in sorted(wt_root.glob("*")):
+                if parent.is_dir() and not any(parent.iterdir()):
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        pass
+    print(
+        json.dumps(
+            {"ok": True, "dry_run": bool(args.dry_run), "found": found, "removed": removed},
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_record_win(args: argparse.Namespace) -> int:
+    """Record a verified bug/task discovery trajectory into an append-only JSONL exemplar log."""
+    art_dir = Path(args.artifact_dir) if args.artifact_dir else default_artifact_dir()
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    out_path = Path(args.out) if args.out else (art_dir / "winning_trajectories.jsonl")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    job_meta: dict[str, Any] = {}
+    cid = sanitize_id(args.campaign, 64) if args.campaign else None
+    if args.job_id and db_path.is_file():
+        store = FleetStore(db_path)
+        summary_data = store.export_campaign(cid) if cid else None
+        if summary_data:
+            for j in summary_data.get("jobs", []):
+                if j.get("id") == args.job_id:
+                    job_meta = {
+                        "resolved_model": j.get("resolved_model") or j.get("model"),
+                        "stage": j.get("stage"),
+                        "tool_calls": j.get("tool_calls"),
+                        "output_path": j.get("output_path"),
+                    }
+                    break
+
+    record: dict[str, Any] = {
+        "recorded_at": utc_now_iso(),
+        "campaign_id": cid,
+        "job_id": args.job_id,
+        "target": str(args.target).strip(),
+        "vuln_class": str(args.vuln_class).strip(),
+        "summary": str(args.summary).strip(),
+        "steps": [str(s).strip() for s in (args.step or []) if str(s).strip()],
+    }
+    if job_meta:
+        record["job_meta"] = job_meta
+
+    with out_path.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    print(json.dumps({"ok": True, "out": str(out_path), "record": record}, indent=2))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="High-Throughput Grok 4.7+ Fleet Runner")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    enq = sub.add_parser("enqueue", help="Enqueue jobs from a JSONL manifest")
+    enq.add_argument("--campaign", required=True)
+    enq.add_argument("--manifest", required=True)
+    enq.add_argument("--name", default=None)
+    enq.add_argument("--db-path", default=None)
+    enq.add_argument("--artifact-dir", default=None)
+    enq.add_argument("--exclusions-file", default=None, help="JSON/text list of intended-design exclusions")
+    enq.add_argument("--forbidden", action="append", default=None, help="Forbidden action rule (repeatable)")
+    enq.add_argument("--trajectories-file", default=None, help="JSONL winning-trajectory exemplars")
+    enq.add_argument("--max-trajectories", type=int, default=3)
+
+    run_p = sub.add_parser("run", help="Drain pending jobs for a campaign")
+    run_p.add_argument("--campaign", required=True)
+    run_p.add_argument("--read-concurrency", type=int, default=8)
+    run_p.add_argument("--write-concurrency", type=int, default=3)
+    run_p.add_argument("--stall-timeout", type=int, default=75)
+    run_p.add_argument("--wall-timeout", type=int, default=300)
+    run_p.add_argument("--max-retries", type=int, default=2)
+    run_p.add_argument("--min-free-ram-mb", type=float, default=1500.0)
+    run_p.add_argument("--min-free-root-gb", type=float, default=8.0)
+    run_p.add_argument("--empty-cwd", action="store_true", help="Run ask/plan jobs in isolated empty cwd + --workspace")
+    run_p.add_argument("--no-tools-guard", action="store_true", help="Prepend single-turn NO_TOOLS banner on ask prompts")
+    run_p.add_argument("--max-tool-calls", type=int, default=-1, help="Kill worker immediately if tool_calls exceeds N (-1 disables)")
+    run_p.add_argument("--max-usd", type=float, default=0.0, help="Halt spawning remaining workers once est_standard_usd reaches cap")
+    run_p.add_argument("--retry-wall-timeouts", action="store_true", help="Retry jobs that hit wall timeout (disabled by default)")
+    run_p.add_argument("--checkpoint-path", default=None, help="Atomic JSON export snapshot updated after each completed job")
+    run_p.add_argument("--checkpoint-jsonl", default=None, help="Append-only fsynced JSONL log of completed jobs")
+    run_p.add_argument("--retry-failed", action="store_true", help="Reset failed jobs back to pending before running")
+    run_p.add_argument("--cursor-bin", default=None)
+    run_p.add_argument("--db-path", default=None)
+    run_p.add_argument("--artifact-dir", default=None)
+
+    st = sub.add_parser("status", help="Show campaign progress and host headroom")
+    st.add_argument("--campaign", default=None)
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--db-path", default=None)
+    st.add_argument("--artifact-dir", default=None)
+
+    exp = sub.add_parser("export", help="Export full campaign records to JSON")
+    exp.add_argument("--campaign", required=True)
+    exp.add_argument("--out", required=True)
+    exp.add_argument("--db-path", default=None)
+
+    rec = sub.add_parser("record-win", help="Append a verified winning trajectory exemplar")
+    rec.add_argument("--campaign", default=None)
+    rec.add_argument("--job-id", default=None)
+    rec.add_argument("--target", required=True)
+    rec.add_argument("--vuln-class", required=True)
+    rec.add_argument("--summary", required=True)
+    rec.add_argument("--step", action="append", default=None)
+    rec.add_argument("--out", default=None)
+    rec.add_argument("--db-path", default=None)
+    rec.add_argument("--artifact-dir", default=None)
+
+    pr = sub.add_parser("prune-worktrees", help="Prune leftover ~/.cursor/worktrees")
+    pr.add_argument("--dry-run", action="store_true")
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.cmd == "enqueue":
+        return cmd_enqueue(args)
+    if args.cmd == "run":
+        return cmd_run(args)
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "export":
+        return cmd_export(args)
+    if args.cmd == "record-win":
+        return cmd_record_win(args)
+    if args.cmd == "prune-worktrees":
+        return cmd_prune_worktrees(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
