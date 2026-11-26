@@ -24,8 +24,13 @@ SYNC_GLOBAL=0
 PRUNE_CODEX_OFFICE=0
 CURSOR_FLEET_ONLY=0
 WIRE_CURSOR_MCP=0
-HOSTS="${WM_HOSTS:-agy}"
+HOSTS="${WM_HOSTS:-}"
+HOSTS_EXPLICIT=0
+if [ -n "${WM_HOSTS:-}" ]; then
+    HOSTS_EXPLICIT=1
+fi
 PULL_PROFILE=""
+CURSOR_SAFE_ALLOW=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -36,19 +41,24 @@ while [ "$#" -gt 0 ]; do
         --prune-codex-office) PRUNE_CODEX_OFFICE=1; shift ;;
         --cursor-fleet-only) CURSOR_FLEET_ONLY=1; shift ;;
         --wire-cursor-mcp) WIRE_CURSOR_MCP=1; shift ;;
+        --cursor-safe-allow) CURSOR_SAFE_ALLOW=1; shift ;;
+        --cursor) HOSTS="agy,cursor"; HOSTS_EXPLICIT=1; shift ;;
+        --cursor-only) HOSTS="cursor"; HOSTS_EXPLICIT=1; shift ;;
         --hosts)
             HOSTS="${2:?--hosts requires a comma-separated list (e.g. agy,codex,cursor)}"
+            HOSTS_EXPLICIT=1
             shift 2
             ;;
         --hosts=*)
             HOSTS="${1#--hosts=}"
+            HOSTS_EXPLICIT=1
             shift
             ;;
         --with-huginn) PULL_PROFILE="huginn"; shift ;;
         --with-ravens) PULL_PROFILE="ravens"; shift ;;
         --with-tricameral) PULL_PROFILE="tricameral"; shift ;;
         -h|--help)
-            echo "Usage: ./install.sh [--cursor-fleet-only [--wire-cursor-mcp]] [--hosts agy,codex,cursor|all] [--prune-codex-office] [--skip-agy-fast] [--skip-tricameral-engine] [--keep-heavy-plugins] [--sync-global] [--with-huginn|--with-ravens|--with-tricameral]"
+            echo "Usage: ./install.sh [--cursor-fleet-only [--wire-cursor-mcp]] [--hosts agy,codex,cursor|all|--cursor|--cursor-only] [--cursor-safe-allow] [--prune-codex-office] [--skip-agy-fast] [--skip-tricameral-engine] [--keep-heavy-plugins] [--sync-global] [--with-huginn|--with-ravens|--with-tricameral]"
             exit 0
             ;;
         *) shift ;;
@@ -91,6 +101,13 @@ PY
     exit 0
 fi
 
+if [ "$HOSTS_EXPLICIT" -eq 0 ] && [ -z "$HOSTS" ]; then
+    if [ -d "${HOME}/.cursor" ]; then
+        HOSTS="agy,cursor"
+    else
+        HOSTS="agy"
+    fi
+fi
 if [ "$HOSTS" = "all" ]; then
     HOSTS="agy,codex,cursor"
 fi
@@ -104,6 +121,13 @@ if [ "$HAS_AGY" -eq 1 ]; then
     mkdir -p "$PLUGINS_DIR" "$AGY_CLI_DIR" "${HOME}/.gemini/config/hooks"
 fi
 
+# Convenience macOS / Gen3 CLI symlinks when present locally
+if [ ! -e "${LOCAL_BIN}/wm3" ] && [ -x "${LOCAL_BIN}/wm-gen3" ]; then
+    ln -sf "${LOCAL_BIN}/wm-gen3" "${LOCAL_BIN}/wm3"
+fi
+if [ "$(uname -s)" = "Darwin" ] && [ ! -e "${LOCAL_BIN}/cursor" ] && [ -x "/Applications/Cursor.app/Contents/Resources/app/bin/cursor" ]; then
+    ln -sf "/Applications/Cursor.app/Contents/Resources/app/bin/cursor" "${LOCAL_BIN}/cursor"
+fi
 echo "=== 1. Building Rust binaries: wm-squeeze, wm-codegraph & Safe-Rust muninn-engine ==="
 if [ "${WM_SKIP_CARGO:-0}" -eq 1 ]; then
     echo "Skipping Cargo build (WM_SKIP_CARGO=1)"
@@ -729,61 +753,33 @@ PY
 fi
 
 if [ "$HAS_CURSOR" -eq 1 ]; then
-    echo "=== 7c. Configuring Cursor adapter (~/.cursor/{hooks.json,mcp.json,hooks,rules,agents}) ==="
+    echo "=== 7c. Configuring Cursor adapter (~/.cursor/{hooks.json,mcp.json,hooks,rules,agents,cli-config.json}) ==="
     mkdir -p "${HOME}/.cursor/hooks" "${HOME}/.cursor/rules" "${HOME}/.cursor/agents"
-    cp "${KIT_DIR}/plugin/hooks/session_start_brief.py" "${HOME}/.cursor/hooks/session_start_brief.py"
-    cp "${KIT_DIR}/plugin/hooks/stop_telemetry.py" "${HOME}/.cursor/hooks/stop_telemetry.py"
-    chmod +x "${HOME}/.cursor/hooks/session_start_brief.py" "${HOME}/.cursor/hooks/stop_telemetry.py"
+    for h in session_start_brief.py pre_tool_guard.py post_tool_sim.py stop_telemetry.py; do
+        install_bin "${KIT_DIR}/plugin/hooks/${h}" "${HOME}/.cursor/hooks/${h}"
+    done
+    install_bin "${KIT_DIR}/bin/statusline.py" "${HOME}/.cursor/statusline.py"
 
-    cat > "${HOME}/.cursor/rules/whitemagic-turbo.mdc" <<'MDC'
----
-description: WhiteMagic Turbo+Fast tool routing, bounded context hygiene, and SIM continuity
-alwaysApply: true
----
+    if [ -f "${KIT_DIR}/cursor/rules/whitemagic-turbo.mdc" ]; then
+        cp "${KIT_DIR}/cursor/rules/whitemagic-turbo.mdc" "${HOME}/.cursor/rules/whitemagic-turbo.mdc"
+    fi
+    for ag in "${KIT_DIR}/cursor/agents/"*.md; do
+        [ -f "$ag" ] || continue
+        cp "$ag" "${HOME}/.cursor/agents/$(basename "$ag")"
+    done
 
-# WhiteMagic Turbo+Fast Directives (Cursor)
-
-## 1. Tool Routing & Token Hygiene (`user-wm_fast` + Built-ins)
-
-| Task | Preferred Tool | Why |
-| :--- | :--- | :--- |
-| >=2 searches, globs, or read-only `git` | `user-wm_fast` `batch_search` | Concurrent `rg`/git (<70ms), <=8.8 KB cap |
-| Symbol defs, callers, impact, skeleton | `user-wm_fast` `code_graph` | <6ms Rust AST/call-graph, saves 85-99% tokens |
-| Map unfamiliar >300L files (10-20/batch) | `user-wm_fast` `read_slices` | Exact line ranges in 1 call; <=120L slices |
-| >=2 multi-hunk/multi-file edits + verify | `user-wm_fast` `apply_edits` | Atomic hunks + drift relocate + squeezed verify |
-| >=2 build/lint/test or noisy commands | `user-wm_fast` `run_checks` | Concurrent + `wm-squeeze` CoACT + 300s git cache |
-| 1-4 small files (<300L) or known ranges | `Read` (parallel, bounded) | Fast direct read; unbounded >400L clamped by hook |
-
-## 2. Compute Pyramid & Safety
-- **4-Tier Routing:** `tricameral_dispatch` ($0 local Huginn/Muninn/Valkyrie) -> `user-wm_fast` -> `grok_dispatch` (parallel read-only audits / isolated worktrees) -> primary model.
-- **SIM & Continuity:** Run `wm-sim query "<topic>" --include-failures` before editing harnesses/benchmarks; log verified outcomes via `wm-sim log`. Record major milestones with `session_checkpoint`.
-- **Verification & Handoffs:** Dispatch `fresh-verifier` (read-only) for unbiased post-edit checks; use `wm-cpr-bridge` / `wm-handoff` / `wm-reset --launcher cursor` for compact handoffs.
-MDC
-
-    cat > "${HOME}/.cursor/agents/fresh-verifier.md" <<'AGENT'
----
-name: fresh-verifier
-description: Independent read-only verification agent. Inspects git status/diff and runs exact build, lint, and test commands in a clean unforked context; emits <=150-token verbatim PASS/FAIL receipt.
-model: inherit
-readonly: true
----
-
-You are an unbiased verification reviewer operating in a clean, unforked context window.
-- Never modify tracked source files or start a second local `wm3 serve`.
-- Inspect `git status --short`, `git diff`, and bounded slices (`<=150L`) of changed files.
-- Execute the exact stated build/lint/test commands (2x when idempotency is requested) via `run_checks` (`outputMode: "full"`) or `Shell`.
-- Report only directly observed outputs: PASS/FAIL status, exact case counts/timings, and verbatim diagnostic lines on failure (`<=150` tokens).
-AGENT
-
-    FAST_MJS="${FAST_MCP_DIR}/mcp-server.mjs" NODE_CMD="${NODE_BIN:-node}" LOCAL_BIN_DIR="${LOCAL_BIN}" python3 - <<'PY'
-import json, os, shutil
+    CURSOR_SAFE_ALLOW="${CURSOR_SAFE_ALLOW}" KIT_ROOT="${KIT_DIR}" FAST_MJS="${FAST_MCP_DIR}/mcp-server.mjs" NODE_CMD="${NODE_BIN:-node}" LOCAL_BIN_DIR="${LOCAL_BIN}" python3 - <<'PY'
+import glob, json, os, shutil
 from datetime import datetime
 from pathlib import Path
 
 home = Path.home()
+kit_dir = Path(os.environ.get("KIT_ROOT") or ".")
 cursor_dir = home / ".cursor"
 local_bin = Path(os.environ.get("LOCAL_BIN_DIR") or str(home / ".local" / "bin"))
 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+gui_path = f"{local_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+path_pref = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
 
 # 1. Merge ~/.cursor/hooks.json (version: 1) cleanly across all 7 Cursor hook events
 hooks_path = cursor_dir / "hooks.json"
@@ -804,47 +800,57 @@ def _strip_wm(items):
     out = []
     for it in (items or []):
         cmd = str(it.get("command", "")) if isinstance(it, dict) else ""
-        if any(tok in cmd for tok in ("wm-squeeze", "session_start_brief.py", "stop_telemetry.py")):
+        if any(tok in cmd for tok in ("wm-squeeze", "session_start_brief.py", "pre_tool_guard.py", "post_tool_sim.py", "stop_telemetry.py")):
             continue
         out.append(it)
     return out
 
-def _sq_cmd(flags: str) -> str:
+def _sq_pre(flags: str) -> str:
     return (
-        f'if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze {flags}; '
-        f'elif [ -x "$HOME/.local/bin/wm-squeeze" ]; then exec "$HOME/.local/bin/wm-squeeze" {flags}; fi'
+        path_pref
+        + f'if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze {flags}; '
+        + f'elif [ -x "$HOME/.local/bin/wm-squeeze" ]; then exec "$HOME/.local/bin/wm-squeeze" {flags}; '
+        + 'else exec python3 -S -B "$HOME/.cursor/hooks/pre_tool_guard.py" --host cursor; fi'
+    )
+
+def _sq_post(flags: str) -> str:
+    return (
+        path_pref
+        + f'if command -v wm-squeeze >/dev/null 2>&1; then exec wm-squeeze {flags}; '
+        + f'elif [ -x "$HOME/.local/bin/wm-squeeze" ]; then exec "$HOME/.local/bin/wm-squeeze" {flags}; '
+        + 'else exec python3 -S -B "$HOME/.cursor/hooks/post_tool_sim.py"; fi'
     )
 
 cursor_specs = (
     ("sessionStart", {
-        "command": 'python3 -S -B "$HOME/.cursor/hooks/session_start_brief.py" --host cursor',
+        "command": path_pref + 'exec python3 -S -B "$HOME/.cursor/hooks/session_start_brief.py" --host cursor',
         "timeout": 5,
     }),
     ("beforeShellExecution", {
-        "command": _sq_cmd("--pre-tool --host cursor --event beforeShellExecution"),
+        "command": _sq_pre('--pre-tool --host cursor --event beforeShellExecution --py "$HOME/.cursor/hooks/pre_tool_guard.py"'),
         "timeout": 5,
     }),
     ("beforeMCPExecution", {
-        "matcher": "wm_fast|whitemagic|tricameral|grok|firecrawl|wm-research-engine|whitemagic_gen4",
-        "command": _sq_cmd("--pre-tool --host cursor --event beforeMCPExecution"),
+        "matcher": "wm_fast|whitemagic|whitemagic_crystals|whitemagic_receipts|tricameral|grok|firecrawl|wm-research-engine|whitemagic_gen4",
+        "command": _sq_pre('--pre-tool --host cursor --event beforeMCPExecution --py "$HOME/.cursor/hooks/pre_tool_guard.py"'),
         "timeout": 5,
     }),
     ("preToolUse", {
-        "matcher": "Shell|Read|Write|StrReplace",
-        "command": _sq_cmd("--pre-tool --host cursor --event preToolUse"),
+        "matcher": "Shell|Read|Write|Edit|StrReplace",
+        "command": _sq_pre('--pre-tool --host cursor --event preToolUse --py "$HOME/.cursor/hooks/pre_tool_guard.py"'),
         "timeout": 5,
     }),
     ("postToolUse", {
-        "matcher": "Shell|MCP:.*",
-        "command": _sq_cmd("--post-tool --host cursor"),
+        "matcher": "Shell|Read|Write|StrReplace|MCP:.*",
+        "command": _sq_post("--post-tool --host cursor"),
         "timeout": 5,
     }),
     ("postToolUseFailure", {
-        "command": _sq_cmd("--post-tool --host cursor"),
+        "command": _sq_post("--post-tool --host cursor"),
         "timeout": 5,
     }),
     ("stop", {
-        "command": 'python3 -S -B "$HOME/.cursor/hooks/stop_telemetry.py" --host cursor',
+        "command": path_pref + 'exec python3 -S -B "$HOME/.cursor/hooks/stop_telemetry.py" --host cursor',
         "timeout": 5,
     }),
 )
@@ -857,7 +863,7 @@ for ev, entry in cursor_specs:
 hooks_path.write_text(json.dumps(hdata, indent=2) + "\n", encoding="utf-8")
 print(f"Updated {hooks_path} ({', '.join(ev for ev, _ in cursor_specs)})")
 
-# 2. Merge wm_fast + locally present sovereign MCP servers into ~/.cursor/mcp.json without disturbing whitemagic
+# 2. Merge wm_fast + locally present sovereign MCP servers into ~/.cursor/mcp.json without disturbing existing whitemagic
 mcp_path = cursor_dir / "mcp.json"
 if mcp_path.is_file():
     shutil.copy2(mcp_path, mcp_path.with_name(f"mcp.json.bak-{ts}"))
@@ -870,35 +876,162 @@ else:
 if not isinstance(mdata, dict):
     mdata = {}
 servers = mdata.setdefault("mcpServers", {})
+base_env = {"PATH": gui_path}
 node_cmd = os.environ.get("NODE_CMD") or "node"
 fast_mjs = os.environ.get("FAST_MJS") or ""
-if fast_mjs and Path(fast_mjs).is_file():
-    servers["wm_fast"] = {"command": node_cmd, "args": [fast_mjs]}
 
 def _find_local(name: str) -> str | None:
     cand = local_bin / name
-    if cand.is_file() and os.access(cand, os.X_OK):
+    if cand.exists() and os.access(cand, os.X_OK):
         return str(cand)
     return shutil.which(name)
 
+if fast_mjs and Path(fast_mjs).is_file():
+    servers["wm_fast"] = {"command": node_cmd, "args": [fast_mjs], "env": dict(base_env)}
+elif _find_local("wm-codegraph"):
+    servers["wm_fast"] = {"command": _find_local("wm-codegraph"), "args": ["--mcp"], "env": dict(base_env)}
+
+if "whitemagic" not in servers:
+    wm_gen3 = _find_local("wm-gen3") or _find_local("wm3")
+    wm_bin = _find_local("wm")
+    # Store discovery: explicit $WM_GEN3_STORE first, then well-known per-user locations.
+    gen3_store = os.environ.get("WM_GEN3_STORE") or ""
+    if not gen3_store:
+        for cand_store in (
+            home / ".local" / "share" / "whitemagic-gen3",
+            home / ".local" / "share" / "whitemagic" / "gen3",
+        ):
+            if Path(cand_store, "data.mdb").is_file():
+                gen3_store = str(cand_store.resolve())
+                break
+        else:
+            gen3_store = str(home / ".local" / "share" / "whitemagic" / "gen3")
+    agy_mcp_p = home / ".gemini" / "config" / "mcp_config.json"
+    agy_wm_cfg = {}
+    if agy_mcp_p.is_file():
+        try:
+            agy_wm_cfg = (json.loads(agy_mcp_p.read_text(encoding="utf-8")).get("mcpServers") or {}).get("whitemagic") or {}
+        except Exception:
+            agy_wm_cfg = {}
+    if wm_gen3 and Path(gen3_store, "data.mdb").is_file():
+        a_cmd = str(agy_wm_cfg.get("command") or "")
+        a_args = [str(x) for x in (agy_wm_cfg.get("args") or [])]
+        agy_owns_gen3 = ("wm3" in a_cmd or "wm-gen3" in a_cmd) and "--readonly" not in a_args
+        wm_args = ["serve", "--store", gen3_store, "--profile", "cyberbrain"]
+        if agy_owns_gen3:
+            wm_args.append("--readonly")
+        servers["whitemagic"] = {
+            "command": wm_gen3,
+            "args": wm_args,
+            "env": {**base_env, "RUST_LOG": "warn"},
+        }
+    elif wm_bin:
+        a_cmd = str(agy_wm_cfg.get("command") or "")
+        a_args = [str(x) for x in (agy_wm_cfg.get("args") or [])]
+        agy_owns_wm = Path(a_cmd).name == "wm" and "--readonly" not in a_args
+        wm_args = ["serve", "--profile", "curated"]
+        if agy_owns_wm:
+            wm_args.append("--readonly")
+        servers["whitemagic"] = {
+            "command": wm_bin,
+            "args": wm_args,
+            "env": {**base_env, "RUST_LOG": "warn", "WM_TOOL_ALLOWLIST": "wm"},
+        }
+
 tri_mcp = _find_local("wm-tricameral-mcp")
 if tri_mcp and _find_local("muninn-engine"):
-    servers.setdefault("tricameral", {"command": tri_mcp, "args": []})
+    servers.setdefault("tricameral", {"command": tri_mcp, "args": [], "env": dict(base_env)})
+
+if node_cmd and (Path(node_cmd).is_file() or shutil.which(node_cmd)):
+    for srv_key, bin_name in (
+        ("whitemagic_crystals", "whitemagic-crystals-mcp"),
+        ("whitemagic_receipts", "whitemagic-receipts-mcp"),
+    ):
+        cand_b = local_bin / bin_name
+        if cand_b.exists() and srv_key not in servers:
+            servers[srv_key] = {
+                "command": node_cmd,
+                "args": [str(cand_b.resolve())],
+                "env": dict(base_env),
+            }
 
 grok_mcp = _find_local("wm-grok-mcp")
 if grok_mcp and _find_local("cursor-agent"):
-    servers.setdefault("grok", {"command": grok_mcp, "args": []})
+    servers.setdefault("grok", {"command": grok_mcp, "args": [], "env": dict(base_env)})
 
 fc_mcp = _find_local("firecrawl-local-mcp")
 if fc_mcp:
-    servers.setdefault("firecrawl", {"command": fc_mcp, "env": {"FIRECRAWL_CLOUD": "off"}})
+    servers.setdefault("firecrawl", {"command": fc_mcp, "env": {**base_env, "FIRECRAWL_CLOUD": "off"}})
 
 wm4_mcp = _find_local("wm4-mcp")
 if wm4_mcp:
-    servers.setdefault("whitemagic_gen4", {"command": wm4_mcp, "args": ["--mcp"]})
+    servers.setdefault("whitemagic_gen4", {"command": wm4_mcp, "args": ["--mcp"], "env": dict(base_env)})
 
 mcp_path.write_text(json.dumps(mdata, indent=2) + "\n", encoding="utf-8")
 print(f"Updated {mcp_path} servers={list(servers.keys())}")
+
+# 3. Sync plugin/skills/* into Cursor Personal User Agent Store when present under HOME
+store_cands = sorted(
+    glob.glob(str(home / "Library" / "Application Support" / "Cursor" / "AgentStores" / "cursor_agent_stores" / "u*" / "files"))
+    + glob.glob(str(home / ".config" / "Cursor" / "AgentStores" / "cursor_agent_stores" / "u*" / "files"))
+)
+if store_cands and (kit_dir / "plugin" / "skills").is_dir():
+    skills_dst = Path(store_cands[0]) / "skills"
+    skills_dst.mkdir(parents=True, exist_ok=True)
+    synced_skills = []
+    for src_skill in sorted((kit_dir / "plugin" / "skills").iterdir()):
+        if not src_skill.is_dir() or not (src_skill / "SKILL.md").is_file():
+            continue
+        dst_skill = skills_dst / src_skill.name
+        if dst_skill.exists():
+            shutil.rmtree(dst_skill)
+        shutil.copytree(src_skill, dst_skill)
+        synced_skills.append(src_skill.name)
+    print(f"Synced {len(synced_skills)} skills to {skills_dst}: {synced_skills}")
+
+# 4. Non-destructively configure ~/.cursor/cli-config.json (statusLine; read-only allowlist only with --cursor-safe-allow)
+cli_cfg_path = cursor_dir / "cli-config.json"
+if cli_cfg_path.is_file():
+    shutil.copy2(cli_cfg_path, cli_cfg_path.with_name(f"cli-config.json.bak-{ts}"))
+    try:
+        cli_cfg = json.loads(cli_cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        cli_cfg = {"version": 1}
+else:
+    cli_cfg = {"version": 1}
+if not isinstance(cli_cfg, dict):
+    cli_cfg = {"version": 1}
+existing_sl = cli_cfg.get("statusLine")
+if not existing_sl or "statusline.py" in json.dumps(existing_sl):
+    cli_cfg["statusLine"] = {
+        "type": "command",
+        "command": "python3 -S -B ~/.cursor/statusline.py",
+        "padding": 1,
+        "timeoutMs": 1500,
+    }
+    sl_msg = "statusLine"
+else:
+    sl_msg = "statusLine kept (user-defined)"
+n_rules = 0
+if os.environ.get("CURSOR_SAFE_ALLOW") == "1":
+    # Opt-in (--cursor-safe-allow): strictly read-only commands with no argument-driven side effects.
+    c_perms = cli_cfg.setdefault("permissions", {})
+    c_allow = c_perms.setdefault("allow", [])
+    for rule in (
+        "Shell(ls)",
+        "Shell(pwd)",
+        "Shell(git status)",
+        "Shell(git diff)",
+        "Shell(git log)",
+        "Shell(git show)",
+        "Shell(wm-squeeze --safe)",
+        "Shell(wm-codegraph)",
+    ):
+        if rule not in c_allow:
+            c_allow.append(rule)
+            n_rules += 1
+cli_cfg_path.write_text(json.dumps(cli_cfg, indent=2) + "\n", encoding="utf-8")
+print(f"Updated {cli_cfg_path} ({sl_msg}; +{n_rules} Shell allow rules)")
 PY
 fi
 

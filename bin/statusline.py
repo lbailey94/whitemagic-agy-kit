@@ -118,15 +118,23 @@ def main():
     parts = []
     model = data.get("model") or {}
     m_name = model.get("display_name") or model.get("id") or "agy"
-    effort = model.get("effort")
+    effort = model.get("effort") or model.get("param_summary")
     m_str = f"{CYAN}{BOLD}{m_name}{RST}"
-    if effort and effort.lower() not in m_name.lower():
-        m_str += f" {DIM}({effort}){RST}"
+    if effort:
+        eff_clean = str(effort).strip("() ")
+        if eff_clean and eff_clean.lower() not in m_name.lower():
+            m_str += f" {DIM}({eff_clean}){RST}"
+    if model.get("max_mode"):
+        m_str += f" {MAGENTA}[MAX]{RST}"
     parts.append(m_str)
 
     mode = data.get("cycle_mode")
     if mode:
         parts.append(f"{MAGENTA}[{mode}]{RST}")
+
+    wt = data.get("worktree") or {}
+    if isinstance(wt, dict) and wt.get("name"):
+        parts.append(f"{BLUE}wt:{wt['name']}{RST}")
 
     cw = data.get("context_window") or {}
     used_pct = cw.get("used_percentage")

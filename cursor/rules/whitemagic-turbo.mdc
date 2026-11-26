@@ -1,0 +1,26 @@
+---
+description: WhiteMagic Turbo+Fast tool routing, birth-time context hygiene, Compute Pyramid, and SIM continuity (v4.6.0)
+alwaysApply: true
+---
+
+# WhiteMagic Turbo+Fast Directives (Cursor v4.6.0)
+
+## 1. Tool Routing & Birth-Time Token Hygiene (`user-wm_fast` / `wm_fast` + Built-ins)
+
+| Task | Preferred Tool | Why |
+| :--- | :--- | :--- |
+| >=2 searches, globs, or read-only `git` | `wm_fast` (`user-wm_fast`) `batch_search` | Concurrent `rg`/git (<70ms), <=8.8 KB birth-time cap |
+| Symbol defs, callers, impact, skeleton | `wm_fast` (`user-wm_fast`) `code_graph` | <6ms Rust AST/call-graph, saves 85-99% tokens |
+| Map unfamiliar >300L files (10-20/batch) | `wm_fast` (`user-wm_fast`) `read_slices` | Exact symbol line ranges in 1 call; <=120L slices |
+| >=2 multi-hunk/multi-file edits + verify | `wm_fast` (`user-wm_fast`) `apply_edits` | Atomic hunks + drift relocate + squeezed `verify` |
+| >=2 build/lint/test or noisy commands | `wm_fast` (`user-wm_fast`) `run_checks` | Concurrent + `wm-squeeze` CoACT + 300s git cache |
+| 1-4 small files (<300L) or known ranges | `Read` (parallel, with `offset` + `limit`) | Fast direct read; unbounded >400L clamped by hook |
+
+## 2. Compute Pyramid, Subagents & Confinement Discipline
+- **4-Tier Routing:** `tricameral_dispatch` ($0 local Huginn/Muninn/Valkyrie when spores present) -> `wm_fast` -> `grok_dispatch` (parallel read-only audits / isolated worktrees) -> primary model.
+- **Native Lifecycle Hooks (`~/.cursor/hooks.json`):** `wm-squeeze` compresses noisy `Shell` commands (including compound/heredoc pipelines), clamps unbounded `Read` calls via `grimoire_profile.json`, enforces `ask` on destructive shell/MCP/secret edits, and logs failures/spills to SIM.
+- **Subagents (`Task`):** Partition parallel tasks onto disjoint file scopes (`wm-handoff --swarm-map .` for shared `<=600`-tok maps); dispatch `fresh-verifier` (`readonly: true`) proactively after multi-file edits; use `best-of-n-runner` for isolated git worktree races.
+
+## 3. SIM & WhiteMagic Continuity
+- Run `wm-sim query "<topic>" --include-failures` before modifying harnesses, prompts, or benchmarks; record verified outcomes via `wm-sim log`.
+- Check WhiteMagic `session_continuity` when resuming estate work, save milestones via `session_checkpoint`, and use `wm-handoff` / `wm-cpr-bridge` / `wm-reset --launcher cursor` before `>120k` context cliffs.
