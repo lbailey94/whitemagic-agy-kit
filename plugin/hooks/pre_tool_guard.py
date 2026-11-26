@@ -1690,14 +1690,127 @@ def handle_swarm_and_subagent(tool_name, args, payload):
     return {"decision": "allow"}
 
 
-def main():
-    if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
+def _emit_host_allow(host: str):
+    if host == "cursor":
+        emit({"permission": "allow"})
+    elif host == "codex":
+        emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}})
+    else:
         emit({"decision": "allow"})
+
+
+def _emit_host_ask(host: str, reason: str):
+    if host == "cursor":
+        emit({"permission": "ask", "user_message": reason, "agent_message": reason})
+    elif host == "codex":
+        emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": reason}})
+    else:
+        emit({"decision": "force_ask", "reason": reason})
+
+
+def handle_non_agy_pretool(host: str, event: str, payload: dict):
+    ev = event or str(payload.get("hook_event_name") or "")
+    tool_name = str(payload.get("tool_name") or "")
+    ti_raw = payload.get("tool_input")
+    ti_dict = None
+    if isinstance(ti_raw, dict):
+        ti_dict = ti_raw
+    elif isinstance(ti_raw, str) and ti_raw.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(ti_raw)
+            if isinstance(parsed, dict):
+                ti_dict = parsed
+        except Exception:
+            ti_dict = None
+
+    if host == "cursor" and ev == "beforeShellExecution":
+        cmd = str(payload.get("command") or (ti_dict or {}).get("command") or "")
+        if cmd:
+            for pattern, reason in _get_destructive_patterns():
+                if pattern.search(cmd):
+                    _emit_host_ask(host, f"[Data-Loss Guard] {reason}. Confirm explicitly before proceeding.")
+                    return
+            kekkai_reason = check_huginn_kekkai_socket(cmd)
+            if kekkai_reason:
+                _emit_host_ask(host, kekkai_reason)
+                return
+        _emit_host_allow(host)
+        return
+
+    if host == "cursor" and ev == "beforeMCPExecution":
+        args_mcp = ti_dict or {}
+        eg = check_env_write_guard(
+            "mcp_whitemagic-agy-kit_fast_apply_edits" if tool_name == "apply_edits" else tool_name,
+            args_mcp,
+        )
+        if eg:
+            _emit_host_ask(host, str(eg.get("reason") or "[Env-Write Guard] Secret file modification requires confirmation."))
+            return
+        for cmd in extract_commands(args_mcp):
+            for pattern, reason in _get_destructive_patterns():
+                if pattern.search(cmd):
+                    _emit_host_ask(host, f"[Data-Loss Guard] {reason}. Confirm explicitly before proceeding.")
+                    return
+            kekkai_reason = check_huginn_kekkai_socket(cmd)
+            if kekkai_reason:
+                _emit_host_ask(host, kekkai_reason)
+                return
+        _emit_host_allow(host)
+        return
+
+    if tool_name in ("Shell", "Bash", "shell", "exec_command", "run_command"):
+        cmd_key = "cmd" if (ti_dict and "cmd" in ti_dict and "command" not in ti_dict) else "command"
+        cmd_line = str((ti_dict or {}).get(cmd_key) or payload.get("command") or "")
+        if cmd_line:
+            if host != "cursor":
+                for pattern, reason in _get_destructive_patterns():
+                    if pattern.search(cmd_line):
+                        _emit_host_ask(host, f"[Data-Loss Guard] {reason}. Confirm explicitly before proceeding.")
+                        return
+                kekkai_reason = check_huginn_kekkai_socket(cmd_line)
+                if kekkai_reason:
+                    _emit_host_ask(host, kekkai_reason)
+                    return
+            rewritten = maybe_squeeze_command(cmd_line)
+            if rewritten:
+                updated = dict(ti_dict) if ti_dict is not None else {}
+                updated[cmd_key] = rewritten
+                if host == "cursor":
+                    emit({"permission": "allow", "updated_input": updated})
+                else:
+                    emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": updated}})
+                return
+        _emit_host_allow(host)
+        return
+
+    _emit_host_allow(host)
+
+
+def main():
+    host = "agy"
+    event = ""
+    cli_args = sys.argv[1:]
+    for idx, a in enumerate(cli_args):
+        if a == "--host" and idx + 1 < len(cli_args):
+            host = cli_args[idx + 1].strip().lower()
+        elif a.startswith("--host="):
+            host = a.split("=", 1)[1].strip().lower()
+        elif a == "--event" and idx + 1 < len(cli_args):
+            event = cli_args[idx + 1].strip()
+        elif a.startswith("--event="):
+            event = a.split("=", 1)[1].strip()
+
+    if os.environ.get("WM_AGY_BENCH_VANILLA") == "1":
+        _emit_host_allow(host)
         return
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception:
-        emit({"decision": "allow"})
+        _emit_host_allow(host)
+        return
+
+    if host != "agy":
+        handle_non_agy_pretool(host, event, payload)
         return
 
     tool_call = payload.get("toolCall") or {}

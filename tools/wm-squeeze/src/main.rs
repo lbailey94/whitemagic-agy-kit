@@ -2169,23 +2169,84 @@ fn emit_pretool_decision(host: HostKind, decision: &str, reason: &str) {
     }
 }
 
-fn emit_pretool_rewrite_cmd(host: HostKind, cmd_key: &str, rewritten: &str) {
+fn extract_raw_json_object_entries(txt: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = txt.trim().as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return out;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        i = skip_json_ws(bytes, i);
+        if i >= bytes.len() || bytes[i] == b'}' {
+            break;
+        }
+        if bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] != b'"' {
+            break;
+        }
+        let Some((key, after_key)) = parse_json_str_at(bytes, i) else { break };
+        i = skip_json_ws(bytes, after_key);
+        if i >= bytes.len() || bytes[i] != b':' {
+            break;
+        }
+        i = skip_json_ws(bytes, i + 1);
+        let end = skip_json_value(bytes, i);
+        if end > i {
+            if let Ok(tok) = std::str::from_utf8(&bytes[i..end]) {
+                out.push((key, tok.trim().to_string()));
+            }
+        }
+        i = end.max(i + 1);
+    }
+    out
+}
+
+fn upsert_json_object_raw(raw_obj: &str, updates: &[(&str, String)]) -> String {
+    let mut entries = extract_raw_json_object_entries(raw_obj);
+    for (k, raw_v) in updates {
+        if let Some(pos) = entries.iter().position(|(ek, _)| ek == k) {
+            entries[pos].1 = raw_v.clone();
+        } else {
+            entries.push(((*k).to_string(), raw_v.clone()));
+        }
+    }
+    let inner = entries
+        .iter()
+        .map(|(k, v)| format!("\"{}\":{}", json_escape(k), v))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{}}}", inner)
+}
+
+fn emit_pretool_rewrite_cmd(host: HostKind, cmd_key: &str, rewritten: &str, ti_raw: &str) {
     match host {
         HostKind::Agy => println!("{{\"decision\":\"allow\",\"overwrite\":{{\"CommandLine\":\"{}\"}}}}", json_escape(rewritten)),
         HostKind::Codex => {
             let key = if cmd_key == "cmd" { "cmd" } else { "command" };
+            let updated_obj = if ti_raw.trim_start().starts_with('{') {
+                upsert_json_object_raw(ti_raw, &[(key, format!("\"{}\"", json_escape(rewritten)))])
+            } else {
+                format!("{{\"{}\":\"{}\"}}", key, json_escape(rewritten))
+            };
             println!(
-                "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"updatedInput\":{{\"{}\":\"{}\"}}}}}}",
-                key,
-                json_escape(rewritten)
+                "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"updatedInput\":{}}}}}",
+                updated_obj
             );
         }
         HostKind::Cursor => {
             let key = if cmd_key == "cmd" { "cmd" } else { "command" };
+            let updated_obj = if ti_raw.trim_start().starts_with('{') {
+                upsert_json_object_raw(ti_raw, &[(key, format!("\"{}\"", json_escape(rewritten)))])
+            } else {
+                format!("{{\"{}\":\"{}\"}}", key, json_escape(rewritten))
+            };
             println!(
-                "{{\"permission\":\"allow\",\"updated_input\":{{\"{}\":\"{}\"}}}}",
-                key,
-                json_escape(rewritten)
+                "{{\"permission\":\"allow\",\"updated_input\":{}}}",
+                updated_obj
             );
         }
     }
@@ -2408,6 +2469,16 @@ fn check_destructive_cmd(cmd: &str) -> Option<&'static str> {
     }
     let _ = (lb, has_ascii_word_ci as fn(&[u8], &[u8]) -> Option<usize>);
     None
+}
+
+fn contains_static_secret_ref(cmd: &str) -> bool {
+    if env::var("WM_HUGINN_KEKKAI_OFF").ok().as_deref() == Some("1") {
+        return false;
+    }
+    let low = cmd.to_ascii_lowercase();
+    [".ssh/", "id_ed25519", "id_rsa", ".aws/credentials", "/etc/shadow", ".gnupg/"]
+        .iter()
+        .any(|pat| low.contains(pat))
 }
 
 fn contains_kekkai_sensitive(cmd: &str) -> bool {
@@ -3455,17 +3526,27 @@ fn find_wm_squeeze_rs() -> Option<String> {
 }
 
 fn run_py_fallback(fallback_py: Option<&str>, stdin_buf: &str) {
+    run_py_fallback_host(fallback_py, stdin_buf, HostKind::Agy, "");
+}
+
+fn run_py_fallback_host(fallback_py: Option<&str>, stdin_buf: &str, host: HostKind, event: &str) {
     let Some(py_path) = fallback_py.filter(|p| Path::new(p).is_file()) else {
-        pretool_allow();
+        emit_pretool_allow(host);
         return;
     };
     let mut cmd = Command::new("python3");
-    cmd.args(["-S", "-B", py_path])
-        .stdin(Stdio::piped())
+    cmd.args(["-S", "-B", py_path]);
+    if host != HostKind::Agy {
+        cmd.args(["--host", host.as_str()]);
+        if !event.is_empty() {
+            cmd.args(["--event", event]);
+        }
+    }
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     let Ok(mut child) = cmd.spawn() else {
-        pretool_allow();
+        emit_pretool_allow(host);
         return;
     };
     if let Some(mut child_in) = child.stdin.take() {
@@ -3479,7 +3560,7 @@ fn run_py_fallback(fallback_py: Option<&str>, stdin_buf: &str) {
             return;
         }
     }
-    pretool_allow();
+    emit_pretool_allow(host);
 }
 
 enum SimpleCmdOutcome {
@@ -4042,10 +4123,10 @@ fn build_mandala_wrapper_cmd(cmd_line: &str, cwd: &str) -> String {
 }
 
 
-fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str, guard_override: Option<&str>) {
+fn run_pre_tool_non_agy(fallback_py: Option<&str>, host: HostKind, event: &str, stdin_buf: &str, guard_override: Option<&str>) {
     let payload = extract_top_level_fields(
         stdin_buf,
-        &["tool_name", "tool_input", "command", "file_path", "path", "server_name", "hook_event_name", "session_id", "conversation_id", "cwd"],
+        &["tool_name", "tool_input", "command", "file_path", "path", "server_name", "hook_event_name", "session_id", "conversation_id", "cwd", "workspace_roots"],
     );
     let raw_event = if !event.is_empty() {
         event
@@ -4096,6 +4177,10 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str, guard_over
 
     // 1b. Cursor Read bounding: clamp unbounded huge text/wide-JSONL reads via adaptive grimoire_profile.json
     if host == HostKind::Cursor && matches!(tool_name, "Read" | "read_file") {
+        if env::var("WM_READ_CLAMP_OFF").ok().as_deref() == Some("1") {
+            emit_pretool_allow(host);
+            return;
+        }
         let has_explicit_limit = ti_fields
             .get("limit")
             .map(|s| !s.trim().is_empty() && s.trim() != "null")
@@ -4113,7 +4198,25 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str, guard_over
                 let is_media = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".svg"]
                     .iter()
                     .any(|ext| low.ends_with(ext));
-                let p_obj = Path::new(raw_p);
+                let p_exp = expand_tilde(raw_p);
+                let resolved_p = if Path::new(&p_exp).is_absolute() {
+                    posix_normpath(&p_exp)
+                } else {
+                    let mut base_cwd = payload.get("cwd").cloned().unwrap_or_default();
+                    if base_cwd.is_empty() {
+                        if let Some(roots) = payload.get("workspace_roots") {
+                            if let Some(first) = extract_json_array_elements(roots, 1).into_iter().next() {
+                                base_cwd = first;
+                            }
+                        }
+                    }
+                    if !base_cwd.is_empty() && Path::new(&base_cwd).is_dir() {
+                        posix_normpath(&format!("{}/{}", base_cwd.trim_end_matches('/'), p_exp))
+                    } else {
+                        p_exp
+                    }
+                };
+                let p_obj = Path::new(&resolved_p);
                 if !is_media && p_obj.is_file() {
                     if let Ok(meta) = fs::metadata(p_obj) {
                         let sz = meta.len();
@@ -4131,13 +4234,25 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str, guard_over
                                 .get("offset")
                                 .and_then(|s| s.trim().parse::<i64>().ok())
                                 .unwrap_or(1);
-                            println!(
-                                "{{\"permission\":\"allow\",\"updated_input\":{{\"{}\":\"{}\",\"offset\":{},\"limit\":{}}}}}",
-                                path_key,
-                                json_escape(raw_p),
-                                off,
-                                lim
-                            );
+                            let updated_obj = if ti_raw.trim_start().starts_with('{') {
+                                upsert_json_object_raw(
+                                    ti_raw,
+                                    &[
+                                        (path_key, format!("\"{}\"", json_escape(raw_p))),
+                                        ("offset", off.to_string()),
+                                        ("limit", lim.to_string()),
+                                    ],
+                                )
+                            } else {
+                                format!(
+                                    "{{\"{}\":\"{}\",\"offset\":{},\"limit\":{}}}",
+                                    path_key,
+                                    json_escape(raw_p),
+                                    off,
+                                    lim
+                                )
+                            };
+                            println!("{{\"permission\":\"allow\",\"updated_input\":{}}}", updated_obj);
                             return;
                         }
                     }
@@ -4150,7 +4265,7 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str, guard_over
 
     // 2. MCP execution guard (Cursor beforeMCPExecution / Codex custom MCP calls)
     if host == HostKind::Cursor && raw_event == "beforeMCPExecution" {
-        if !ti_raw.is_empty() && contains_kekkai_sensitive(ti_raw) {
+        if !ti_raw.is_empty() && (contains_static_secret_ref(ti_raw) || contains_kekkai_sensitive(ti_raw)) {
             emit_pretool_decision(host, "force_ask", "[Kekkai Guard] MCP payload references sensitive credentials or protected paths; confirm explicitly.");
             return;
         }
@@ -4191,7 +4306,7 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str, guard_over
             emit_pretool_decision(host, "force_ask", &msg);
             return;
         }
-        if contains_kekkai_sensitive(cmd_line) {
+        if contains_static_secret_ref(cmd_line) || contains_kekkai_sensitive(cmd_line) {
             emit_pretool_decision(
                 host,
                 "force_ask",
@@ -4213,7 +4328,7 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str, guard_over
         emit_pretool_decision(host, "force_ask", &msg);
         return;
     }
-    if contains_kekkai_sensitive(cmd_line) {
+    if contains_static_secret_ref(cmd_line) || contains_kekkai_sensitive(cmd_line) {
         if host == HostKind::Cursor {
             emit_pretool_allow(host);
             return;
@@ -4227,14 +4342,16 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str, guard_over
     }
 
     match classify_run_command_rs(cmd_line) {
-        SimpleCmdOutcome::Rewrite(rewritten) => emit_pretool_rewrite_cmd(host, cmd_key, &rewritten),
+        SimpleCmdOutcome::Rewrite(rewritten) => emit_pretool_rewrite_cmd(host, cmd_key, &rewritten, ti_raw),
         SimpleCmdOutcome::DelegatePy | SimpleCmdOutcome::AllowAsIs => {
             let guard = resolve_mandala_guard_mode(guard_override);
             let can_rewrite = host == HostKind::Codex || (host == HostKind::Cursor && raw_event == "preToolUse");
             if can_rewrite && should_mandala_wrap_cmd(&guard, cmd_line) {
                 let cwd_str = payload.get("cwd").map(|s| s.as_str()).unwrap_or("");
                 let wrapped = build_mandala_wrapper_cmd(cmd_line, cwd_str);
-                emit_pretool_rewrite_cmd(host, cmd_key, &wrapped);
+                emit_pretool_rewrite_cmd(host, cmd_key, &wrapped, ti_raw);
+            } else if matches!(classify_run_command_rs(cmd_line), SimpleCmdOutcome::DelegatePy) {
+                run_py_fallback_host(fallback_py, stdin_buf, host, raw_event);
             } else {
                 emit_pretool_allow(host);
             }
@@ -4253,7 +4370,7 @@ fn run_pre_tool(fallback_py: Option<&str>, host: HostKind, event: Option<&str>, 
         return;
     }
     if host != HostKind::Agy {
-        run_pre_tool_non_agy(host, event.unwrap_or(""), &stdin_buf, guard_override);
+        run_pre_tool_non_agy(fallback_py, host, event.unwrap_or(""), &stdin_buf, guard_override);
         return;
     }
 
