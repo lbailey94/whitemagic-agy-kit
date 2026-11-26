@@ -7,6 +7,7 @@ Stdlib-only loopback ThreadingHTTPServer providing:
   - GET /api/status
   - GET /api/crystals
   - GET /api/receipts
+  - GET /api/webmcp & /.well-known/webmcp.json (Declarative/Imperative WebMCP manifest)
   - POST /api/receipt (validates wm-receipt/1.2 | wm-confinement-receipt/1.1 + optional HMAC-SHA256)
 """
 from __future__ import annotations
@@ -26,6 +27,54 @@ from pathlib import Path
 
 VERSION = "4.6.0"
 MAX_RECEIPT_BYTES = 16384
+
+WEBMCP_MANIFEST = {
+    "schema": "webmcp/1.0",
+    "server": "wm-sidecar",
+    "version": VERSION,
+    "tools": [
+        {
+            "name": "wm_sidecar_status",
+            "description": "Refresh live telemetry, cache warmth, squeeze savings, and ready handoff crystals.",
+            "method": "GET",
+            "path": "/api/status",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "annotations": {"readOnlyHint": True, "idempotentHint": True},
+        },
+        {
+            "name": "wm_sidecar_crystals",
+            "description": "List cached handoff crystals from wm-handoff.",
+            "method": "GET",
+            "path": "/api/crystals",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "annotations": {"readOnlyHint": True, "idempotentHint": True},
+        },
+        {
+            "name": "wm_sidecar_receipts",
+            "description": "List recent verified CPR bridge ledger receipts.",
+            "method": "GET",
+            "path": "/api/receipts",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "annotations": {"readOnlyHint": True, "idempotentHint": True},
+        },
+        {
+            "name": "wm_sidecar_verify_receipt",
+            "description": "Verify and optionally record a CPR wm-receipt/1.2 JSON payload.",
+            "method": "POST",
+            "path": "/api/receipt",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "receipt": {"type": "object", "description": "CPR receipt JSON object"},
+                    "dry_run": {"type": "boolean", "description": "Verify without appending ledger"},
+                },
+                "required": ["receipt"],
+                "additionalProperties": False,
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": False},
+        },
+    ],
+}
 
 
 def _handoff_cache_dir() -> Path:
@@ -250,6 +299,12 @@ DASHBOARD_HTML = """<!doctype html>
   li { padding: 6px 0; border-top: 1px solid var(--bd); font-size: 12px; }
   li:first-child { border-top: 0; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; background: #0d1117; padding: 1px 4px; border-radius: 4px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  button { background: #1f6feb; color: #fff; border: 0; border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer; }
+  button:hover { background: #388bfd; }
+  textarea { width: 100%; box-sizing: border-box; background: #0d1117; color: var(--fg); border: 1px solid var(--bd); border-radius: 6px; padding: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; margin-bottom: 6px; }
+  label.chk { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; }
+  pre#verify-out { margin: 6px 0 0; font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
 </style>
 </head>
 <body>
@@ -263,6 +318,23 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="card"><h2>Ready Handoff Crystals (wm-reset)</h2><ul id="list-crystals"></ul></div>
   <div class="card"><h2>Recent CPR Ledger (wm-receipt/1.2)</h2><ul id="list-receipts"></ul></div>
   <div class="card"><h2>Recent Turn Telemetry</h2><ul id="list-stops"></ul></div>
+  <div class="card">
+    <h2>WebMCP Interactive Controls</h2>
+    <div class="row">
+      <form id="form-status" toolname="wm_sidecar_status" tooldescription="Refresh telemetry, cache warmth, squeeze savings, and ready handoff crystals." toolautosubmit>
+        <button id="btn-refresh" type="submit">Refresh Telemetry</button>
+      </form>
+      <a href="/api/webmcp" style="font-size:11px;color:var(--accent);text-decoration:none;">/api/webmcp</a>
+    </div>
+    <form id="form-verify" method="post" action="/api/receipt" toolname="wm_sidecar_verify_receipt" tooldescription="Verify and optionally record a CPR wm-receipt/1.2 JSON payload.">
+      <textarea id="receipt-input" name="receipt_json" rows="3" placeholder='{"schema":"wm-receipt/1.2",...}'></textarea>
+      <div class="row">
+        <label class="chk"><input id="verify-dry" type="checkbox" name="dry_run"> Dry-run verify only</label>
+        <button id="btn-verify" type="submit">Verify Receipt</button>
+      </div>
+    </form>
+    <pre id="verify-out"></pre>
+  </div>
 <script>
 function setList(el, items, emptyText, renderFn) {
   while (el.firstChild) el.removeChild(el.firstChild);
@@ -306,6 +378,75 @@ async function refresh() {
 }
 refresh();
 setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+document.getElementById("form-status").addEventListener("submit", (e) => {
+  e.preventDefault();
+  refresh();
+});
+document.getElementById("form-verify").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const out = document.getElementById("verify-out");
+  let parsed;
+  try {
+    parsed = JSON.parse(document.getElementById("receipt-input").value || "{}");
+  } catch (err) {
+    out.textContent = "Invalid JSON: " + String(err);
+    return;
+  }
+  const suffix = document.getElementById("verify-dry").checked ? "?recorded=1" : "";
+  try {
+    const res = await fetch("/api/receipt" + suffix, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(parsed),
+    });
+    const body = await res.json();
+    out.textContent = JSON.stringify(body, null, 2);
+    if (res.ok) refresh();
+  } catch (err) {
+    out.textContent = "Request failed: " + String(err);
+  }
+});
+try {
+  if (navigator.modelContext && typeof navigator.modelContext.registerTool === "function") {
+    navigator.modelContext.registerTool({
+      name: "wm_sidecar_status",
+      description: "Read live telemetry, cache warmth, squeeze savings, and ready handoff crystals.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: async () => (await fetch("/api/status", { cache: "no-store" })).json(),
+    });
+    navigator.modelContext.registerTool({
+      name: "wm_sidecar_crystals",
+      description: "List cached handoff crystals from wm-handoff.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: async () => (await fetch("/api/crystals", { cache: "no-store" })).json(),
+    });
+    navigator.modelContext.registerTool({
+      name: "wm_sidecar_receipts",
+      description: "List recent verified CPR bridge ledger receipts.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: async () => (await fetch("/api/receipts", { cache: "no-store" })).json(),
+    });
+    navigator.modelContext.registerTool({
+      name: "wm_sidecar_verify_receipt",
+      description: "Verify and optionally record a CPR wm-receipt/1.2 JSON payload.",
+      inputSchema: {
+        type: "object",
+        properties: { receipt: { type: "object" }, dry_run: { type: "boolean" } },
+        required: ["receipt"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        const suffix = input && input.dry_run ? "?recorded=1" : "";
+        const res = await fetch("/api/receipt" + suffix, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify((input && input.receipt) || {}),
+        });
+        return res.json();
+      },
+    });
+  }
+} catch (e) {}
 </script>
 </body>
 </html>
@@ -351,6 +492,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
         elif path == "/api/receipts":
             rows = _read_jsonl_tail(_bridge_ledger_path(), 30)
             self._send_json(200, {"ok": True, "receipts": list(reversed(rows))})
+        elif path in ("/api/webmcp", "/.well-known/webmcp.json"):
+            self._send_json(200, WEBMCP_MANIFEST)
         else:
             self._send_json(404, {"ok": False, "error": "Not found"})
 

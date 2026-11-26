@@ -1996,7 +1996,25 @@ def test_v451_sidecar_cpr_bridge_and_plugin_scoping():
                 check("sidecar GET /healthz 200 ok", r.status == 200 and hz.get("ok") is True and hz.get("version") == "4.6.0")
             with urllib.request.urlopen(f"{url}/", timeout=2) as r:
                 html = r.read().decode("utf-8")
-                check("sidecar GET / serves no-store UI", r.status == 200 and "WhiteMagic AGY Telemetry" in html and r.headers.get("Cache-Control") == "no-store")
+                check(
+                    "sidecar GET / serves no-store UI with Declarative WebMCP controls",
+                    r.status == 200
+                    and "WhiteMagic AGY Telemetry" in html
+                    and r.headers.get("Cache-Control") == "no-store"
+                    and 'toolname="wm_sidecar_status"' in html
+                    and 'toolname="wm_sidecar_verify_receipt"' in html
+                    and "navigator.modelContext" in html,
+                )
+            for wmcp_path in ("/api/webmcp", "/.well-known/webmcp.json"):
+                with urllib.request.urlopen(f"{url}{wmcp_path}", timeout=2) as r:
+                    wmcp = json.loads(r.read())
+                    tool_names = {t.get("name") for t in (wmcp.get("tools") or [])}
+                    check(
+                        f"sidecar GET {wmcp_path} returns webmcp/1.0 manifest",
+                        r.status == 200
+                        and wmcp.get("schema") == "webmcp/1.0"
+                        and {"wm_sidecar_status", "wm_sidecar_crystals", "wm_sidecar_receipts", "wm_sidecar_verify_receipt"}.issubset(tool_names),
+                    )
             with urllib.request.urlopen(f"{url}/api/status", timeout=2) as r:
                 st_j = json.loads(r.read())
                 check("sidecar GET /api/status returns valid payload", st_j.get("ok") is True and "telemetry" in st_j and "wm_squeeze" in st_j)
