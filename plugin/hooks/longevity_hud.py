@@ -155,6 +155,11 @@ def main():
         t_last = last_pr.get("ts")
         idle_secs = int(t_last - t_prev) if (t_prev is not None and t_last is not None and t_last > t_prev) else 0
 
+        is_neon = "neon" in cur_model.lower()
+        warn_thresh = 100_000 if is_neon else 120_000
+        cliff_thresh = 120_000 if is_neon else 200_000
+        reset_thresh = 80_000 if is_neon else 90_000
+
         # Reset context-threshold flags after compaction or context shrink
         prev_epoch = int(state.get("epoch") or 0)
         if checkpoints > prev_epoch:
@@ -162,7 +167,7 @@ def main():
             state["warned_200k"] = False
             state["flip_count"] = 0
             state["flip_unc_total"] = 0
-        elif cur_ctx < 90_000:
+        elif cur_ctx < reset_thresh:
             state["warned_120k"] = False
             state["warned_200k"] = False
         state["epoch"] = max(prev_epoch, checkpoints)
@@ -200,18 +205,30 @@ def main():
 
         # 2. App/IDE context thresholds & cold-resume misses (CLI already renders statusLine)
         if (not is_cli) or hud_cli_full:
-            if cur_ctx >= 200_000 and not state.get("warned_200k"):
-                alerts.append(
-                    f"🔴 **Context Cliff (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% cache hit):** "
-                    f"High re-prefill cost on any idle gap. Run `/compact` or `wm-handoff` soon.{crystal_short}"
-                )
+            if cur_ctx >= cliff_thresh and not state.get("warned_200k"):
+                if is_neon:
+                    alerts.append(
+                        f"🔴 **Neon Rollover Target (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% cache hit):** "
+                        f"Neon KV TTL decays fast past 120k. Run `/compact` or `wm-handoff` → fresh chat now.{crystal_short}"
+                    )
+                else:
+                    alerts.append(
+                        f"🔴 **Context Cliff (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% cache hit):** "
+                        f"High re-prefill cost on any idle gap. Run `/compact` or `wm-handoff` soon.{crystal_short}"
+                    )
                 state["warned_200k"] = True
                 state["warned_120k"] = True
-            elif cur_ctx >= 120_000 and not state.get("warned_120k"):
-                alerts.append(
-                    f"🟡 **Context Watch (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% cache hit):** "
-                    f"Run `/compact` or `wm-handoff` before stepping away >5m.{crystal_short}"
-                )
+            elif cur_ctx >= warn_thresh and not state.get("warned_120k"):
+                if is_neon:
+                    alerts.append(
+                        f"🟡 **Neon Context Watch (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% cache hit):** "
+                        f"Approaching 120k Neon rollover target. Keep turns <30s TTL or prepare `wm-handoff`.{crystal_short}"
+                    )
+                else:
+                    alerts.append(
+                        f"🟡 **Context Watch (~{cur_ctx / 1000:.0f}k tok · {hit_pct:.0f}% cache hit):** "
+                        f"Run `/compact` or `wm-handoff` before stepping away >5m.{crystal_short}"
+                    )
                 state["warned_120k"] = True
 
             last_cold_inv = int(state.get("last_cold_inv", -99))

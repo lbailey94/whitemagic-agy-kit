@@ -1993,7 +1993,7 @@ def test_v451_sidecar_cpr_bridge_and_plugin_scoping():
 
             with urllib.request.urlopen(f"{url}/healthz", timeout=2) as r:
                 hz = json.loads(r.read())
-                check("sidecar GET /healthz 200 ok", r.status == 200 and hz.get("ok") is True and hz.get("version") == "4.6.0")
+                check("sidecar GET /healthz 200 ok", r.status == 200 and hz.get("ok") is True and hz.get("version") == "4.7.0")
             with urllib.request.urlopen(f"{url}/", timeout=2) as r:
                 html = r.read().decode("utf-8")
                 check(
@@ -2360,7 +2360,7 @@ def test_v460_multihost_codex_cursor_and_cpr_translate():
                 sc_ok = resp.status == 201
             with urllib.request.urlopen(f"{info['url']}/api/status", timeout=2) as resp2:
                 st_j = json.loads(resp2.read().decode("utf-8"))
-            check("sidecar v4.6.0 accepts mandala-cpr-pointer/0.5 & reports version", sc_ok and st_j.get("version") == "4.6.0", str(st_j.get("version")))
+            check("sidecar v4.7.0 accepts mandala-cpr-pointer/0.5 & reports version", sc_ok and st_j.get("version") == "4.7.0", str(st_j.get("version")))
         finally:
             sc_proc.send_signal(signal.SIGTERM)
             sc_proc.wait(timeout=4)
@@ -2541,6 +2541,239 @@ def test_c2_grimoire_profiles_mandala_exec_and_sidecar_telemetry():
             sc_proc.wait(timeout=4)
 
 
+def test_v470_ultra_efficiency_cockpit_neon_and_spool():
+    print("\n16. v4.7.0 Live Cockpit, --breakdown, Neon 100k/120k Rollover & Crystal Spool:")
+    import signal
+    import urllib.request
+
+    audit_bin = KIT / "bin" / "agy-token-audit"
+    handoff_bin = KIT / "bin" / "wm-handoff"
+    hud_py = _HOOKS_DIR / "longevity_hud.py"
+    sidecar_py = KIT / "plugin" / "sidecars" / "wm-sidecar" / "server.py"
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        app_brain = td_path / "app_brain"
+        coord_id = "11111111-2222-3333-4444-555555555555"
+        worker_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        coord_tp = app_brain / coord_id / ".system_generated" / "logs" / "transcript.jsonl"
+        worker_tp = app_brain / worker_id / ".system_generated" / "logs" / "transcript.jsonl"
+        coord_tp.parent.mkdir(parents=True)
+        worker_tp.parent.mkdir(parents=True)
+
+        # Synthetic transcript exercising all 5 uncached buckets + swarm worker spawn
+        coord_tp.write_text(
+            "\n".join([
+                json.dumps({"type": "USER_INPUT", "content": "Execute Ultra-Efficiency Wave v4.7.0"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-xhigh", "input_tokens": 16000, "cache_read_tokens": 0, "output_tokens": 400, "created_at": "2026-11-26T20:00:00Z"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-xhigh", "input_tokens": 4000, "cache_read_tokens": 86000, "output_tokens": 500, "created_at": "2026-11-26T20:00:10Z", "tool_calls": [{"name": "swarm", "args": {"action": "add", "name": "lane-1"}}]}),
+                json.dumps({"type": "GENERIC", "content": json.dumps({"status": "added", "name": "lane-1", "conversation_id": worker_id})}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-xhigh", "input_tokens": 95000, "cache_read_tokens": 0, "output_tokens": 300, "created_at": "2026-11-26T20:00:20Z"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-xhigh", "input_tokens": 80000, "cache_read_tokens": 15000, "output_tokens": 250, "created_at": "2026-11-26T20:04:00Z"}),
+                json.dumps({"type": "CHECKPOINT", "content": "compacted"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-xhigh", "input_tokens": 20000, "cache_read_tokens": 20000, "output_tokens": 200, "created_at": "2026-11-26T20:04:10Z"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-xhigh", "input_tokens": 25000, "cache_read_tokens": 45000, "output_tokens": 200, "created_at": "2026-11-26T20:04:20Z"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-xhigh", "input_tokens": 3000, "cache_read_tokens": 102000, "output_tokens": 200, "created_at": "2026-11-26T20:04:30Z"}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        worker_tp.write_text(
+            json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-high", "input_tokens": 13500, "cache_read_tokens": 32000, "output_tokens": 350, "created_at": "2026-11-26T20:04:25Z"}) + "\n",
+            encoding="utf-8",
+        )
+        os.utime(worker_tp, (time.time() - 5, time.time() - 5))
+
+        # 16a) agy-token-audit --breakdown --session --json exact accounting across all 5 buckets
+        env_brain = {**os.environ, "WM_AGY_APP_BRAIN": str(app_brain), "WM_AGY_IDE_BRAIN": str(td_path / "none1"), "WM_AGY_CLI_BRAIN": str(td_path / "none2")}
+        r_bd = subprocess.run([sys.executable, "-S", str(audit_bin), "--breakdown", "--session", coord_id[:8], "--json"], capture_output=True, text=True, env=env_brain, timeout=5)
+        bd_j = json.loads(r_bd.stdout) if r_bd.returncode == 0 else {}
+        bd_map = bd_j.get("breakdown") or {}
+        tot_unc = (bd_j.get("aggregate") or {}).get("tot_unc", -1)
+        tot_turns = (bd_j.get("aggregate") or {}).get("turns", -1)
+        sum_b_tok = sum(int(v.get("tokens") or 0) for v in bd_map.values())
+        sum_b_trn = sum(int(v.get("turns") or 0) for v in bd_map.values())
+        check(
+            "agy-token-audit --breakdown exact 5-bucket accounting",
+            r_bd.returncode == 0
+            and sum_b_tok == tot_unc
+            and sum_b_trn == tot_turns
+            and all(bd_map.get(k, {}).get("tokens", 0) > 0 for k in ("flips", "ttl_expiries", "warm_work", "compactions_partial", "turn_0")),
+            f"tot={tot_unc} sum={sum_b_tok} bd={bd_map}",
+        )
+        r_bd_txt = subprocess.run([sys.executable, "-S", str(audit_bin), "--breakdown", "--session", coord_id[:8]], capture_output=True, text=True, env=env_brain, timeout=5)
+        check(
+            "agy-token-audit --breakdown table lists all 5 bucket labels",
+            r_bd_txt.returncode == 0 and all(lbl in r_bd_txt.stdout for lbl in ("Flips", "TTL Expiries", "Warm Work", "Partial/Compactions", "Turn-0")),
+        )
+
+        # 16b) Neon 100k warn / 120k rollover parity (Python longevity_hud.py == Rust wm-squeeze --hud)
+        neon_tp = td_path / ".gemini" / "antigravity" / "brain" / "neon-hud" / ".system_generated" / "logs" / "transcript.jsonl"
+        neon_tp.parent.mkdir(parents=True)
+        neon_state_py = td_path / "hud_py"
+        neon_state_rs = td_path / "hud_rs"
+        neon_tp.write_text(json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-xhigh", "input_tokens": 5000, "cache_read_tokens": 90000, "step_index": 1}) + "\n", encoding="utf-8")
+        _, out_py_95, _, _ = run_hook(hud_py, {"conversationId": "neon-1", "transcriptPath": str(neon_tp), "invocationNum": 1}, env_extra={"WM_HOOK_STATE_DIR": str(neon_state_py)})
+        p_rs_95 = subprocess.run([str(WM_SQUEEZE), "--hud"], input=json.dumps({"conversationId": "neon-1", "transcriptPath": str(neon_tp), "invocationNum": 1}), capture_output=True, text=True, env={**os.environ, "WM_HOOK_STATE_DIR": str(neon_state_rs)}, timeout=5)
+        check("Neon HUD 95k -> silent {} (Py & Rust)", json.loads(out_py_95) == {} and json.loads(p_rs_95.stdout) == {})
+
+        neon_tp.write_text(neon_tp.read_text(encoding="utf-8") + json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-xhigh", "input_tokens": 5000, "cache_read_tokens": 100000, "step_index": 2}) + "\n", encoding="utf-8")
+        _, out_py_105, _, _ = run_hook(hud_py, {"conversationId": "neon-1", "transcriptPath": str(neon_tp), "invocationNum": 2}, env_extra={"WM_HOOK_STATE_DIR": str(neon_state_py)})
+        p_rs_105 = subprocess.run([str(WM_SQUEEZE), "--hud"], input=json.dumps({"conversationId": "neon-1", "transcriptPath": str(neon_tp), "invocationNum": 2}), capture_output=True, text=True, env={**os.environ, "WM_HOOK_STATE_DIR": str(neon_state_rs)}, timeout=5)
+        um_py_105 = json.loads(out_py_105).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", "")
+        um_rs_105 = json.loads(p_rs_105.stdout).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", "")
+        check("Neon HUD 105k -> Neon Context Watch (exact Py/Rust parity)", "Neon Context Watch" in um_py_105 and um_py_105 == um_rs_105, f"py={um_py_105!r} rs={um_rs_105!r}")
+
+        neon_tp.write_text(neon_tp.read_text(encoding="utf-8") + json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-neon-xhigh", "input_tokens": 5000, "cache_read_tokens": 120000, "step_index": 3}) + "\n", encoding="utf-8")
+        _, out_py_125, _, _ = run_hook(hud_py, {"conversationId": "neon-1", "transcriptPath": str(neon_tp), "invocationNum": 3}, env_extra={"WM_HOOK_STATE_DIR": str(neon_state_py)})
+        p_rs_125 = subprocess.run([str(WM_SQUEEZE), "--hud"], input=json.dumps({"conversationId": "neon-1", "transcriptPath": str(neon_tp), "invocationNum": 3}), capture_output=True, text=True, env={**os.environ, "WM_HOOK_STATE_DIR": str(neon_state_rs)}, timeout=5)
+        um_py_125 = json.loads(out_py_125).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", "")
+        um_rs_125 = json.loads(p_rs_125.stdout).get("injectSteps", [{}])[0].get("systemMessage", {}).get("metadata", {}).get("user_markdown", "")
+        check("Neon HUD 125k -> Neon Rollover Target (exact Py/Rust parity)", "Neon Rollover Target" in um_py_125 and um_py_125 == um_rs_125, f"py={um_py_125!r} rs={um_rs_125!r}")
+
+        # 16c) stop_telemetry Neon 125k auto-crystal + pending_crystals.jsonl spool + --flush-wm3 dedup/fail-preserve
+        spool_file = td_path / "pending_crystals.jsonl"
+        cache_dir = td_path / "cache"
+        cache_dir.mkdir()
+        tel_file = td_path / "tel.jsonl"
+        env_sp = {
+            **env_brain,
+            "WM_AGY_TELEMETRY": str(tel_file),
+            "WM_HANDOFF_CACHE_DIR": str(cache_dir),
+            "WM_HANDOFF_BIN": str(handoff_bin),
+            "WM_PENDING_CRYSTALS": str(spool_file),
+            "WM_GRIMOIRE_PROFILE": str(td_path / "no_grimoire.json"),
+        }
+        run_hook(STOP_HOOK, {"transcriptPath": str(neon_tp), "conversationId": "neon-stop-1", "cwd": str(KIT), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"}, env_extra=env_sp)
+        tel_rec = json.loads(tel_file.read_text(encoding="utf-8").splitlines()[-1]) if tel_file.is_file() else {}
+        spool_rows = [json.loads(l) for l in spool_file.read_text(encoding="utf-8").splitlines() if l.strip()] if spool_file.is_file() else []
+        check(
+            "stop_telemetry Neon 125k marks rollover, auto-crystallizes & spools to pending_crystals.jsonl",
+            tel_rec.get("neon_rollover_recommended") is True
+            and (cache_dir / "latest_neon-stop-1.md").is_file()
+            and len(spool_rows) == 1
+            and spool_rows[0].get("schema") == "wm-crystal-spool/1.0"
+            and spool_rows[0].get("source") == "stop_telemetry",
+            f"tel={tel_rec} spool_n={len(spool_rows)}",
+        )
+
+        # Mock wm3 binary supporting both remember & recall --inspect-promise strict-zero-write
+        mock_store = td_path / "mock_gen3"
+        mock_store.mkdir()
+        wm3_log = td_path / "wm3_calls.jsonl"
+        mock_wm3 = td_path / "mock_wm3.py"
+        mock_wm3.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\nfrom pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            f"Path({str(wm3_log)!r}).open('a').write(json.dumps(args) + '\\n')\n"
+            "if 'serve' in args:\n    sys.exit(1)\n"
+            "if os.environ.get('MOCK_WM3_FAIL') == '1' and 'remember' in args:\n    sys.stderr.write('LMDB busy\\n')\n    sys.exit(1)\n"
+            "if 'recall' in args:\n    print(json.dumps({'results': [{'id': 'rec-42', 'score': 0.99, 'source': 'gen3_mock', 'content': 'Ultra-Efficiency Wave cockpit note'}]}))\n    sys.exit(0)\n"
+            "print('OK')\n",
+            encoding="utf-8",
+        )
+        mock_wm3.chmod(0o755)
+        env_wm3 = {**env_sp, "WM3_BIN": str(mock_wm3), "WM3_STORE": str(mock_store), "WM3_RECALL_MODE": "cli"}
+
+        r_dry = subprocess.run([sys.executable, "-S", str(handoff_bin), "--flush-wm3", "--dry-run", "--json"], capture_output=True, text=True, env=env_wm3, timeout=5)
+        dry_j = json.loads(r_dry.stdout) if r_dry.returncode == 0 else {}
+        check("wm-handoff --flush-wm3 --dry-run previews pending without consuming spool", dry_j.get("to_flush") == 1 and spool_file.stat().st_size > 0)
+
+        r_fl1 = subprocess.run([sys.executable, "-S", str(handoff_bin), "--flush-wm3", "--json"], capture_output=True, text=True, env=env_wm3, timeout=5)
+        fl1_j = json.loads(r_fl1.stdout) if r_fl1.returncode == 0 else {}
+        check("wm-handoff --flush-wm3 ingests spooled crystal & drains spool", r_fl1.returncode == 0 and fl1_j.get("flushed") == 1 and fl1_j.get("remaining") == 0)
+
+        # Re-spool same crystal -> idempotent dedup skips duplicate
+        subprocess.run([sys.executable, "-S", str(handoff_bin), "--transcript", str(neon_tp), "--cwd", str(KIT), "--out", str(cache_dir / "dup.md"), "--spool"], capture_output=True, text=True, env=env_wm3, timeout=5)
+        r_fl2 = subprocess.run([sys.executable, "-S", str(handoff_bin), "--flush-wm3", "--json"], capture_output=True, text=True, env=env_wm3, timeout=5)
+        fl2_j = json.loads(r_fl2.stdout) if r_fl2.returncode == 0 else {}
+        check("wm-handoff --flush-wm3 deduplicates already-flushed sha256", r_fl2.returncode == 0 and fl2_j.get("flushed") == 0 and fl2_j.get("skipped_dup") == 1)
+
+        # Failing wm3 write preserves crystal in pending_crystals.jsonl
+        subprocess.run([sys.executable, "-S", str(handoff_bin), "--transcript", str(coord_tp), "--cwd", str(KIT), "--out", str(cache_dir / "keep.md"), "--spool"], capture_output=True, text=True, env=env_wm3, timeout=5)
+        r_fl_fail = subprocess.run([sys.executable, "-S", str(handoff_bin), "--flush-wm3", "--json"], capture_output=True, text=True, env={**env_wm3, "MOCK_WM3_FAIL": "1"}, timeout=5)
+        flf_j = json.loads(r_fl_fail.stdout) if r_fl_fail.stdout.strip().startswith("{") else {}
+        check("wm-handoff --flush-wm3 preserves failed entries on LMDB error", r_fl_fail.returncode == 1 and flf_j.get("failed") == 1 and flf_j.get("remaining") == 1)
+
+        # 16d) Live wm-sidecar v4.7.0 cockpit (/api/live + 4 one-click loopback POST actions)
+        cfg_dir = td_path / "agy_cfg"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.json").write_text(json.dumps({"plugins": {"whitemagic-agy-kit": {"enabled": True}, "chrome-devtools-plugin": {"enabled": False}}}), encoding="utf-8")
+        (cfg_dir / "mcp_config.json").write_text(
+            json.dumps({"mcpServers": {"whitemagic": {"args": ["serve", "--readonly"], "tools": {"memory_recall": {"eager": True}, "session_checkpoint": {"eager": True}}}}}),
+            encoding="utf-8",
+        )
+        sc_env = {**env_wm3, "ANTIGRAVITY_SIDECAR_WEB_PORT": "0", "WM_AGY_CONFIG_DIR": str(cfg_dir)}
+        sc_proc = subprocess.Popen([sys.executable, "-S", "-B", str(sidecar_py)], env=sc_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            disc = cache_dir / "sidecar.json"
+            for _ in range(50):
+                if disc.is_file():
+                    break
+                time.sleep(0.05)
+            info = json.loads(disc.read_text(encoding="utf-8"))
+            url = info["url"]
+
+            with urllib.request.urlopen(f"{url}/api/live", timeout=3) as r:
+                lv = json.loads(r.read())
+            act = lv.get("active") or {}
+            worker_names = {w.get("name") for w in (lv.get("workers") or [])}
+            check(
+                "sidecar GET /api/live reports Neon ctx zone, TTL state, 5-bucket breakdown & swarm worker",
+                lv.get("ok") is True
+                and act.get("is_neon") is True
+                and act.get("ctx_zone") == "amber"
+                and act.get("ttl_state") in ("warm", "cooling", "cold")
+                and set((act.get("breakdown") or {}).keys()) == {"flips", "ttl_expiries", "warm_work", "compactions_partial", "turn_0"}
+                and "lane-1" in worker_names,
+                f"act={act.get('ctx_zone')}/{act.get('last_ctx')} workers={worker_names}",
+            )
+
+            req_ho = urllib.request.Request(f"{url}/api/actions/handoff", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req_ho, timeout=6) as r:
+                ho_j = json.loads(r.read())
+            check(
+                "sidecar POST /api/actions/handoff spools crystal & returns <=150-tok pointer",
+                ho_j.get("ok") is True and ho_j.get("spooled") is True and 0 < len((ho_j.get("pointer_prompt") or "").encode("utf-8")) <= 600,
+            )
+
+            req_t0 = urllib.request.Request(f"{url}/api/actions/audit-turn0", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req_t0, timeout=5) as r:
+                t0_j = json.loads(r.read())
+            check(
+                "sidecar POST /api/actions/audit-turn0 flags readonly eager conflict",
+                t0_j.get("ok") is True and "whitemagic/session_checkpoint" in (t0_j.get("readonly_eager_conflicts") or []),
+            )
+
+            req_rc = urllib.request.Request(f"{url}/api/actions/recall", data=json.dumps({"query": "Ultra-Efficiency Wave", "limit": 5}).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req_rc, timeout=6) as r:
+                rc_j = json.loads(r.read())
+            sources = {x.get("source") for x in (rc_j.get("results") or [])}
+            check(
+                "sidecar POST /api/actions/recall returns zero-LLM read-only gen3 + local spool hits",
+                rc_j.get("ok") is True and rc_j.get("zero_llm_tokens") is True and "gen3_mock" in sources and any(str(s).startswith("spool:") for s in sources),
+                f"sources={sources}",
+            )
+
+            req_fl = urllib.request.Request(f"{url}/api/actions/flush-spool", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req_fl, timeout=6) as r:
+                fls_j = json.loads(r.read())
+            check(
+                "sidecar POST /api/actions/flush-spool drains pending spool to 0",
+                fls_j.get("ok") is True and (fls_j.get("spool") or {}).get("pending_count") == 0,
+            )
+        finally:
+            sc_proc.send_signal(signal.SIGTERM)
+            sc_proc.wait(timeout=4)
+
+    # 16e) install.sh preserves lean Turn-0 eager defaults (no session_checkpoint/firecrawl_scrape eager)
+    inst_txt = (KIT / "install.sh").read_text(encoding="utf-8")
+    check(
+        "install.sh keeps session_checkpoint & firecrawl_scrape lazy (Turn-0 trim)",
+        'tools.pop("session_checkpoint"' in inst_txt and 'fc_tools.pop("firecrawl_scrape"' in inst_txt,
+    )
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="agy_hook_state_") as state_td:
         os.environ["WM_HOOK_STATE_DIR"] = state_td
@@ -2560,7 +2793,8 @@ def main():
         test_v451_sidecar_cpr_bridge_and_plugin_scoping()
         test_v460_multihost_codex_cursor_and_cpr_translate()
         test_c2_grimoire_profiles_mandala_exec_and_sidecar_telemetry()
-    print(f"\n=== Wave 3/4/v4.6.0 Test Summary: {PASS} passed, {FAIL} failed ===")
+        test_v470_ultra_efficiency_cockpit_neon_and_spool()
+    print(f"\n=== Wave 3/4/v4.7.0 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WhiteMagic Turbo Kit v4.6.0 — Idempotent Multi-Host Cross-Platform Installer (Antigravity, Codex, Cursor)
+# WhiteMagic Turbo Kit v4.7.0 — Idempotent Multi-Host Cross-Platform Installer (Antigravity, Codex, Cursor)
 # Installs:
 #   1. Zero-dependency Rust binaries `wm-squeeze` (multi-host `--host agy|codex|cursor`), `wm-codegraph`, & `muninn-engine` -> ~/.local/bin/
 #   2. Host adapters (`--hosts agy,codex,cursor` or `--hosts all`; default `agy`):
@@ -205,7 +205,7 @@ hp.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 print(f"Updated global {hp}")
 PY
 else
-    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.6.0 ==="
+    echo "=== 2. Installing unified native plugin: whitemagic-agy-kit v4.7.0 ==="
     if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
         echo "[WARN] Node.js (>=20) not found; fused 5-tool 'fast' MCP will fall back to 1-tool 'codegraph' MCP."
     fi
@@ -523,8 +523,11 @@ wm3 = shutil.which("wm3") or (str(home / ".local" / "bin" / "wm3") if (home / ".
 if wm3:
     entry = servers.setdefault("whitemagic", {"command": wm3, "args": ["serve", "--store", str(home / ".local" / "share" / "whitemagic" / "gen3")]})
     tools = entry.setdefault("tools", {})
-    for t in ("memory_recall", "memory_get", "session_continuity", "session_checkpoint"):
+    for t in ("memory_recall", "memory_get", "session_continuity"):
         tools.setdefault(t, {"eager": True})
+    # Turn-0 trim (v4.7.0): session_checkpoint is always refused on --readonly; keep it lazy
+    if "session_checkpoint" in tools:
+        tools.pop("session_checkpoint", None)
     changed = True
 
 grok_mcp = shutil.which("wm-grok-mcp") or (str(home / ".local" / "bin" / "wm-grok-mcp") if (home / ".local" / "bin" / "wm-grok-mcp").exists() else None)
@@ -540,8 +543,24 @@ if grok_mcp and ca_bin:
 fc = shutil.which("firecrawl-local-mcp") or (str(home / ".local" / "bin" / "firecrawl-local-mcp") if (home / ".local" / "bin" / "firecrawl-local-mcp").exists() else None)
 if fc:
     entry = servers.setdefault("firecrawl", {"command": fc, "disabled": False, "env": {"FIRECRAWL_CLOUD": "off"}})
-    entry.setdefault("tools", {}).setdefault("firecrawl_scrape", {"eager": True})
+    # Turn-0 trim (v4.7.0): keep firecrawl_scrape lazy-loaded on demand
+    fc_tools = entry.get("tools")
+    if isinstance(fc_tools, dict) and "firecrawl_scrape" in fc_tools:
+        fc_tools.pop("firecrawl_scrape", None)
+        if not fc_tools:
+            entry.pop("tools", None)
     changed = True
+
+# Turn-0 trim (v4.7.0): keep low-frequency wm-research-engine tools lazy-loaded
+if isinstance(servers.get("wm-research-engine"), dict):
+    re_tools = servers["wm-research-engine"].get("tools")
+    if isinstance(re_tools, dict):
+        for rt in ("research_hunt", "research_daydream"):
+            if rt in re_tools:
+                re_tools.pop(rt, None)
+                changed = True
+        if not re_tools:
+            servers["wm-research-engine"].pop("tools", None)
 
 if changed:
     mcp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -556,10 +575,13 @@ if wm_plugin_mcp.is_file():
         if "whitemagic_gen3" in pservers:
             ptools = pservers["whitemagic_gen3"].setdefault("tools", {})
             pchanged = False
-            for t in ("memory_recall", "session_continuity", "session_checkpoint"):
+            for t in ("memory_recall", "session_continuity"):
                 if t not in ptools:
                     ptools[t] = {"eager": True}
                     pchanged = True
+            if "session_checkpoint" in ptools:
+                ptools.pop("session_checkpoint", None)
+                pchanged = True
             if pchanged:
                 wm_plugin_mcp.write_text(json.dumps(pdata, indent=2) + "\n", encoding="utf-8")
                 print(f"Promoted selective eager Gen3 tools in {wm_plugin_mcp}")

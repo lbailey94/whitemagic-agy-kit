@@ -132,8 +132,19 @@ def main():
     used_pct = cw.get("used_percentage")
     in_tok = cw.get("total_input_tokens") or 0
     over_200k = bool(data.get("exceeds_200k_tokens"))
+    is_neon = "neon" in m_name.lower()
     if used_pct is not None or in_tok:
-        if over_200k or in_tok >= 180000:
+        if is_neon:
+            if over_200k or in_tok >= 120000:
+                c_col = RED
+                tip = " >120k rollover!"
+            elif in_tok >= 100000:
+                c_col = YELLOW
+                tip = " >100k"
+            else:
+                c_col = GREEN
+                tip = ""
+        elif over_200k or in_tok >= 180000:
             c_col = RED
             tip = " /compact!"
         elif in_tok >= 120000:

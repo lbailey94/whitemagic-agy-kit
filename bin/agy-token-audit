@@ -15,11 +15,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SURFACE_BRAINS = {
-    "app": Path.home() / ".gemini" / "antigravity" / "brain",
-    "ide": Path.home() / ".gemini" / "antigravity-ide" / "brain",
-    "cli": Path.home() / ".gemini" / "antigravity-cli" / "brain",
-}
+def _surface_brains() -> dict[str, Path]:
+    return {
+        "app": Path(os.environ.get("WM_AGY_APP_BRAIN") or str(Path.home() / ".gemini" / "antigravity" / "brain")),
+        "ide": Path(os.environ.get("WM_AGY_IDE_BRAIN") or str(Path.home() / ".gemini" / "antigravity-ide" / "brain")),
+        "cli": Path(os.environ.get("WM_AGY_CLI_BRAIN") or str(Path.home() / ".gemini" / "antigravity-cli" / "brain")),
+    }
+
+
+SURFACE_BRAINS = _surface_brains()
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 SWARM_NAME_CID_RE = re.compile(r'"name"\s*:\s*"([^"]+)"[^}]*?"conversation_id"\s*:\s*"([0-9a-f-]{36})"')
@@ -27,9 +31,10 @@ SWARM_CID_NAME_RE = re.compile(r'"conversation_id"\s*:\s*"([0-9a-f-]{36})"[^}]*?
 
 
 def find_transcript(conv_id: str, surface: str = "all") -> tuple[Path | None, str]:
+    brains = _surface_brains()
     surfaces = ("app", "ide", "cli") if surface == "all" else (surface,)
     for surf in surfaces:
-        bdir = SURFACE_BRAINS.get(surf)
+        bdir = brains.get(surf)
         if not bdir or not bdir.is_dir():
             continue
         tf = bdir / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
@@ -37,7 +42,7 @@ def find_transcript(conv_id: str, surface: str = "all") -> tuple[Path | None, st
             return tf, surf
     if len(conv_id) >= 6:
         for surf in surfaces:
-            bdir = SURFACE_BRAINS.get(surf)
+            bdir = brains.get(surf)
             if not bdir or not bdir.is_dir():
                 continue
             for tf in sorted(bdir.glob(f"{conv_id}*/.system_generated/logs/transcript.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -143,6 +148,20 @@ def audit_transcript(label: str, conv_id: str, surface: str = "all") -> dict[str
     enter_plan_count = 0
     one_turn_neon_plans = 0
     neon_streak = 0
+    last_ctx = 0
+    last_unc = 0
+    last_hit_pct = None
+    last_model = ""
+    last_ts_epoch: float | None = None
+    saw_checkpoint_since_prev = False
+    prev_ctx = 0
+    buckets: dict[str, dict[str, int]] = {
+        "turn_0": {"turns": 0, "tokens": 0},
+        "flips": {"turns": 0, "tokens": 0},
+        "ttl_expiries": {"turns": 0, "tokens": 0},
+        "compactions_partial": {"turns": 0, "tokens": 0},
+        "warm_work": {"turns": 0, "tokens": 0},
+    }
     read_files: set[str] = set()
     models: Counter[str] = Counter()
     tools: Counter[str] = Counter()
@@ -192,34 +211,71 @@ def audit_transcript(label: str, conv_id: str, surface: str = "all") -> dict[str
                             read_files.add(str(_unwrap_json_str(rp)))
             if has_toks:
                 turns += 1
+                ctx = u + c
+                turn_hit = (100.0 * c / ctx) if ctx > 0 else 0.0
                 if turns == 1:
                     t0_unc = u
                 unc_sum += u
                 cac_sum += c
                 out_sum += ot
+                if ctx > 0:
+                    last_ctx = ctx
+                    last_unc = u
+                    last_hit_pct = round(turn_hit, 1)
                 if u > max_unc:
                     max_unc = u
                 if m:
                     models[m] += 1
+                    last_model = m
                 flipped = bool(m and prev_model and m != prev_model)
                 if flipped:
                     flips += 1
                     flip_unc += u
-                if m:
-                    prev_model = m
+                gap_s = 0.0
                 ts_s = o.get("created_at") or o.get("timestamp")
                 if ts_s:
                     try:
                         dt = datetime.fromisoformat(str(ts_s).replace("Z", "+00:00"))
-                        if prev_ts is not None and (dt - prev_ts).total_seconds() >= 30.0:
-                            gaps30 += 1
-                            if not flipped:
-                                gap_unc += u
+                        last_ts_epoch = dt.timestamp()
+                        if prev_ts is not None:
+                            gap_s = max(0.0, (dt - prev_ts).total_seconds())
+                            if gap_s >= 30.0:
+                                gaps30 += 1
+                                if not flipped:
+                                    gap_unc += u
                         prev_ts = dt
                     except Exception:
                         pass
+
+                # Mutually exclusive, exhaustive uncached burn attribution
+                if turns == 1:
+                    bkey = "turn_0"
+                elif flipped:
+                    bkey = "flips"
+                elif (
+                    saw_checkpoint_since_prev
+                    or (prev_ctx >= 40_000 and ctx > 0 and ctx < int(prev_ctx * 0.85))
+                    or (50.0 <= turn_hit < 90.0 and u >= 15_000 and gap_s < 60.0)
+                ):
+                    bkey = "compactions_partial"
+                elif (
+                    (gap_s >= 60.0 and turn_hit < 85.0)
+                    or (gap_s >= 180.0 and u >= 25_000)
+                    or (turn_hit < 50.0 and ctx >= 50_000)
+                ):
+                    bkey = "ttl_expiries"
+                else:
+                    bkey = "warm_work"
+                buckets[bkey]["turns"] += 1
+                buckets[bkey]["tokens"] += u
+                saw_checkpoint_since_prev = False
+                if ctx > 0:
+                    prev_ctx = ctx
+                if m:
+                    prev_model = m
         elif t == "CHECKPOINT":
             compactions += 1
+            saw_checkpoint_since_prev = True
         elif t == "GENERIC":
             c = str(o.get("content") or "")
             low = c.lower()
@@ -229,6 +285,16 @@ def audit_transcript(label: str, conv_id: str, surface: str = "all") -> dict[str
                 spills += 1
 
     hit_pct = round(100.0 * cac_sum / max(unc_sum + cac_sum, 1), 1)
+    breakdown = {}
+    for bkey, bval in buckets.items():
+        btoks = bval["tokens"]
+        btrns = bval["turns"]
+        breakdown[bkey] = {
+            "turns": btrns,
+            "tokens": btoks,
+            "pct": round(100.0 * btoks / max(unc_sum, 1), 1) if unc_sum > 0 else 0.0,
+            "avg_per_turn": round(btoks / btrns) if btrns > 0 else 0,
+        }
     return {
         "label": label,
         "conv_id": tf.parents[2].name,
@@ -240,6 +306,11 @@ def audit_transcript(label: str, conv_id: str, surface: str = "all") -> dict[str
         "tot_unc": unc_sum,
         "tot_cac": cac_sum,
         "tot_out": out_sum,
+        "last_ctx": last_ctx,
+        "last_unc": last_unc,
+        "last_hit_pct": last_hit_pct,
+        "last_model": last_model,
+        "last_ts_epoch": last_ts_epoch,
         "max_unc": max_unc,
         "flips": flips,
         "flip_unc": flip_unc,
@@ -254,6 +325,7 @@ def audit_transcript(label: str, conv_id: str, surface: str = "all") -> dict[str
         "one_turn_neon_plans": one_turn_neon_plans,
         "unique_reads": len(read_files),
         "_read_files": read_files,
+        "breakdown": breakdown,
         "models": dict(models),
         "tools": dict(tools),
     }
@@ -273,6 +345,16 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     tot_cac = sum(r["tot_cac"] for r in active)
     tot_out = sum(r["tot_out"] for r in active)
     tot_trn = sum(r["turns"] for r in active)
+    agg_buckets: dict[str, dict[str, Any]] = {}
+    for bkey in ("flips", "ttl_expiries", "warm_work", "compactions_partial", "turn_0"):
+        btrns = sum(int((r.get("breakdown") or {}).get(bkey, {}).get("turns") or 0) for r in active)
+        btoks = sum(int((r.get("breakdown") or {}).get(bkey, {}).get("tokens") or 0) for r in active)
+        agg_buckets[bkey] = {
+            "turns": btrns,
+            "tokens": btoks,
+            "pct": round(100.0 * btoks / max(tot_unc, 1), 1) if tot_unc > 0 else 0.0,
+            "avg_per_turn": round(btoks / btrns) if btrns > 0 else 0,
+        }
     return {
         "sessions_audited": len(active),
         "turns": tot_trn,
@@ -293,9 +375,57 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "enter_plan_count": sum(r.get("enter_plan_count", 0) for r in active),
         "one_turn_neon_plans": sum(r.get("one_turn_neon_plans", 0) for r in active),
         "cross_session_dup_reads": sum(1 for cnt in path_sessions.values() if cnt >= 2),
+        "breakdown": agg_buckets,
         "top_tools": tot_tools.most_common(15),
         "models": dict(tot_models),
     }
+
+
+BREAKDOWN_LABELS = (
+    ("flips", "Flips"),
+    ("ttl_expiries", "TTL Expiries"),
+    ("warm_work", "Warm Work"),
+    ("compactions_partial", "Partial/Compactions"),
+    ("turn_0", "Turn-0"),
+)
+
+
+def _fmt_tok(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1e6:7.2f}M"
+    if n >= 1_000:
+        return f"{n / 1000.0:7.1f}k"
+    return f"{n:8d}"
+
+
+def format_breakdown_table(rows: list[dict[str, Any]], agg: dict[str, Any], target_label: str) -> str:
+    tot_in = agg["tot_unc"] + agg["tot_cac"]
+    lines = [
+        f"=== AGY Uncached Burn Breakdown ({target_label} | {agg['sessions_audited']} sessions | {agg['turns']} turns) ===",
+        f"Total Input: {_fmt_tok(tot_in).strip()} ({_fmt_tok(agg['tot_cac']).strip()} cached {agg['hit_pct']}% | {_fmt_tok(agg['tot_unc']).strip()} uncached | {_fmt_tok(agg['tot_out']).strip()} output)",
+        f"{'BUCKET':20s} | {'TURNS':>6s} | {'UNCACHED':>8s} | {'SHARE%':>6s} | {'AVG/TURN':>8s}",
+        "-" * 60,
+    ]
+    bd = agg.get("breakdown") or {}
+    for key, lbl in BREAKDOWN_LABELS:
+        b = bd.get(key) or {"turns": 0, "tokens": 0, "pct": 0.0, "avg_per_turn": 0}
+        lines.append(
+            f"{lbl:20s} | {b['turns']:6d} | {_fmt_tok(b['tokens'])} | {b['pct']:5.1f}% | {_fmt_tok(b['avg_per_turn'])}"
+        )
+    lines.append("-" * 60)
+    avg_all = round(agg["tot_unc"] / max(agg["turns"], 1)) if agg["turns"] else 0
+    lines.append(
+        f"{'TOTAL':20s} | {agg['turns']:6d} | {_fmt_tok(agg['tot_unc'])} | {'100.0%':>6s} | {_fmt_tok(avg_all)}"
+    )
+    active = [r for r in rows if not r.get("missing")]
+    if len(active) == 1:
+        r = active[0]
+        lines.append("")
+        lines.append(
+            f"Session: {r['conv_id']} ({r.get('surface', '-')}) | model={r.get('last_model') or '?'} | "
+            f"last_ctx={r.get('last_ctx', 0):,} tok | last_hit={r.get('last_hit_pct')}% | max_unc={r.get('max_unc', 0):,}"
+        )
+    return "\n".join(lines)
 
 
 def format_table(rows: list[dict[str, Any]], agg: dict[str, Any]) -> str:
@@ -392,7 +522,9 @@ def main() -> int:
     ap.add_argument("--recent", type=int, default=15, help="Audit N most recent sessions (default 15)")
     ap.add_argument("--surface", choices=["all", "app", "ide", "cli"], default="all", help="AGY surface to scan (default: all)")
     ap.add_argument("--conv", type=str, help="Audit a single conversation ID (auto-discovers spawned swarm workers if present)")
+    ap.add_argument("--session", type=str, help="Audit one exact session ID or prefix (no swarm expansion)")
     ap.add_argument("--swarm", type=str, help="Audit a swarm coordinator ID and all its spawned workers")
+    ap.add_argument("--breakdown", action="store_true", help="Display uncached burn decomposition table (Flips, TTL Expiries, Warm Work, Partial/Compactions, Turn-0)")
     ap.add_argument("--json", action="store_true", help="Print JSON output")
     ap.add_argument("--report-md", type=str, help="Write Zero-PII Markdown telemetry report to path")
     args = ap.parse_args()
@@ -402,14 +534,18 @@ def main() -> int:
     if args.swarm:
         targets = discover_swarm_workers(args.swarm, surface=args.surface)
         target_label = f"swarm-{args.swarm[:8]}"
+    elif args.session:
+        targets = [(args.session[:14], args.session)]
+        target_label = f"session-{args.session[:8]}"
     elif args.conv:
         targets = discover_swarm_workers(args.conv, surface=args.surface)
         target_label = f"conv-{args.conv[:8]}"
     else:
+        brains = _surface_brains()
         surfaces = ("app", "ide", "cli") if args.surface == "all" else (args.surface,)
         all_logs = []
         for surf in surfaces:
-            bdir = SURFACE_BRAINS.get(surf)
+            bdir = brains.get(surf)
             if bdir and bdir.is_dir():
                 for lp in bdir.glob("*/.system_generated/logs/transcript.jsonl"):
                     all_logs.append((lp.stat().st_mtime, lp))
@@ -428,9 +564,15 @@ def main() -> int:
         rp.write_text(build_markdown_report(clean_rows, agg, target_label), encoding="utf-8")
 
     if args.json:
-        print(json.dumps({"target": target_label, "aggregate": agg, "sessions": clean_rows}, indent=2))
+        out_obj: dict[str, Any] = {"target": target_label, "aggregate": agg, "sessions": clean_rows}
+        if args.breakdown:
+            out_obj["breakdown"] = agg.get("breakdown") or {}
+        print(json.dumps(out_obj, indent=2))
     else:
-        print(format_table(clean_rows, agg))
+        if args.breakdown:
+            print(format_breakdown_table(clean_rows, agg, target_label))
+        else:
+            print(format_table(clean_rows, agg))
         if args.report_md:
             print(f"\nWrote Zero-PII Markdown report -> {args.report_md}")
     return 0

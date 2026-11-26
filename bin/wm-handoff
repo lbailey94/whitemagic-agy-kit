@@ -23,11 +23,239 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 SURFACE_BRAINS = {
     "app": Path.home() / ".gemini" / "antigravity" / "brain",
     "ide": Path.home() / ".gemini" / "antigravity-ide" / "brain",
     "cli": Path.home() / ".gemini" / "antigravity-cli" / "brain",
 }
+
+
+def _pending_crystals_path() -> Path:
+    explicit = os.environ.get("WM_PENDING_CRYSTALS", "").strip()
+    if explicit:
+        return Path(explicit)
+    telem = os.environ.get("WM_AGY_TELEMETRY", "").strip()
+    if telem:
+        return Path(telem).parent / "pending_crystals.jsonl"
+    return Path.home() / ".local" / "share" / "whitemagic" / "pending_crystals.jsonl"
+
+
+def _resolve_wm3_bin_and_store(store_override: str | None = None) -> tuple[Path, Path]:
+    wm_bin = Path(
+        os.environ.get(
+            "WM3_BIN",
+            shutil.which("wm3")
+            or shutil.which("wm-gen3")
+            or str(Path.home() / ".local" / "bin" / "wm3"),
+        )
+    )
+    xdg_store = Path.home() / ".local" / "share" / "whitemagic" / "gen3"
+    shared_store = Path("/Users/Shared/ai/wm-store-gen3")
+    default_store = str(
+        xdg_store if xdg_store.is_dir() else (shared_store if shared_store.is_dir() else xdg_store)
+    )
+    wm_store = Path(store_override or os.environ.get("WM3_STORE") or default_store)
+    return wm_bin, wm_store
+
+
+def append_crystal_spool(
+    st: dict,
+    gs,
+    surf: str,
+    digest: str,
+    crystal: str,
+    out_path: str | None,
+    receipt_path: Path | None,
+    source: str = "wm-handoff",
+) -> Path:
+    """Lock-free O_APPEND spool write for IDE/readonly sessions (zero LMDB contention)."""
+    spool_path = _pending_crystals_path()
+    spool_path.parent.mkdir(parents=True, exist_ok=True)
+    goal = (st.get("user_goals") or [""])[-1][:180]
+    entry = {
+        "schema": "wm-crystal-spool/1.0",
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "conv_id": st["conv_id"],
+        "surface": surf,
+        "model": st["model"],
+        "last_ctx": int(st["last_ctx"] or 0),
+        "last_hit_pct": st["last_hit"],
+        "model_flips": int(st["model_flips"] or 0),
+        "crystal_sha256": digest,
+        "crystal_path": str(out_path or ""),
+        "receipt_path": str(receipt_path or ""),
+        "git_branch": gs.get("branch", "") if gs else "",
+        "summary": goal,
+        "content": crystal,
+    }
+    line = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    fd = os.open(str(spool_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+    return spool_path
+
+
+def flush_pending_crystals(dry_run: bool = False, store_override: str | None = None) -> dict:
+    """Single-writer-safe ingestion of pending_crystals.jsonl into Gen3 LMDB."""
+    spool_path = _pending_crystals_path()
+    flushed_ledger = spool_path.with_name("flushed_crystals.sha256")
+    lock_path = spool_path.with_name("pending_crystals.lock")
+    wm_bin, wm_store = _resolve_wm3_bin_and_store(store_override)
+
+    if not spool_path.is_file() or spool_path.stat().st_size == 0:
+        return {
+            "ok": True,
+            "spool_path": str(spool_path),
+            "store": str(wm_store),
+            "dry_run": dry_run,
+            "total_records": 0,
+            "flushed": 0,
+            "skipped_dup": 0,
+            "failed": 0,
+            "remaining": 0,
+        }
+
+    spool_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = lock_path.open("a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return {
+                    "ok": False,
+                    "locked": True,
+                    "error": "Another wm-handoff --flush-wm3 writer holds the spool lock",
+                    "spool_path": str(spool_path),
+                }
+
+        flushed_shas: set[str] = set()
+        if flushed_ledger.is_file():
+            for ln in flushed_ledger.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = ln.strip()
+                if s:
+                    flushed_shas.add(s)
+
+        raw_lines = [
+            ln.strip()
+            for ln in spool_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip().startswith("{")
+        ]
+        parsed: list[tuple[str, dict]] = []
+        for ln in raw_lines:
+            try:
+                obj = json.loads(ln)
+                if isinstance(obj, dict):
+                    parsed.append((ln, obj))
+            except Exception:
+                continue
+
+        seen_in_batch: set[str] = set()
+        to_ingest: list[tuple[str, dict, str]] = []
+        skipped_dup = 0
+        for ln, obj in parsed:
+            content = str(obj.get("content") or "")
+            sha = str(obj.get("crystal_sha256") or "") or hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+            if sha in flushed_shas or sha in seen_in_batch:
+                skipped_dup += 1
+                continue
+            seen_in_batch.add(sha)
+            to_ingest.append((ln, obj, sha))
+
+        if dry_run:
+            return {
+                "ok": True,
+                "spool_path": str(spool_path),
+                "store": str(wm_store),
+                "dry_run": True,
+                "total_records": len(parsed),
+                "to_flush": len(to_ingest),
+                "flushed": 0,
+                "skipped_dup": skipped_dup,
+                "failed": 0,
+                "remaining": len(to_ingest),
+            }
+
+        if not wm_bin.exists():
+            return {
+                "ok": False,
+                "spool_path": str(spool_path),
+                "store": str(wm_store),
+                "error": f"wm3 binary not found at {wm_bin}",
+                "total_records": len(parsed),
+                "flushed": 0,
+                "skipped_dup": skipped_dup,
+                "failed": len(to_ingest),
+                "remaining": len(to_ingest),
+            }
+
+        flushed = 0
+        failed = 0
+        remaining_lines: list[str] = []
+        errors: list[str] = []
+        newly_flushed: list[str] = []
+
+        for ln, obj, sha in to_ingest:
+            content = str(obj.get("content") or "").strip()
+            if not content and obj.get("crystal_path") and Path(str(obj["crystal_path"])).is_file():
+                content = Path(str(obj["crystal_path"])).read_text(encoding="utf-8", errors="replace").strip()
+            if not content:
+                skipped_dup += 1
+                continue
+            src = str(obj.get("source") or "wm-handoff").strip()
+            try:
+                proc = subprocess.run(
+                    [str(wm_bin), "--store", str(wm_store), "remember", "--source", f"tool:{src}", "--kind", "system", content],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                if proc.returncode == 0:
+                    flushed += 1
+                    flushed_shas.add(sha)
+                    newly_flushed.append(sha)
+                else:
+                    failed += 1
+                    remaining_lines.append(ln)
+                    errors.append(f"{sha}: {(proc.stderr or proc.stdout or 'rc=' + str(proc.returncode)).strip()[:160]}")
+            except Exception as exc:
+                failed += 1
+                remaining_lines.append(ln)
+                errors.append(f"{sha}: {exc}")
+
+        if newly_flushed:
+            _write_text_atomic(flushed_ledger, "\n".join(sorted(flushed_shas)) + "\n")
+        _write_text_atomic(spool_path, ("\n".join(remaining_lines) + "\n") if remaining_lines else "")
+
+        out = {
+            "ok": failed == 0,
+            "spool_path": str(spool_path),
+            "store": str(wm_store),
+            "dry_run": False,
+            "total_records": len(parsed),
+            "flushed": flushed,
+            "skipped_dup": skipped_dup,
+            "failed": failed,
+            "remaining": len(remaining_lines),
+        }
+        if errors:
+            out["errors"] = errors[:5]
+        return out
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        lock_fh.close()
 
 
 def parse_ts(v):
@@ -283,7 +511,32 @@ def main():
     ap.add_argument("--room", default="", help="Optional Sangha room for --publish-sangha")
     ap.add_argument("--swarm-map", metavar="REPO_DIR", help="Emit a <=600-token shared codemap for fresh swarm workers and exit")
     ap.add_argument("--save-wm3", action="store_true", help="Also persist handoff crystal to WhiteMagic Gen3 (wm3 / wm-gen3)")
+    ap.add_argument("--spool", action="store_true", help="Append crystal to lock-free pending_crystals.jsonl spool (zero LMDB contention)")
+    ap.add_argument("--spool-source", default="wm-handoff", help="Origin label recorded on spooled crystal entries")
+    ap.add_argument("--flush-wm3", action="store_true", help="Flush pending_crystals.jsonl into WhiteMagic Gen3 LMDB safely and exit")
+    ap.add_argument("--dry-run", action="store_true", help="Preview --flush-wm3 without mutating Gen3 LMDB or spool")
+    ap.add_argument("--json", action="store_true", help="Emit JSON output (for --flush-wm3)")
     args = ap.parse_args()
+
+    if args.flush_wm3:
+        res = flush_pending_crystals(dry_run=args.dry_run)
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            if res.get("locked"):
+                print(f"wm-handoff --flush-wm3: {res.get('error')}")
+            elif res.get("dry_run"):
+                print(
+                    f"wm-handoff --flush-wm3 --dry-run: pending={res.get('to_flush', 0)} "
+                    f"dup_skip={res.get('skipped_dup', 0)} store={res.get('store')}"
+                )
+            else:
+                print(
+                    f"wm-handoff --flush-wm3: flushed={res.get('flushed', 0)} "
+                    f"dup_skip={res.get('skipped_dup', 0)} failed={res.get('failed', 0)} "
+                    f"remaining={res.get('remaining', 0)} store={res.get('store')}"
+                )
+        sys.exit(0 if res.get("ok") else 1)
 
     if args.swarm_map:
         smap = build_swarm_map(args.swarm_map)
@@ -348,41 +601,6 @@ def main():
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
     crystal = f"{body}\n\n`crystal_sha256={digest} | est_tokens~{len(body)//4}`\n"
 
-    if args.save_wm3:
-        wm_bin = Path(
-            os.environ.get(
-                "WM3_BIN",
-                shutil.which("wm3")
-                or shutil.which("wm-gen3")
-                or str(Path.home() / ".local" / "bin" / "wm-gen3"),
-            )
-        )
-        xdg_store = Path.home() / ".local" / "share" / "whitemagic" / "gen3"
-        shared_store = Path("/Users/Shared/ai/wm-store-gen3")
-        default_store = str(
-            xdg_store if xdg_store.is_dir() else (shared_store if shared_store.is_dir() else xdg_store)
-        )
-        wm_store = Path(os.environ.get("WM3_STORE", default_store))
-        if not wm_bin.exists():
-            sys.stderr.write(f"wm-handoff: --save-wm3 binary not found at {wm_bin}\n")
-        else:
-            proc = subprocess.run(
-                [str(wm_bin), "--store", str(wm_store), "remember", "--source", "tool:wm-handoff", crystal],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if proc.returncode != 0:
-                sys.stderr.write(f"wm-handoff: --save-wm3 failed: {proc.stderr or proc.stdout}\n")
-            else:
-                sys.stderr.write(f"Saved handoff crystal to WhiteMagic Gen3 ({wm_store})\n")
-
-    if args.out:
-        _write_text_atomic(Path(args.out), crystal)
-        print(f"Wrote handoff crystal -> {args.out} ({len(crystal)} B, ~{len(crystal)//4} tok)")
-    else:
-        sys.stdout.write(crystal)
-
     receipt_path = None
     if args.emit_receipt:
         receipt_path = Path(args.emit_receipt)
@@ -390,6 +608,37 @@ def main():
         cache_dir = Path(os.environ.get("WM_HANDOFF_CACHE_DIR") or str(Path.home() / ".cache" / "wm-handoff"))
         san = "".join(c for c in st["conv_id"] if c.isascii() and (c.isalnum() or c in "_-"))[:20] or "default"
         receipt_path = cache_dir / f"latest_{san}.receipt.json"
+
+    spooled_already = False
+    if args.save_wm3:
+        wm_bin, wm_store = _resolve_wm3_bin_and_store()
+        if not wm_bin.exists():
+            sys.stderr.write(f"wm-handoff: --save-wm3 binary not found at {wm_bin}; spooling to pending_crystals.jsonl\n")
+            append_crystal_spool(st, gs, surf, digest, crystal, args.out, receipt_path, source=f"{args.spool_source}:fallback")
+            spooled_already = True
+        else:
+            proc = subprocess.run(
+                [str(wm_bin), "--store", str(wm_store), "remember", "--source", "tool:wm-handoff", "--kind", "system", crystal],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                sys.stderr.write(f"wm-handoff: --save-wm3 failed ({proc.stderr or proc.stdout}); spooling to pending_crystals.jsonl\n")
+                append_crystal_spool(st, gs, surf, digest, crystal, args.out, receipt_path, source=f"{args.spool_source}:fallback")
+                spooled_already = True
+            else:
+                sys.stderr.write(f"Saved handoff crystal to WhiteMagic Gen3 ({wm_store})\n")
+
+    if args.spool and not spooled_already:
+        sp = append_crystal_spool(st, gs, surf, digest, crystal, args.out, receipt_path, source=args.spool_source)
+        sys.stderr.write(f"Spooled crystal sha256={digest} -> {sp}\n")
+
+    if args.out:
+        _write_text_atomic(Path(args.out), crystal)
+        print(f"Wrote handoff crystal -> {args.out} ({len(crystal)} B, ~{len(crystal)//4} tok)")
+    else:
+        sys.stdout.write(crystal)
 
     if receipt_path is not None:
         receipt = build_receipt_v12(st, gs, surf, digest, crystal, tp, args.out)

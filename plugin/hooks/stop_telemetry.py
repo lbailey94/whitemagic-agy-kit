@@ -160,9 +160,14 @@ def _maybe_auto_crystal(payload: dict, stats: dict, now: float, host: str = "agy
     reason = str(payload.get("terminationReason") or "")
     if reason not in ("NO_TOOL_CALL", ""):
         return
+    is_neon = "neon" in str(stats.get("model") or "").lower()
     tuning = _load_grimoire_tuning(host)
-    warn_tok = min(99_000, int(tuning.get("context_warn_tokens") or 99_000))
-    cliff_tok = min(130_000, int(tuning.get("context_cliff_tokens") or 130_000))
+    if is_neon:
+        warn_tok = min(100_000, int(tuning.get("neon_warn_tokens") or tuning.get("context_warn_tokens") or 100_000))
+        cliff_tok = min(120_000, int(tuning.get("neon_rollover_tokens") or tuning.get("context_cliff_tokens") or 120_000))
+    else:
+        warn_tok = min(99_000, int(tuning.get("context_warn_tokens") or 99_000))
+        cliff_tok = min(130_000, int(tuning.get("context_cliff_tokens") or 130_000))
     flip_guard = bool(tuning.get("enable_flip_guard", True))
 
     last_ctx = int(stats.get("last_ctx") or 0)
@@ -207,11 +212,19 @@ def _maybe_auto_crystal(payload: dict, stats: dict, now: float, host: str = "agy
         str(crystal_out),
         "--emit-receipt",
         str(receipt_out),
+        "--spool",
+        "--spool-source",
+        "stop_telemetry",
     ]
     cwd = str(payload.get("cwd") or "")
     if cwd and Path(cwd).is_dir():
         cmd.extend(["--cwd", cwd])
-    subprocess.run(cmd, capture_output=True, text=True, timeout=1.5)
+    env = os.environ.copy()
+    if not env.get("WM_PENDING_CRYSTALS"):
+        telem_override = env.get("WM_AGY_TELEMETRY", "").strip()
+        if telem_override:
+            env["WM_PENDING_CRYSTALS"] = str(Path(telem_override).parent / "pending_crystals.jsonl")
+    subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1.5)
 
 
 def main():
@@ -260,6 +273,8 @@ def main():
         stats = summarize_tail(tp) if tp else None
         if stats:
             now = time.time()
+            is_neon = "neon" in str(stats.get("model") or "").lower()
+            last_ctx = int(stats.get("last_ctx") or 0)
             rec = {
                 "ts": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
                 "ts_epoch": int(now),
@@ -268,6 +283,9 @@ def main():
                 "cwd": str(payload.get("cwd") or ""),
                 **stats,
             }
+            if is_neon:
+                rec["neon_warn"] = last_ctx >= 100_000
+                rec["neon_rollover_recommended"] = last_ctx >= 120_000
             TELEM_PATH.parent.mkdir(parents=True, exist_ok=True)
             with open(TELEM_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")

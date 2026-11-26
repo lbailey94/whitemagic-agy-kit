@@ -1342,12 +1342,17 @@ fn run_hud() {
         _ => 0,
     };
 
+    let is_neon = cur_model.to_ascii_lowercase().contains("neon");
+    let warn_thresh: u64 = if is_neon { 100_000 } else { 120_000 };
+    let cliff_thresh: u64 = if is_neon { 120_000 } else { 200_000 };
+    let reset_thresh: u64 = if is_neon { 80_000 } else { 90_000 };
+
     if checkpoints > state.epoch {
         state.warned_120k = false;
         state.warned_200k = false;
         state.flip_count = 0;
         state.flip_unc_total = 0;
-    } else if cur_ctx < 90_000 {
+    } else if cur_ctx < reset_thresh {
         state.warned_120k = false;
         state.warned_200k = false;
     }
@@ -1401,22 +1406,40 @@ fn run_hud() {
     }
 
     if !is_cli || hud_cli_full {
-        if cur_ctx >= 200_000 && !state.warned_200k {
-            alerts.push(format!(
-                "🔴 **Context Cliff (~{:.0}k tok · {:.0}% cache hit):** High re-prefill cost on any idle gap. Run `/compact` or `wm-handoff` soon.{}",
-                (cur_ctx as f64) / 1000.0,
-                hit_pct,
-                crystal_short
-            ));
+        if cur_ctx >= cliff_thresh && !state.warned_200k {
+            if is_neon {
+                alerts.push(format!(
+                    "🔴 **Neon Rollover Target (~{:.0}k tok · {:.0}% cache hit):** Neon KV TTL decays fast past 120k. Run `/compact` or `wm-handoff` → fresh chat now.{}",
+                    (cur_ctx as f64) / 1000.0,
+                    hit_pct,
+                    crystal_short
+                ));
+            } else {
+                alerts.push(format!(
+                    "🔴 **Context Cliff (~{:.0}k tok · {:.0}% cache hit):** High re-prefill cost on any idle gap. Run `/compact` or `wm-handoff` soon.{}",
+                    (cur_ctx as f64) / 1000.0,
+                    hit_pct,
+                    crystal_short
+                ));
+            }
             state.warned_200k = true;
             state.warned_120k = true;
-        } else if cur_ctx >= 120_000 && !state.warned_120k {
-            alerts.push(format!(
-                "🟡 **Context Watch (~{:.0}k tok · {:.0}% cache hit):** Run `/compact` or `wm-handoff` before stepping away >5m.{}",
-                (cur_ctx as f64) / 1000.0,
-                hit_pct,
-                crystal_short
-            ));
+        } else if cur_ctx >= warn_thresh && !state.warned_120k {
+            if is_neon {
+                alerts.push(format!(
+                    "🟡 **Neon Context Watch (~{:.0}k tok · {:.0}% cache hit):** Approaching 120k Neon rollover target. Keep turns <30s TTL or prepare `wm-handoff`.{}",
+                    (cur_ctx as f64) / 1000.0,
+                    hit_pct,
+                    crystal_short
+                ));
+            } else {
+                alerts.push(format!(
+                    "🟡 **Context Watch (~{:.0}k tok · {:.0}% cache hit):** Run `/compact` or `wm-handoff` before stepping away >5m.{}",
+                    (cur_ctx as f64) / 1000.0,
+                    hit_pct,
+                    crystal_short
+                ));
+            }
             state.warned_120k = true;
         }
 

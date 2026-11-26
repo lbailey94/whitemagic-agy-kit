@@ -1,4 +1,4 @@
-# WhiteMagic AGY Turbo+Fast Directives (v4.5.1)
+# WhiteMagic AGY Turbo+Fast Directives (v4.7.0)
 
 ## 1. Tool Routing & Latency Hygiene (5 Eager Tools + Fast Built-ins)
 
@@ -13,7 +13,7 @@
 
 ## 2. Context, Cache & Swarm Orchestration
 - **Rust PreToolUse & Squeeze:** `wm-squeeze --pre-tool` clamps >250L reads (<=150L >=120k, <=100L >=160k, <=50L wide JSONL), wraps `rg`/`find`/`git`/test/`python3 -c`/safe `for`/heredocs, and deduplicates re-reads.
-- **Longevity, Sidecar & CPR Bridge:** Keep Turn-0 fixed (`wm-sim audit --scope-plugins` scopes optional plugins). Watch HUD ping-pong (`>=2` flips) / sidecar pane; auto-crystal fires on idle `Stop`; verify/publish `<=150`-tok pointers via `wm-cpr-bridge` & reset via `wm-reset`.
+- **Longevity, Sidecar & CPR Bridge:** Keep Turn-0 fixed (`wm-sim audit --scope-plugins` scopes optional plugins). Watch HUD Neon 100k/120k rollover & ping-pong (`>=2` flips) / live Aux-Pane cockpit; auto-crystal spools to `pending_crystals.jsonl` (`wm-handoff --flush-wm3`); verify/publish `<=150`-tok pointers via `wm-cpr-bridge` & reset via `wm-reset`.
 - **Swarm & Native Agents:** Generate `wm-handoff --swarm-map .` (<=600 tok); dispatch `hydrogen-builder`, `fresh-verifier` (<60k), or `swarm-coordinator` (<80k). Pass `model="gemini-4-hydrogen-high"` + `workspace="share"` (never `fork` >=80k); keep board posts <=4 KB (`<=150`-tok CPRs).
 - **4-Tier Pyramid:** `tricameral_dispatch` ($0 local) -> `whitemagic-agy-kit_fast` / `Hydrogen` -> `grok_dispatch` -> `Neon` (plan `<80k`, pin `>100k` via `/model`, `/btw` for asides).
 
