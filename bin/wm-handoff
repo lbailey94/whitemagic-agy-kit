@@ -182,6 +182,22 @@ def extract_verbatim_state(tp):
     }
 
 
+def _grimoire_brief_max_bytes(host: str = "agy") -> int | None:
+    p = Path(
+        os.environ.get("WM_GRIMOIRE_PROFILE")
+        or str(Path.home() / ".local" / "share" / "whitemagic" / "grimoire_profile.json")
+    )
+    if not p.is_file():
+        return None
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        hp = (obj.get("host_profiles") or {}).get(host) or obj.get("model_tuning") or {}
+        val = int(hp.get("turn0_brief_max_bytes") or 0)
+        return val if val >= 600 else None
+    except Exception:
+        return None
+
+
 def build_swarm_map(repo_dir: str) -> str:
     """Build a compact <=600-token (<=2400 B) shared codemap for fresh swarm workers."""
     root = Path(repo_dir).resolve()
@@ -213,8 +229,10 @@ def build_swarm_map(repo_dir: str) -> str:
     if cg_out:
         lines.append("Symbol overview:\n```\n" + cg_out + "\n```")
     body = "\n".join(lines)
-    if len(body) > 2280:
-        body = body[:2230] + "\n... [swarm-map cap 600 tok]"
+    g_cap = _grimoire_brief_max_bytes("agy")
+    cap = min(2280, max(900, g_cap - 150)) if g_cap is not None else 2280
+    if len(body) > cap:
+        body = body[: cap - 50] + "\n... [swarm-map cap 600 tok]"
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
     return f"{body}\n\n`swarm_map_sha256={digest} | est_tokens~{len(body)//4}`\n"
 

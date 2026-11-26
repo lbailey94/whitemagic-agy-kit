@@ -134,7 +134,25 @@ def _resolve_handoff_bin() -> str | None:
     return None
 
 
-def _maybe_auto_crystal(payload: dict, stats: dict, now: float) -> None:
+def _load_grimoire_tuning(host: str = "agy") -> dict:
+    p = Path(
+        os.environ.get("WM_GRIMOIRE_PROFILE")
+        or str(Path.home() / ".local" / "share" / "whitemagic" / "grimoire_profile.json")
+    )
+    if not p.is_file():
+        return {}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        hp = obj.get("host_profiles") or {}
+        if isinstance(hp, dict) and isinstance(hp.get(host), dict):
+            return hp[host]
+        mt = obj.get("model_tuning") or {}
+        return mt if isinstance(mt, dict) else {}
+    except Exception:
+        return {}
+
+
+def _maybe_auto_crystal(payload: dict, stats: dict, now: float, host: str = "agy") -> None:
     if os.environ.get("WM_AUTO_CRYSTAL_OFF") == "1":
         return
     if payload.get("fullyIdle") is False:
@@ -142,9 +160,18 @@ def _maybe_auto_crystal(payload: dict, stats: dict, now: float) -> None:
     reason = str(payload.get("terminationReason") or "")
     if reason not in ("NO_TOOL_CALL", ""):
         return
+    tuning = _load_grimoire_tuning(host)
+    warn_tok = min(99_000, int(tuning.get("context_warn_tokens") or 99_000))
+    cliff_tok = min(130_000, int(tuning.get("context_cliff_tokens") or 130_000))
+    flip_guard = bool(tuning.get("enable_flip_guard", True))
+
     last_ctx = int(stats.get("last_ctx") or 0)
     flips = int(stats.get("model_flips") or 0)
-    if not ((last_ctx >= 99_000 and flips >= 2) or last_ctx >= 130_000):
+    if flip_guard:
+        should_fire = (last_ctx >= warn_tok and flips >= 2) or last_ctx >= cliff_tok
+    else:
+        should_fire = last_ctx >= cliff_tok or (last_ctx >= warn_tok and flips >= 1)
+    if not should_fire:
         return
     tp = str(payload.get("transcriptPath") or "")
     if not tp or not Path(tp).is_file():

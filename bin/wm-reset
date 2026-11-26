@@ -141,11 +141,33 @@ def load_or_build_crystal(args, cache_dir: Path) -> tuple[str, dict | None, Path
     sys.exit(1)
 
 
+def _default_launcher() -> str:
+    env_l = os.environ.get("WM_RESET_LAUNCHER", "").strip().lower()
+    if env_l in ("agy", "codex", "cursor"):
+        return env_l
+    if env_l == "auto":
+        p = Path(
+            os.environ.get("WM_GRIMOIRE_PROFILE")
+            or str(Path.home() / ".local" / "share" / "whitemagic" / "grimoire_profile.json")
+        )
+        if p.is_file():
+            try:
+                obj = json.loads(p.read_text(encoding="utf-8"))
+                hosts = obj.get("turbo_hosts") or []
+                if isinstance(hosts, list):
+                    for h in hosts:
+                        if h in ("agy", "codex", "cursor"):
+                            return h
+            except Exception:
+                pass
+    return "agy"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Reset into a clean cache-warmed AGY, Codex, or Cursor session from a verbatim handoff crystal.")
     ap.add_argument("--conv", help="Source conversation ID prefix (defaults to newest crystal / transcript)")
     ap.add_argument("--surface", choices=["all", "app", "ide", "cli"], default="all", help="AGY surface to scan (default: all)")
-    ap.add_argument("--launcher", choices=["agy", "codex", "cursor"], default=os.environ.get("WM_RESET_LAUNCHER", "agy"), help="Target agent CLI (default: agy)")
+    ap.add_argument("--launcher", choices=["agy", "codex", "cursor"], default=_default_launcher(), help="Target agent CLI (default: agy)")
     ap.add_argument("--model", default="", help="Target model profile (defaults to gemini-4-hydrogen for agy)")
     ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"], default="high", help="Reasoning effort for agy (default: high)")
     ap.add_argument("--agent", help="Optional native agent name (e.g., hydrogen-builder for agy)")

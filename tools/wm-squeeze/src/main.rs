@@ -12,6 +12,7 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -47,6 +48,103 @@ fn fnv1a_hex(s: &str) -> String {
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{:016x}", h)
+}
+
+const SHA256_H0: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let mut msg = data.to_vec();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut state = SHA256_H0;
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            let j = i * 4;
+            w[i] = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for i in 0..64 {
+            let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h.wrapping_add(big_s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+            let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = big_s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (slot, delta) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(delta);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in state.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let d = sha256_digest(data);
+    let mut s = String::with_capacity(64);
+    for b in d {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    let mut k_block = [0u8; 64];
+    if key.len() > 64 {
+        let kh = sha256_digest(key);
+        k_block[..32].copy_from_slice(&kh);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(64 + msg.len());
+    for b in k_block {
+        inner.push(b ^ 0x36);
+    }
+    inner.extend_from_slice(msg);
+    let inner_hash = sha256_digest(&inner);
+
+    let mut outer = Vec::with_capacity(64 + 32);
+    for b in k_block {
+        outer.push(b ^ 0x5c);
+    }
+    outer.extend_from_slice(&inner_hash);
+    sha256_hex(&outer)
 }
 
 fn stats_path() -> Option<PathBuf> {
@@ -2764,9 +2862,16 @@ fn handle_read_file_rs(args: &HashMap<String, String>, transcript: &str, conv_id
             } else {
                 (200i64, 250i64)
             };
+            let mut wide_lim = 50i64;
+            if grimoire_profile_exists() {
+                let (g_unb, g_clamp, g_wide) = load_grimoire_read_limits(HostKind::Agy);
+                clamp_trigger = clamp_trigger.min(g_unb as i64);
+                max_span = max_span.min(g_clamp as i64);
+                wide_lim = wide_lim.min(g_wide as i64);
+            }
             if wide_lines {
-                max_span = max_span.min(50);
-                clamp_trigger = clamp_trigger.min(60);
+                max_span = max_span.min(wide_lim);
+                clamp_trigger = clamp_trigger.min(wide_lim + 10);
             }
             let is_large = wide_lines || file_exceeds_lines_rs(p_obj, clamp_trigger as usize, size);
             if is_large && !conv_id.is_empty() && step_idx > 0 {
@@ -3495,7 +3600,426 @@ fn scan_patch_env_secret(patch_text: &str) -> Option<String> {
     None
 }
 
-fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str) {
+fn grimoire_profile_path() -> Option<PathBuf> {
+    if let Ok(explicit) = env::var("WM_GRIMOIRE_PROFILE") {
+        if !explicit.trim().is_empty() {
+            return Some(PathBuf::from(explicit));
+        }
+    }
+    let home = env::var("HOME").ok()?;
+    if home.trim().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".local/share/whitemagic/grimoire_profile.json"))
+}
+
+fn grimoire_profile_exists() -> bool {
+    grimoire_profile_path().is_some_and(|p| p.is_file())
+}
+
+fn extract_json_object_slice<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{}\"", key);
+    let mut offset = 0usize;
+    while let Some(rel) = raw[offset..].find(&needle) {
+        let key_end = offset + rel + needle.len();
+        let after = raw[key_end..].trim_start();
+        if !after.starts_with(':') {
+            offset = key_end;
+            continue;
+        }
+        let colon_rel = raw[key_end..].find(':')?;
+        let after_colon = raw[key_end + colon_rel + 1..].trim_start();
+        if !after_colon.starts_with('{') {
+            offset = key_end + colon_rel + 1;
+            continue;
+        }
+        let start_rel = raw[key_end + colon_rel + 1..].find('{')?;
+        let obj_start = key_end + colon_rel + 1 + start_rel;
+        let bytes = raw.as_bytes();
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        for i in obj_start..bytes.len() {
+            let b = bytes[i];
+            if esc {
+                esc = false;
+                continue;
+            }
+            if in_str {
+                if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            if b == b'"' {
+                in_str = true;
+            } else if b == b'{' {
+                depth += 1;
+            } else if b == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&raw[obj_start..=i]);
+                }
+            }
+        }
+        return None;
+    }
+    None
+}
+
+fn parse_json_str_key(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let idx = raw.find(&needle)?;
+    let rest = &raw[idx + needle.len()..];
+    let colon = rest.find(':')?;
+    let after = rest[colon + 1..].trim_start();
+    if !after.starts_with('"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut esc = false;
+    for ch in after[1..].chars() {
+        if esc {
+            out.push(ch);
+            esc = false;
+            continue;
+        }
+        if ch == '\\' {
+            esc = true;
+            continue;
+        }
+        if ch == '"' {
+            return Some(out);
+        }
+        out.push(ch);
+    }
+    None
+}
+
+fn parse_json_usize_key(raw: &str, key: &str) -> Option<usize> {
+    let needle = format!("\"{}\"", key);
+    let idx = raw.find(&needle)?;
+    let rest = &raw[idx + needle.len()..];
+    let colon = rest.find(':')?;
+    let after = rest[colon + 1..].trim_start();
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<usize>().ok()
+}
+
+fn load_grimoire_read_limits(host: HostKind) -> (usize, usize, usize) {
+    let Some(path) = grimoire_profile_path() else {
+        return (400, 250, 50);
+    };
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return (400, 250, 50);
+    };
+    let host_key = match host {
+        HostKind::Agy => "agy",
+        HostKind::Codex => "codex",
+        HostKind::Cursor => "cursor",
+    };
+    let section = extract_json_object_slice(&raw, "host_profiles")
+        .and_then(|hp| extract_json_object_slice(hp, host_key))
+        .or_else(|| extract_json_object_slice(&raw, "model_tuning"))
+        .unwrap_or(&raw);
+    let max_unbounded = parse_json_usize_key(section, "max_unbounded_read_lines")
+        .filter(|&v| (50..=2000).contains(&v))
+        .unwrap_or(400);
+    let clamp_to = parse_json_usize_key(section, "clamp_read_lines")
+        .filter(|&v| (20..=1000).contains(&v))
+        .unwrap_or(250);
+    let wide_jsonl = parse_json_usize_key(section, "wide_jsonl_lines")
+        .filter(|&v| (10..=500).contains(&v))
+        .unwrap_or(50);
+    (max_unbounded, clamp_to, wide_jsonl)
+}
+
+fn resolve_mandala_guard_mode(explicit: Option<&str>) -> String {
+    if let Some(m) = explicit {
+        let low = m.trim().to_ascii_lowercase();
+        if matches!(low.as_str(), "advisory" | "strict" | "off") {
+            return low;
+        }
+    }
+    if let Ok(ev) = env::var("WM_MANDALA_GUARD") {
+        let low = ev.trim().to_ascii_lowercase();
+        if matches!(low.as_str(), "advisory" | "strict" | "off") {
+            return low;
+        }
+    }
+    if let Some(path) = grimoire_profile_path() {
+        if let Ok(raw) = fs::read_to_string(path) {
+            if let Some(mode) = parse_json_str_key(&raw, "mandala_guard_mode") {
+                let low = mode.trim().to_ascii_lowercase();
+                if matches!(low.as_str(), "advisory" | "strict" | "off") {
+                    return low;
+                }
+            }
+        }
+    }
+    "off".to_string()
+}
+
+fn resolve_exe_in_path(name: &str) -> Option<PathBuf> {
+    if let Ok(home) = env::var("HOME") {
+        if !home.trim().is_empty() {
+            let local = PathBuf::from(&home).join(".local/bin").join(name);
+            if local.is_file() {
+                return Some(local);
+            }
+        }
+    }
+    if let Ok(paths) = env::var("PATH") {
+        for dir in env::split_paths(&paths) {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn handoff_cache_dir_rs() -> PathBuf {
+    if let Ok(v) = env::var("WM_HANDOFF_CACHE_DIR") {
+        if !v.trim().is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    let home = env::var("HOME").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/tmp".into());
+    PathBuf::from(home).join(".cache/wm-handoff")
+}
+
+fn post_loopback_receipt(cache_dir: &Path, json_body: &str) {
+    let disc = cache_dir.join("sidecar.json");
+    let Ok(raw) = fs::read_to_string(disc) else {
+        return;
+    };
+    let Some(port) = parse_json_usize_key(&raw, "port") else {
+        return;
+    };
+    if !(1..=65535).contains(&port) {
+        return;
+    }
+    let Ok(addr) = format!("127.0.0.1:{port}").parse::<SocketAddr>() else {
+        return;
+    };
+    let timeout = std::time::Duration::from_millis(250);
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let req = format!(
+        "POST /api/receipt?recorded=1 HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        json_body.len(),
+        json_body
+    );
+    let _ = stream.write_all(req.as_bytes());
+    let _ = stream.flush();
+}
+
+fn exec_via_mandala_guard(cmd_args: &[String], cwd: Option<&str>, profile_override: Option<&str>) -> ! {
+    if cmd_args.is_empty() {
+        eprintln!("wm-squeeze --mandala-exec: missing command after --");
+        std::process::exit(2);
+    }
+    let work_dir = cwd
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let runner_profile = profile_override
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            grimoire_profile_path()
+                .and_then(|p| fs::read_to_string(p).ok())
+                .and_then(|raw| parse_json_str_key(&raw, "runner_profile"))
+        })
+        .unwrap_or_else(|| "landlock-wm-direct-v1".to_string());
+
+    let sb_bin = match env::var("WM_SANDBOX_BIN") {
+        Ok(v) if v.trim().is_empty() || v.trim() == "none" => None,
+        Ok(v) => {
+            let p = PathBuf::from(v);
+            p.is_file().then_some(p)
+        }
+        Err(_) => resolve_exe_in_path("wm-sandbox"),
+    };
+
+    if env::var("WM_MANDALA_REQUIRE_KERNEL").ok().as_deref() == Some("1") && sb_bin.is_none() {
+        eprintln!("wm-squeeze --mandala-exec: kernel wm-sandbox required (WM_MANDALA_REQUIRE_KERNEL=1)");
+        std::process::exit(3);
+    }
+
+    let (sandbox_class, verdict, output) = if let Some(ref sb) = sb_bin {
+        let rw_paths = format!("/tmp:{}", work_dir.display());
+        let ro_paths = "/usr:/lib:/lib64:/bin:/sbin:/etc:/proc:/dev/urandom:/dev/null:/dev/zero";
+        let res = Command::new(sb)
+            .args(["--ro", ro_paths, "--rw", &rw_paths, "--"])
+            .args(cmd_args)
+            .current_dir(&work_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        match res {
+            Ok(o) => ("landlock", "TRUSTED", o),
+            Err(e) => {
+                eprintln!("wm-squeeze --mandala-exec failed spawning {}: {}", sb.display(), e);
+                std::process::exit(127);
+            }
+        }
+    } else {
+        let res = Command::new(&cmd_args[0])
+            .args(&cmd_args[1..])
+            .current_dir(&work_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        match res {
+            Ok(o) => ("host-unconfined", "PROVISIONAL", o),
+            Err(e) => {
+                eprintln!("wm-squeeze --mandala-exec failed spawning '{}': {}", cmd_args[0], e);
+                std::process::exit(127);
+            }
+        }
+    };
+
+    let code = output.status.code().unwrap_or(1);
+    let stdout_hash = format!("sha256:{}", sha256_hex(&output.stdout));
+    let stderr_hash = format!("sha256:{}", sha256_hex(&output.stderr));
+    let ts = now_secs();
+    let pid = std::process::id();
+    let job_id = format!("mg-{ts}-{pid}");
+    let slot_id = format!("slot-{ts}-{pid}");
+    let task_id = format!("urn:wm:mandala:{ts}:{pid}");
+    let head_receipt_id = format!("urn:wm:rcpt:{ts}:{pid}");
+    let bundle_material = format!("{job_id}:{runner_profile}:{code}:{stdout_hash}:{stderr_hash}");
+    let bundle_sha256 = format!("sha256:{}", sha256_hex(bundle_material.as_bytes()));
+
+    // Canonical alphabetical JSON matching Python `json.dumps(core, sort_keys=True, separators=(",", ":"))`
+    let core_json = format!(
+        "{{\"action\":\"mandala.exec\",\"bundle_sha256\":\"{}\",\"exit\":{},\"head_receipt_id\":\"{}\",\"job_id\":\"{}\",\"receipt_count\":1,\"runner_profile\":\"{}\",\"sandbox_class\":\"{}\",\"schema\":\"mandala-cpr-pointer/0.5\",\"slot_id\":\"{}\",\"stdout_hash\":\"{}\",\"task_id\":\"{}\",\"verdict\":\"{}\",\"worker_id\":\"wm-squeeze\"}}",
+        json_escape(&bundle_sha256),
+        code,
+        json_escape(&head_receipt_id),
+        json_escape(&job_id),
+        json_escape(&runner_profile),
+        json_escape(sandbox_class),
+        json_escape(&slot_id),
+        json_escape(&stdout_hash),
+        json_escape(&task_id),
+        json_escape(verdict),
+    );
+
+    let signing_key = env::var("WM_CPR_HMAC_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env::var("WM_CONFINEMENT_SIGNING_KEY").ok().filter(|s| !s.trim().is_empty()));
+    let signed_json = if let Some(ref k) = signing_key {
+        let sig = hmac_sha256_hex(k.trim().as_bytes(), core_json.as_bytes());
+        format!(
+            "{{\"action\":\"mandala.exec\",\"bundle_sha256\":\"{}\",\"exit\":{},\"head_receipt_id\":\"{}\",\"hmac_sha256\":\"hmac-sha256:{}\",\"job_id\":\"{}\",\"receipt_count\":1,\"runner_profile\":\"{}\",\"sandbox_class\":\"{}\",\"schema\":\"mandala-cpr-pointer/0.5\",\"slot_id\":\"{}\",\"stdout_hash\":\"{}\",\"task_id\":\"{}\",\"verdict\":\"{}\",\"worker_id\":\"wm-squeeze\"}}",
+            json_escape(&bundle_sha256),
+            code,
+            json_escape(&head_receipt_id),
+            sig,
+            json_escape(&job_id),
+            json_escape(&runner_profile),
+            json_escape(sandbox_class),
+            json_escape(&slot_id),
+            json_escape(&stdout_hash),
+            json_escape(&task_id),
+            json_escape(verdict),
+        )
+    } else {
+        core_json
+    };
+
+    let cache_dir = handoff_cache_dir_rs();
+    let _ = fs::create_dir_all(&cache_dir);
+    let bridge_bin = env::var("WM_CPR_BRIDGE_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| resolve_exe_in_path("wm-cpr-bridge"));
+
+    let mut bridged = false;
+    if let Some(ref br) = bridge_bin {
+        let tmp_rcpt = cache_dir.join(format!("tmp_mandala_{pid}_{ts}.receipt.json"));
+        if fs::write(&tmp_rcpt, &signed_json).is_ok() {
+            if let Ok(r) = Command::new("python3")
+                .args(["-S", "-B"])
+                .arg(br)
+                .args(["publish", "--receipt"])
+                .arg(&tmp_rcpt)
+                .arg("--local-only")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                if r.success() {
+                    bridged = true;
+                }
+            }
+            let _ = fs::remove_file(&tmp_rcpt);
+        }
+    }
+    if !bridged {
+        let ledger = env::var("WM_CPR_BRIDGE_LEDGER")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cache_dir.join("cpr_bridge.jsonl"));
+        if let Some(par) = ledger.parent() {
+            let _ = fs::create_dir_all(par);
+        }
+        if let Ok(mut lf) = OpenOptions::new().create(true).append(true).open(&ledger) {
+            let _ = writeln!(lf, "{}", signed_json);
+        }
+        post_loopback_receipt(&cache_dir, &signed_json);
+    }
+
+    let _ = io::stdout().write_all(&output.stdout);
+    let _ = io::stderr().write_all(&output.stderr);
+    std::process::exit(code);
+}
+
+fn should_mandala_wrap_cmd(guard_mode: &str, cmd_line: &str) -> bool {
+    if cmd_line.trim().is_empty() || cmd_line.contains("wm-squeeze") {
+        return false;
+    }
+    guard_mode == "strict"
+        || (guard_mode == "advisory" && env::var("WM_MANDALA_EXEC_CONFINED").ok().as_deref() == Some("1"))
+}
+
+fn build_mandala_wrapper_cmd(cmd_line: &str, cwd: &str) -> String {
+    let sq = env::var("WM_SQUEEZE_BIN")
+        .ok()
+        .filter(|x| !x.is_empty())
+        .or_else(find_wm_squeeze_rs)
+        .unwrap_or_else(|| "wm-squeeze".to_string());
+    let mut prefix = format!("{} --mandala-exec", shell_quote(&sq));
+    if !cwd.trim().is_empty() {
+        prefix.push_str(" --cwd ");
+        prefix.push_str(&shell_quote(cwd.trim()));
+    }
+    if !has_unsafe_shell_meta_rs(cmd_line) {
+        if let Some(toks) = posix_shlex_split(cmd_line) {
+            if !toks.is_empty() && !toks[0].contains('=') {
+                return format!("{} -- {}", prefix, cmd_line.trim());
+            }
+        }
+    }
+    format!("{} -- sh -c {}", prefix, shell_quote(cmd_line.trim()))
+}
+
+
+fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str, guard_override: Option<&str>) {
     let payload = extract_top_level_fields(
         stdin_buf,
         &["tool_name", "tool_input", "command", "file_path", "path", "server_name", "hook_event_name", "session_id", "conversation_id", "cwd"],
@@ -3547,40 +4071,6 @@ fn run_pre_tool_non_agy(host: HostKind, event: &str, stdin_buf: &str) {
         return;
     }
 
-fn parse_json_usize_key(raw: &str, key: &str) -> Option<usize> {
-    let needle = format!("\"{}\"", key);
-    let idx = raw.find(&needle)?;
-    let rest = &raw[idx + needle.len()..];
-    let colon = rest.find(':')?;
-    let after = rest[colon + 1..].trim_start();
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse::<usize>().ok()
-}
-
-fn load_grimoire_read_limits() -> (usize, usize, usize) {
-    let path = env::var("WM_GRIMOIRE_PROFILE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env::var("HOME").unwrap_or_default())
-                .join(".local/share/whitemagic/grimoire_profile.json")
-        });
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return (400, 250, 50);
-    };
-    let max_unbounded = parse_json_usize_key(&raw, "max_unbounded_read_lines")
-        .filter(|&v| (50..=2000).contains(&v))
-        .unwrap_or(400);
-    let clamp_to = parse_json_usize_key(&raw, "clamp_read_lines")
-        .filter(|&v| (20..=1000).contains(&v))
-        .unwrap_or(250);
-    let wide_jsonl = parse_json_usize_key(&raw, "wide_jsonl_lines")
-        .filter(|&v| (10..=500).contains(&v))
-        .unwrap_or(50);
-    (max_unbounded, clamp_to, wide_jsonl)
-}
-
     // 1b. Cursor Read bounding: clamp unbounded huge text/wide-JSONL reads via adaptive grimoire_profile.json
     if host == HostKind::Cursor && matches!(tool_name, "Read" | "read_file") {
         let has_explicit_limit = ti_fields
@@ -3604,7 +4094,7 @@ fn load_grimoire_read_limits() -> (usize, usize, usize) {
                 if !is_media && p_obj.is_file() {
                     if let Ok(meta) = fs::metadata(p_obj) {
                         let sz = meta.len();
-                        let (max_unbounded, clamp_lines, wide_lines) = load_grimoire_read_limits();
+                        let (max_unbounded, clamp_lines, wide_lines) = load_grimoire_read_limits(host);
                         let wide = is_wide_line_file_rs(p_obj, sz);
                         let clamp_to = if wide {
                             Some(wide_lines)
@@ -3715,11 +4205,21 @@ fn load_grimoire_read_limits() -> (usize, usize, usize) {
 
     match classify_run_command_rs(cmd_line) {
         SimpleCmdOutcome::Rewrite(rewritten) => emit_pretool_rewrite_cmd(host, cmd_key, &rewritten),
-        SimpleCmdOutcome::DelegatePy | SimpleCmdOutcome::AllowAsIs => emit_pretool_allow(host),
+        SimpleCmdOutcome::DelegatePy | SimpleCmdOutcome::AllowAsIs => {
+            let guard = resolve_mandala_guard_mode(guard_override);
+            let can_rewrite = host == HostKind::Codex || (host == HostKind::Cursor && raw_event == "preToolUse");
+            if can_rewrite && should_mandala_wrap_cmd(&guard, cmd_line) {
+                let cwd_str = payload.get("cwd").map(|s| s.as_str()).unwrap_or("");
+                let wrapped = build_mandala_wrapper_cmd(cmd_line, cwd_str);
+                emit_pretool_rewrite_cmd(host, cmd_key, &wrapped);
+            } else {
+                emit_pretool_allow(host);
+            }
+        }
     }
 }
 
-fn run_pre_tool(fallback_py: Option<&str>, host: HostKind, event: Option<&str>) {
+fn run_pre_tool(fallback_py: Option<&str>, host: HostKind, event: Option<&str>, guard_override: Option<&str>) {
     if env::var("WM_AGY_BENCH_VANILLA").ok().as_deref() == Some("1") {
         emit_pretool_allow(host);
         return;
@@ -3730,7 +4230,7 @@ fn run_pre_tool(fallback_py: Option<&str>, host: HostKind, event: Option<&str>) 
         return;
     }
     if host != HostKind::Agy {
-        run_pre_tool_non_agy(host, event.unwrap_or(""), &stdin_buf);
+        run_pre_tool_non_agy(host, event.unwrap_or(""), &stdin_buf, guard_override);
         return;
     }
 
@@ -3837,6 +4337,12 @@ fn run_pre_tool(fallback_py: Option<&str>, host: HostKind, event: Option<&str>) 
                     return;
                 }
                 SimpleCmdOutcome::AllowAsIs => {
+                    let guard = resolve_mandala_guard_mode(guard_override);
+                    if should_mandala_wrap_cmd(&guard, cmd_line) {
+                        let wrapped = build_mandala_wrapper_cmd(cmd_line, cwd);
+                        println!("{{\"decision\":\"allow\",\"overwrite\":{{\"CommandLine\":\"{}\"}}}}", json_escape(&wrapped));
+                        return;
+                    }
                     pretool_allow();
                     return;
                 }
@@ -3879,7 +4385,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!(
-            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --pre-tool [--py FALLBACK_SCRIPT] [--host agy|codex|cursor] [--event NAME]\n  wm-squeeze --hud\n  wm-squeeze --post-tool [--host agy|codex|cursor]\n  wm-squeeze --stats"
+            "Usage:\n  wm-squeeze --safe [--cwd DIR] [--max-bytes N] [--] <cmd> [args...]\n  wm-squeeze --pipe [--kind auto|cargo|pytest|gotest|linter|git|rg|ls|generic] [--max-bytes N]\n  wm-squeeze --pre-tool [--py FALLBACK_SCRIPT] [--host agy|codex|cursor] [--event NAME] [--mandala-guard advisory|strict|off]\n  wm-squeeze --mandala-exec [--profile ID] [--cwd DIR] [--] <cmd> [args...]\n  wm-squeeze --hud\n  wm-squeeze --post-tool [--host agy|codex|cursor]\n  wm-squeeze --stats"
         );
         std::process::exit(0);
     }
@@ -3890,6 +4396,29 @@ fn main() {
     if args[0] == "--hud" {
         run_hud();
         return;
+    }
+    if args[0] == "--mandala-exec" {
+        let mut profile: Option<String> = None;
+        let mut cwd: Option<String> = None;
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--profile" if i + 1 < args.len() => {
+                    profile = Some(args[i + 1].clone());
+                    i += 2;
+                }
+                "--cwd" if i + 1 < args.len() => {
+                    cwd = Some(args[i + 1].clone());
+                    i += 2;
+                }
+                "--" => {
+                    i += 1;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        exec_via_mandala_guard(&args[i..], cwd.as_deref(), profile.as_deref());
     }
     if args[0] == "--post-tool" {
         let mut host = HostKind::Agy;
@@ -3909,6 +4438,7 @@ fn main() {
         let mut py_fb: Option<&str> = None;
         let mut host = HostKind::Agy;
         let mut event: Option<&str> = None;
+        let mut guard: Option<String> = None;
         let mut i = 1;
         while i < args.len() {
             if args[i] == "--py" && i + 1 < args.len() {
@@ -3920,11 +4450,14 @@ fn main() {
             } else if args[i] == "--event" && i + 1 < args.len() {
                 event = Some(args[i + 1].as_str());
                 i += 2;
+            } else if args[i] == "--mandala-guard" && i + 1 < args.len() {
+                guard = Some(args[i + 1].clone());
+                i += 2;
             } else {
                 i += 1;
             }
         }
-        run_pre_tool(py_fb, host, event);
+        run_pre_tool(py_fb, host, event, guard.as_deref());
         return;
     }
 

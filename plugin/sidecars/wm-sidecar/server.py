@@ -107,6 +107,50 @@ def _discovery_path() -> Path:
     return _handoff_cache_dir() / "sidecar.json"
 
 
+def _grimoire_profile_path() -> Path:
+    return Path(
+        os.environ.get("WM_GRIMOIRE_PROFILE")
+        or str(Path.home() / ".local" / "share" / "whitemagic" / "grimoire_profile.json")
+    )
+
+
+def _wm_fast_stats_path() -> Path:
+    return Path(
+        os.environ.get("WM_FAST_STATS")
+        or str(Path.home() / ".local" / "share" / "whitemagic" / "wm_fast_stats.jsonl")
+    )
+
+
+def _load_grimoire_summary() -> dict:
+    p = _grimoire_profile_path()
+    if not p.is_file():
+        return {"present": False}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        conf = obj.get("confinement") or {}
+        mt = obj.get("model_tuning") or {}
+        hp = obj.get("host_profiles") or {}
+        tel = obj.get("telemetry") or {}
+        host_models = {}
+        if isinstance(hp, dict):
+            for k, v in hp.items():
+                if isinstance(v, dict) and v.get("resolved_family"):
+                    host_models[str(k)] = str(v["resolved_family"])
+        return {
+            "present": True,
+            "schema": str(obj.get("schema") or "wm-grimoire-profile/1.0"),
+            "hardware_tier": str(obj.get("hardware_tier") or "unknown"),
+            "confinement_profile": str(conf.get("runner_profile") or "unknown"),
+            "mandala_guard_mode": str(conf.get("mandala_guard_mode") or "advisory"),
+            "model_family": str(mt.get("resolved_family") or "unknown"),
+            "host_models": host_models,
+            "recommendations_count": len(tel.get("recommendations") or []),
+            "profile_path": _redact_home(str(p)),
+        }
+    except Exception:
+        return {"present": False}
+
+
 def _redact_home(val: str) -> str:
     if not val:
         return ""
@@ -221,11 +265,18 @@ def _build_status_payload() -> dict:
         if p.is_dir()
     ]
 
+    fast_rows = _read_jsonl_tail(_wm_fast_stats_path(), 200)
+    fast_calls = len(fast_rows)
+    fast_errs = sum(1 for r in fast_rows if r.get("err"))
+    fast_out = sum(int(r.get("out") or 0) for r in fast_rows)
+    fast_ms = sum(int(r.get("wall_ms") or 0) for r in fast_rows)
+
     return {
         "ok": True,
         "version": VERSION,
         "pid": os.getpid(),
         "hosts_detected": hosts_detected,
+        "grimoire": _load_grimoire_summary(),
         "telemetry": {
             "sample_stops": len(stops),
             "avg_hit_pct": avg_hit,
@@ -238,6 +289,13 @@ def _build_status_payload() -> dict:
             "raw_bytes": sq_raw,
             "saved_bytes": sq_saved,
             "est_tokens_saved": sq_saved // 4,
+        },
+        "wm_fast": {
+            "calls": fast_calls,
+            "errors": fast_errs,
+            "total_bytes": fast_out,
+            "avg_bytes": (fast_out // fast_calls) if fast_calls else 0,
+            "avg_ms": (fast_ms // fast_calls) if fast_calls else 0,
         },
         "crystals": crystals,
         "cpr_ledger_tail": list(reversed(receipts)),
@@ -315,6 +373,7 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="kpi-lbl">Squeeze Saved</div><div class="kpi-val" id="kpi-sq">-</div></div>
     <div class="card"><div class="kpi-lbl">Ready Crystals</div><div class="kpi-val" id="kpi-crys">-</div></div>
   </div>
+  <div class="card"><h2>Adaptive Grimoire &amp; wm_fast</h2><div id="grimoire-line">Not detected</div></div>
   <div class="card"><h2>Ready Handoff Crystals (wm-reset)</h2><ul id="list-crystals"></ul></div>
   <div class="card"><h2>Recent CPR Ledger (wm-receipt/1.2)</h2><ul id="list-receipts"></ul></div>
   <div class="card"><h2>Recent Turn Telemetry</h2><ul id="list-stops"></ul></div>
@@ -356,6 +415,11 @@ async function refresh() {
     document.getElementById("kpi-flips").textContent = String(d.telemetry.recent_flips || 0);
     document.getElementById("kpi-sq").textContent = Math.round((d.wm_squeeze.saved_bytes || 0) / 1024) + " KB";
     document.getElementById("kpi-crys").textContent = String((d.crystals || []).length);
+    const gr = d.grimoire || {};
+    const wf = d.wm_fast || {};
+    document.getElementById("grimoire-line").textContent = gr.present
+      ? ("tier=" + gr.hardware_tier + " | conf=" + gr.confinement_profile + " (guard=" + (gr.mandala_guard_mode || "advisory") + ") | model=" + gr.model_family + " | wm_fast=" + (wf.calls || 0) + " calls (" + (wf.avg_ms || 0) + "ms)")
+      : ("wm_fast=" + (wf.calls || 0) + " calls | Grimoire profile not seeded yet");
     setList(document.getElementById("list-crystals"), d.crystals, "No cached crystals yet.", (c) => {
       const li = document.createElement("li");
       const code = document.createElement("code");

@@ -2407,6 +2407,140 @@ def test_v460_multihost_codex_cursor_and_cpr_translate():
         )
 
 
+def test_c2_grimoire_profiles_mandala_exec_and_sidecar_telemetry():
+    print("\n15. Phase C2 Per-Host Grimoire Profile, --mandala-exec & Sidecar Grimoire/wm_fast:")
+    import signal
+    import urllib.request
+
+    reset_bin = LOCAL_BIN / "wm-reset"
+    handoff_bin = LOCAL_BIN / "wm-handoff"
+    bridge_bin = LOCAL_BIN / "wm-cpr-bridge"
+    sidecar_py = KIT / "plugin" / "sidecars" / "wm-sidecar" / "server.py"
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        gp_path = td_path / "grimoire_profile.json"
+        gp_path.write_text(
+            json.dumps({
+                "schema": "wm-grimoire-profile/1.1",
+                "hardware_tier": "standard",
+                "confinement": {"runner_profile": "bwrap-landlock-v1", "mandala_guard_mode": "advisory"},
+                "model_tuning": {"resolved_family": "gemini4", "max_unbounded_read_lines": 350, "clamp_read_lines": 210, "wide_jsonl_lines": 40, "context_warn_tokens": 24000, "context_cliff_tokens": 48000, "enable_flip_guard": False, "turn0_brief_max_bytes": 1400},
+                "host_profiles": {
+                    "agy": {"resolved_family": "gemini4", "max_unbounded_read_lines": 220, "clamp_read_lines": 160, "wide_jsonl_lines": 45, "context_warn_tokens": 24000, "context_cliff_tokens": 48000, "enable_flip_guard": False, "turn0_brief_max_bytes": 1400},
+                    "cursor": {"resolved_family": "claude4", "max_unbounded_read_lines": 180, "clamp_read_lines": 120, "wide_jsonl_lines": 35, "context_warn_tokens": 24000, "context_cliff_tokens": 48000, "enable_flip_guard": False, "turn0_brief_max_bytes": 1400},
+                },
+                "turbo_hosts": ["cursor", "codex", "agy"],
+                "telemetry": {"recommendations": ["prefer compact slices"]},
+            }),
+            encoding="utf-8",
+        )
+
+        # 15a) Per-host Cursor read clamp (120L) vs AGY read clamp (160L)
+        big_txt = td_path / "big_sample.py"
+        big_txt.write_text("".join(f"x_{i} = {i}\n" for i in range(420)), encoding="utf-8")
+        env_gp = {**os.environ, "WM_GRIMOIRE_PROFILE": str(gp_path)}
+
+        r_cur = subprocess.run(
+            [str(WM_SQUEEZE), "--pre-tool", "--host", "cursor", "--event", "preToolUse"],
+            input=json.dumps({"tool_name": "Read", "tool_input": {"path": str(big_txt)}}),
+            capture_output=True, text=True, env=env_gp, timeout=5,
+        )
+        cur_j = json.loads(r_cur.stdout) if r_cur.returncode == 0 else {}
+        r_agy = subprocess.run(
+            [str(WM_SQUEEZE), "--pre-tool", "--host", "agy"],
+            input=json.dumps({"toolCall": {"name": "read_file", "args": {"Path": str(big_txt)}}}),
+            capture_output=True, text=True, env=env_gp, timeout=5,
+        )
+        agy_j = json.loads(r_agy.stdout) if r_agy.returncode == 0 else {}
+        check(
+            "wm-squeeze honors per-host Grimoire 1.1 limits (Cursor=120L, AGY=160L)",
+            cur_j.get("updated_input", {}).get("limit") == 120
+            and agy_j.get("overwrite", {}).get("EndLine") == 160,
+            f"cur={cur_j} agy={agy_j}",
+        )
+
+        # 15b) stop_telemetry fires early crystal at 50k ctx when local-small Grimoire thresholds (24k warn / 48k cliff) active
+        tp_small = td_path / "small_tp.jsonl"
+        tp_small.write_text(
+            json.dumps({"type": "PLANNER_RESPONSE", "model": "qwen-local", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 200}) + "\n",
+            encoding="utf-8",
+        )
+        cache_dir = td_path / "cache"
+        cache_dir.mkdir()
+        env_st = {
+            **env_gp,
+            "WM_AGY_TELEMETRY": str(td_path / "tel.jsonl"),
+            "WM_HANDOFF_CACHE_DIR": str(cache_dir),
+            "WM_HANDOFF_BIN": str(handoff_bin),
+        }
+        run_hook(STOP_HOOK, {"transcriptPath": str(tp_small), "conversationId": "conv_c2_small", "cwd": str(KIT), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"}, env_extra=env_st)
+        check("stop_telemetry honors Grimoire tight warn/cliff thresholds (30k crystal)", (cache_dir / "latest_conv_c2_small.md").is_file())
+
+        # 15c) wm-reset --launcher auto reads turbo_hosts + wm-handoff honors brief cap
+        r_rst = subprocess.run([str(reset_bin), "--cwd", str(KIT), "--dry-run"], capture_output=True, text=True, env={**env_st, "WM_RESET_LAUNCHER": "auto"}, timeout=10)
+        check(
+            "wm-reset WM_RESET_LAUNCHER=auto selects turbo_hosts[0] from Grimoire",
+            r_rst.returncode == 0 and json.loads(r_rst.stdout).get("launcher") == "cursor",
+            r_rst.stdout or r_rst.stderr,
+        )
+
+        # 15d) Codex strict --mandala-guard hook rewrite + --mandala-exec -> sidecar + ledger
+        r_mg_hook = subprocess.run(
+            [str(WM_SQUEEZE), "--pre-tool", "--host", "codex", "--mandala-guard", "strict"],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "echo MANDALA_C2_OK"}}),
+            capture_output=True, text=True, env=env_gp, timeout=5,
+        )
+        mg_hook_j = json.loads(r_mg_hook.stdout) if r_mg_hook.returncode == 0 else {}
+        check(
+            "wm-squeeze --mandala-guard strict rewrites shell command via --mandala-exec",
+            "--mandala-exec" in mg_hook_j.get("hookSpecificOutput", {}).get("updatedInput", {}).get("command", ""),
+            str(mg_hook_j),
+        )
+
+        fast_log = td_path / "wm_fast_stats.jsonl"
+        fast_log.write_text('{"ts":1,"tool":"batch_search","out":128,"wall_ms":12,"err":false}\n', encoding="utf-8")
+        sc_env = {
+            **env_gp,
+            "WM_HANDOFF_CACHE_DIR": str(cache_dir),
+            "WM_CPR_BRIDGE_LEDGER": str(cache_dir / "cpr_bridge.jsonl"),
+            "WM_FAST_STATS": str(fast_log),
+            "WM_CPR_HMAC_KEY": "c2_mandala_hmac_secret",
+            "WM_CPR_BRIDGE_BIN": str(bridge_bin),
+            "WM_SANDBOX_BIN": "none",
+            "ANTIGRAVITY_SIDECAR_WEB_PORT": "0",
+        }
+        sc_proc = subprocess.Popen([sys.executable, "-S", "-B", str(sidecar_py)], env=sc_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            disc = cache_dir / "sidecar.json"
+            for _ in range(40):
+                if disc.is_file():
+                    break
+                time.sleep(0.05)
+            r_exec = subprocess.run(
+                [str(WM_SQUEEZE), "--mandala-exec", "--cwd", str(td_path), "--", "echo", "C2_EXEC_OK"],
+                capture_output=True, text=True, env=sc_env, timeout=10,
+            )
+            info = json.loads(disc.read_text(encoding="utf-8"))
+            with urllib.request.urlopen(f"{info['url']}/api/status", timeout=2) as r_st:
+                st_j = json.loads(r_st.read().decode("utf-8"))
+            tail = st_j.get("cpr_ledger_tail") or []
+            has_mandala_ptr = any(item.get("schema") == "mandala-cpr-pointer/0.5" and item.get("sig_status") == "verified" for item in tail)
+            check(
+                "wm-squeeze --mandala-exec emits verified HMAC mandala-cpr-pointer/0.5 -> sidecar /api/status (with grimoire+wm_fast)",
+                r_exec.returncode == 0
+                and "C2_EXEC_OK" in r_exec.stdout
+                and has_mandala_ptr
+                and st_j.get("grimoire", {}).get("present") is True
+                and st_j.get("grimoire", {}).get("confinement_profile") == "bwrap-landlock-v1"
+                and st_j.get("wm_fast", {}).get("calls") == 1,
+                f"rc={r_exec.returncode} tail={tail} grimoire={st_j.get('grimoire')} fast={st_j.get('wm_fast')}",
+            )
+        finally:
+            sc_proc.send_signal(signal.SIGTERM)
+            sc_proc.wait(timeout=4)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="agy_hook_state_") as state_td:
         os.environ["WM_HOOK_STATE_DIR"] = state_td
@@ -2425,6 +2559,7 @@ def main():
         test_v450_rust_pretool_crystal_and_swarm_guards()
         test_v451_sidecar_cpr_bridge_and_plugin_scoping()
         test_v460_multihost_codex_cursor_and_cpr_translate()
+        test_c2_grimoire_profiles_mandala_exec_and_sidecar_telemetry()
     print(f"\n=== Wave 3/4/v4.6.0 Test Summary: {PASS} passed, {FAIL} failed ===")
     sys.exit(0 if FAIL == 0 else 1)
 
