@@ -544,7 +544,7 @@ def test_empty_cwd_no_tools_guard_and_max_tool_calls_kills_worker(tmp_path):
     by_id = {j["id"]: j for j in mod.FleetStore(db_path).export_campaign("c_tools")["jobs"]}
     rec_out = json.loads(Path(by_id["rec1"]["output_path"]).read_text(encoding="utf-8"))
     expected_empty = str(art_dir / "_empty_cwd")
-    assert rec_out["cwd"] == expected_empty
+    assert Path(rec_out["cwd"]).resolve() == Path(expected_empty).resolve()
     assert "--workspace" in rec_out["args"] and expected_empty in rec_out["args"]
     assert rec_out["prompt"].startswith("PURE SYNTHESIS MODE:")
 
@@ -1311,3 +1311,80 @@ def test_ask_text_out_and_state_dir_shorthand(tmp_path):
     assert (state_dir / "c_txt_checkpoint.json").is_file()
     assert "reasoning_pct" in meta["summary"]["tokens"]
     assert meta["summary"]["tokens"]["reasoning_pct"] > 0.0
+
+
+VM_STAT_SAMPLE = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               1000.
+Pages active:                             5000.
+Pages inactive:                           2000.
+Pages speculative:                         500.
+Pages purgeable:                           500.
+"""
+
+
+def _no_proc_meminfo(monkeypatch):
+    real_is_file = Path.is_file
+
+    def fake_is_file(self):
+        if str(self) == "/proc/meminfo":
+            return False
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", fake_is_file)
+
+
+def test_read_mem_available_mb_darwin_vm_stat_fallback(monkeypatch):
+    mod = _load_fleet_mod()
+    _no_proc_meminfo(monkeypatch)
+
+    class _Res:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+
+    def fake_run(cmd, *a, **kw):
+        if cmd and cmd[0] == "sysctl":
+            return _Res("16384\n")
+        return _Res(VM_STAT_SAMPLE)
+
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    # free + inactive + speculative + purgeable = 4000 pages * 16 KiB
+    assert mod.read_mem_available_mb() == pytest.approx(4000 * 16384 / (1024 * 1024))
+
+
+def test_read_mem_available_mb_darwin_vm_stat_failure_returns_none(monkeypatch):
+    mod = _load_fleet_mod()
+    _no_proc_meminfo(monkeypatch)
+
+    def boom(*a, **kw):
+        raise FileNotFoundError("vm_stat")
+
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    monkeypatch.setattr(mod.subprocess, "run", boom)
+    assert mod.read_mem_available_mb() is None
+
+
+def test_swarm_openssl_ed25519_sign_verify_roundtrip():
+    loader = importlib.machinery.SourceFileLoader("wm_swarm_openssl_t", str(REPO_ROOT / "bin" / "wm-grok-swarm"))
+    spec = importlib.util.spec_from_loader("wm_swarm_openssl_t", loader)
+    swarm = importlib.util.module_from_spec(spec)
+    prev = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader.exec_module(swarm)
+    finally:
+        sys.dont_write_bytecode = prev
+    openssl = swarm._find_openssl_ed25519()
+    if not openssl:
+        pytest.skip("OpenSSL 3+ (non-LibreSSL) not available")
+    seed = os.urandom(32)
+    pem = swarm._der_to_pem(swarm._ED25519_PKCS8_PREFIX + seed, "PRIVATE KEY")
+    assert pem.startswith(b"-----BEGIN PRIVATE KEY-----\n") and pem.endswith(b"-----END PRIVATE KEY-----\n")
+    priv = swarm._OpensslEd25519PrivateKey(pem, openssl)
+    pub = priv.public_key()
+    sig = priv.sign(b"payload")
+    assert len(sig) == 64
+    pub.verify(sig, b"payload")
+    with pytest.raises(ValueError):
+        pub.verify(sig, b"tampered")

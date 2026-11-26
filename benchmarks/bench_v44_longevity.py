@@ -666,6 +666,10 @@ def benchmark_v451_sidecar_cpr_and_plugin_scoping() -> dict:
                         kb = int(line.split()[1])
                         rss_mb = round(kb / 1024.0, 1)
                         break
+            elif sys.platform == "darwin":
+                ps_r = subprocess.run(["ps", "-o", "rss=", "-p", str(proc.pid)], capture_output=True, text=True)
+                if ps_r.returncode == 0 and ps_r.stdout.strip().isdigit():
+                    rss_mb = round(int(ps_r.stdout.strip()) / 1024.0, 1)
         finally:
             proc.send_signal(signal.SIGTERM)
             proc.wait(timeout=4)
