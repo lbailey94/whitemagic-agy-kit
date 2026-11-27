@@ -37,6 +37,8 @@ Make sure `~/.local/bin` is on your `PATH`.
 | Preset | Action | Default Model | Tool Budget | Best For |
 | :--- | :--- | :--- | :--- | :--- |
 | `synthesis` | `ask` | `grok-4.7-medium` | `0` (`empty_cwd` + no-tools guard) | Map-reduce triage, corpus/log/transcript digestion, batch JSON classification (**18.8× cheaper**) |
+| `dataset` | `ask` | `grok-4.7-low` | `0` (`12x` conc., `240s` wall + `60s` grace) | High-throughput verified JSON/code dataset synthesis (**~4× faster & ~3–4× cheaper** than `synthesis` on bulk tasks) |
+| `blueprint` | `ask` | `grok-4.7-high-fast` | `0` (`4x` conc., `480s` wall + `90s` grace) | Long-form multi-section architecture blueprints & specs without premature thinking-phase timeouts |
 | `fast` | `ask` | `grok-4.7-medium-fast` | `0` (`empty_cwd` + no-tools guard) | Interactive latency-sensitive pure synthesis (~2× faster wall, ~2× quota) |
 | `audit` | `ask` | `grok-4.7-high` | `15` | Read-only codebase/security inspection across a repo |
 | `plan` | `plan` | `grok-4.7-high` | `15` | Architecture second opinions & refactor plans |
@@ -49,6 +51,11 @@ Make sure `~/.local/bin` is on your `PATH`.
 ### 1. One-Shot Parallel Fan-Out (`ask`)
 
 ```bash
+# Write clean unwrapped Markdown/text directly with --text-out (no JSON envelope!)
+cursor-fleet ask --preset blueprint --prompt-file ./spec_prompt.txt \
+  --state-dir ./_fleet --text-out ./ARCHITECTURE_SPEC.md
+
+# Or fan out multiple prompts in parallel into a combined Markdown report
 cursor-fleet ask --preset synthesis \
   "Compare SQLite WAL vs DuckDB for a 500MB local analytics cache in 5 bullets." \
   "Design a minimal RFC 9421 webhook verifier in Python stdlib." \
@@ -187,13 +194,22 @@ cursor-fleet pipeline examples/cursor-fleet/security_funnel.json --cwd /path/to/
 
 ---
 
-## Managing Campaigns & Crash-Safe Resume
+## Managing Campaigns, Self-Healing Retries & Crash-Safe Resume
 
 ```bash
 cursor-fleet campaigns                         # list all campaigns, status, spend, quota %
 cursor-fleet status --campaign ticket-triage   # live summary + host RAM/disk headroom
 cursor-fleet inspect --campaign ticket-triage --failed-only --show-output
 cursor-fleet report --campaign ticket-triage --format md --out report.md
+
+# Isolate campaign state cleanly in one directory (auto-wires fleet.db, artifacts/, checkpoint.json)
+cursor-fleet run --campaign my-wave --preset dataset --state-dir ./_fleet --timeout-fallback-model auto
+
+# Retry ONLY failed jobs on a faster model tier (zero manual SQLite edits!)
+cursor-fleet retry --campaign my-wave --state-dir ./_fleet --model high-fast --run --preset blueprint
+
+# Downshift ALL remaining non-done jobs from medium -> low mid-campaign (preserving done jobs)
+cursor-fleet retry --campaign my-wave --state-dir ./_fleet --non-done --model low --run --preset dataset
 
 # Interrupted by Ctrl+C, --max-usd, or Cursor quota reset? Resume cleanly — done jobs are skipped:
 cursor-fleet run --campaign ticket-triage --preset synthesis --max-usd 3.00
@@ -235,8 +251,10 @@ Example MCP call (zero-tool pure synthesis, 18.8× cheaper):
 
 ## Tuning Tips From Empirical Calibration
 
-1. **Always prefer `--preset synthesis` with inlined context** whenever workers do not need to explore a repository interactively. Unconstrained `ask` workers run 10–25 workspace search tool calls (~230k tokens/worker), whereas `--preset synthesis` runs `0` tool calls (~12k tokens/worker).
-2. **Pack 4 items per worker (`--batch-size 4`)** for structured triage/classification: beats `N=1` (overhead per worker) and `N=8` (reasoning wall timeouts) on both tokens and wall-time per item.
-3. **Stick to standard non-fast tiers (`medium` / `high`)** for batch fleets; reserve `*-fast` for latency-critical interactive checks.
-4. **Static instructions always go first**: `map` and `enqueue` place guardrails and `--instruction` before varying `[TASK]` / `=== ITEM ===` blocks to maximize Grok 4.7 prefix cache reuse.
+1. **Always prefer `--preset synthesis` (or `--preset dataset` / `--preset blueprint`) with inlined context** whenever workers do not need to explore a repository interactively. Unconstrained `ask` workers run 10–25 workspace search tool calls (~230k tokens/worker), whereas zero-tool presets run `0` tool calls (~12k tokens/worker, **18.8× fewer tokens**).
+2. **Use `--preset dataset` (`grok-4.7-low`, `12x` conc.) for large locally-verified JSON/code generation waves**: empirical 146-worker (`4.77h` compute) calibration showed `grok-4.7-medium` spent `77%–83%` of output tokens on reasoning on 6-task batches (`200–300s/worker`), whereas `grok-4.7-low` ran **~4× faster** and **~3–4× cheaper** while achieving **85.7%–96.7%** isolated `python3 -I` execution pass rates and **100%** schema compliance.
+3. **Never lose an actively streaming answer to a wall timeout**: `--streaming-grace 60` (enabled by default; `90s` on `--preset blueprint`) detects when `thinking/completed` or `assistant` text streaming is actively flushing and lets the worker finish instead of killing it mid-paragraph. Pair with `--timeout-fallback-model auto` to auto-step down stuck jobs (`high -> high-fast -> medium-fast -> low -> low-fast`) with `1.25×` wall timeout on retry.
+4. **Watch live `reason=XX%` and `[fleet][hint]` telemetry**: if a bulk campaign exceeds `65%` reasoning overhead or hits wall timeouts, `cursor-fleet` prints the exact one-line `cursor-fleet retry` command to switch tiers without touching SQLite.
+5. **Pack 4 items per worker (`--batch-size 4`)** for structured triage/classification; **static instructions always go first** (`map` and `enqueue` keep guardrails + `--instruction` ahead of varying items, driving `46%–54%` Grok 4.7 prefix cache hit rates).
+6. **Automatic JSON escape repair**: `--parse-json` and `extract_json_payload` attempt strict `json.loads` first, then fall back to a string-aware repair pass for common LLM JSON bugs (stray Python backslashes like `\U`, `\d`, `\s`, `\'` and trailing commas).
 

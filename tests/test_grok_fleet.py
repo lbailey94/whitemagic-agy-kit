@@ -84,6 +84,33 @@ if "WALL_HANG" in prompt:
     time.sleep(3)
     sys.exit(0)
 
+if "STREAM_GRACE" in prompt:
+    emit({{"type": "thinking", "subtype": "delta", "text": "planning", "session_id": sid}})
+    time.sleep(0.5)
+    emit({{"type": "thinking", "subtype": "completed", "session_id": sid}})
+    emit({{"type": "assistant", "message": {{"role": "assistant", "content": [{{"type": "text", "text": "partial "}}]}}, "session_id": sid}})
+    time.sleep(0.9)
+    emit({{"type": "assistant", "message": {{"role": "assistant", "content": [{{"type": "text", "text": "completed"}}]}}, "session_id": sid}})
+    emit({{
+        "type": "result",
+        "subtype": "success",
+        "duration_ms": 1400,
+        "duration_api_ms": 1350,
+        "is_error": False,
+        "result": "partial completed",
+        "session_id": sid,
+        "usage": {{"inputTokens": 500, "cacheReadTokens": 100, "cacheWriteTokens": 0, "outputTokens": 200, "reasoningTokens": 120}},
+    }})
+    sys.exit(0)
+
+if "SLOW_HIGH_ONLY" in prompt and model == "grok-4.7-high":
+    time.sleep(3)
+    sys.exit(0)
+
+if "FAIL_ON_MEDIUM" in prompt and model == "grok-4.7-medium":
+    time.sleep(3)
+    sys.exit(0)
+
 if "TOOL_BURST" in prompt:
     emit({{"type": "tool_call", "subtype": "started", "session_id": sid}})
     emit({{"type": "tool_call", "subtype": "completed", "session_id": sid}})
@@ -151,6 +178,8 @@ elif "INTERMEDIATE MERGE STEP" in prompt or "FINAL_REDUCE_SYNTH" in prompt:
     reply = json.dumps({{"reduced": True, "parts_seen": prompt.count("=== PART "), "model": model}})
 elif "blind consensus judge" in prompt:
     reply = json.dumps({{"consensus": True, "panelists_seen": prompt.count("=== PANELIST "), "judge_model": model}})
+elif "RAW_MD_OUT" in prompt:
+    reply = "# Raw Blueprint Title\\n\\nExact unwrapped markdown body."
 else:
     reply = json.dumps({{"ok": True, "echo": prompt[:40], "model": model}})
 emit({{"type": "assistant", "message": {{"role": "assistant", "content": [{{"type": "text", "text": reply}}]}}, "session_id": sid}})
@@ -1094,3 +1123,191 @@ def test_pipeline_three_stage_map_filter_audit(tmp_path):
     assert res["stages"][0]["items_emitted"] == 4
     assert res["stages"][1]["in_items"] == 4 and res["stages"][1]["kept_items"] == 2
     assert res["stages"][2]["items_emitted"] == 2
+
+
+def test_streaming_grace_protects_active_output_from_wall_kill(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    state_dir = tmp_path / "state"
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+
+    p = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "ask",
+            "--preset", "blueprint", "--campaign", "c_grace",
+            "--wall-timeout", "1", "--streaming-grace", "4", "--stall-timeout", "10",
+            "--state-dir", str(state_dir),
+            "STREAM_GRACE finish writing after thinking",
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    out = json.loads(p.stdout)
+    assert out["ok"] is True
+    assert out["results"][0]["output"] == "partial completed"
+    assert "[grace]" in p.stderr
+
+
+def test_presets_dataset_and_blueprint_parity_across_cli_swarm_mcp():
+    mod = _load_fleet_mod()
+    assert "dataset" in mod.FLEET_PRESETS and mod.FLEET_PRESETS["dataset"]["model"] == "low"
+    assert mod.FLEET_PRESETS["dataset"]["read_concurrency"] == 12
+    assert "blueprint" in mod.FLEET_PRESETS and mod.FLEET_PRESETS["blueprint"]["model"] == "high-fast"
+    assert mod.FLEET_PRESETS["blueprint"]["wall_timeout"] == 480
+    assert mod.FLEET_PRESETS["blueprint"]["streaming_grace"] == 90
+
+    swarm_bin = REPO_ROOT / "bin" / "wm-grok-swarm"
+    prev = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader = importlib.machinery.SourceFileLoader("wm_grok_swarm_v22_mod", str(swarm_bin))
+        spec = importlib.util.spec_from_loader("wm_grok_swarm_v22_mod", loader)
+        assert spec is not None and spec.loader is not None
+        smod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smod)
+    finally:
+        sys.dont_write_bytecode = prev
+    assert {"dataset", "blueprint"}.issubset(smod.SWARM_PRESETS.keys())
+
+    mcp_bin = REPO_ROOT / "bin" / "wm-grok-mcp"
+    p_mcp = subprocess.run(
+        [sys.executable, "-B", str(mcp_bin)],
+        input='{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n',
+        capture_output=True, text=True, check=True,
+    )
+    preset_enum = json.loads(p_mcp.stdout.strip())["result"]["tools"][0]["inputSchema"]["properties"]["preset"]["enum"]
+    assert {"dataset", "blueprint"}.issubset(set(preset_enum))
+
+
+def test_timeout_fallback_model_auto_escalation(tmp_path):
+    mod = _load_fleet_mod()
+    assert mod.step_down_timeout_model("grok-4.7-high", "auto") == "grok-4.7-high-fast"
+    assert mod.step_down_timeout_model("grok-4.7-medium", "auto") == "grok-4.7-medium-fast"
+    assert mod.step_down_timeout_model("grok-4.7-low", "auto") == "grok-4.7-low-fast"
+    assert mod.step_down_timeout_model("grok-4.7-low-fast", "auto") is None
+    assert mod.step_down_timeout_model("grok-4.7-medium", "low") == "grok-4.7-low"
+
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    state_dir = tmp_path / "state"
+    manifest = tmp_path / "m.jsonl"
+    manifest.write_text(
+        json.dumps({"id": "fb1", "name": "fb1", "stage": "s", "action": "ask", "model": "high", "cwd": str(tmp_path), "prompt": "SLOW_HIGH_ONLY spec"}) + "\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+    subprocess.run(
+        [sys.executable, "-B", str(FLEET_BIN), "enqueue", "--campaign", "c_fb", "--manifest", str(manifest), "--state-dir", str(state_dir)],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    p_run = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "run", "--campaign", "c_fb",
+            "--wall-timeout", "1", "--streaming-grace", "0", "--stall-timeout", "10",
+            "--timeout-fallback-model", "auto", "--max-retries", "2",
+            "--state-dir", str(state_dir),
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    res = json.loads(p_run.stdout)
+    assert res["ok"] is True
+    assert "[fallback]" in p_run.stderr
+    j = mod.FleetStore(state_dir / "fleet.db").export_campaign("c_fb")["jobs"][0]
+    assert j["status"] == "done"
+    assert j["attempts"] == 2
+    assert j["resolved_model"] == "grok-4.7-high-fast"
+
+
+def test_retry_subcommand_and_run_model_override(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    state_dir = tmp_path / "state"
+    manifest = tmp_path / "m.jsonl"
+    manifest.write_text(
+        "\n".join([
+            json.dumps({"id": "j1", "name": "j1", "stage": "s", "action": "ask", "model": "medium", "cwd": str(tmp_path), "prompt": "FAIL_ON_MEDIUM batch 1"}),
+            json.dumps({"id": "j2", "name": "j2", "stage": "s", "action": "ask", "model": "medium", "cwd": str(tmp_path), "prompt": "ok batch 2"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+    subprocess.run(
+        [sys.executable, "-B", str(FLEET_BIN), "enqueue", "--campaign", "c_ret", "--manifest", str(manifest), "--state-dir", str(state_dir)],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    p1 = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "run", "--campaign", "c_ret",
+            "--wall-timeout", "1", "--streaming-grace", "0", "--stall-timeout", "10",
+            "--state-dir", str(state_dir),
+        ],
+        env=env, capture_output=True, text=True,
+    )
+    assert p1.returncode == 1
+    s1 = json.loads(p1.stdout)
+    assert s1["counts"].get("done") == 1 and s1["counts"].get("failed") == 1
+    assert any("cursor-fleet retry" in h for h in s1.get("hints", []))
+
+    p2 = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "retry", "--campaign", "c_ret",
+            "--model", "low", "--run", "--preset", "dataset",
+            "--state-dir", str(state_dir),
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    s2 = json.loads(p2.stdout)
+    assert s2["ok"] is True
+    assert s2["counts"].get("done") == 2
+    mod = _load_fleet_mod()
+    by_id = {j["id"]: j for j in mod.FleetStore(state_dir / "fleet.db").export_campaign("c_ret")["jobs"]}
+    assert by_id["j1"]["resolved_model"] == "grok-4.7-low"
+    assert by_id["j2"]["resolved_model"] == "grok-4.7-medium"
+
+
+def test_extract_json_payload_repairs_python_escapes_and_trailing_commas():
+    mod = _load_fleet_mod()
+    # Invalid JSON escapes (\U0001f60a, \d+, \s, \') plus trailing comma inside array
+    tricky = r'''[{"id": "t1", "code": "assert f('a\U0001f60ab') == 1 and re.match(r'\d+\s+', '12 ')", "quote": "it\'s ok",},]'''
+    parsed = mod.extract_json_payload(tricky)
+    assert isinstance(parsed, list) and len(parsed) == 1
+    assert parsed[0]["id"] == "t1"
+    assert r"\U0001f60a" in parsed[0]["code"]
+    assert r"\d+\s+" in parsed[0]["code"]
+
+    # Valid JSON with \n, \t, \u00e9 remains 100% untouched on pass 1
+    valid = '{"ok": true, "msg": "caf\\u00e9\\nline2\\tok"}'
+    parsed_v = mod.extract_json_payload(valid)
+    assert parsed_v == {"ok": True, "msg": "caf\u00e9\nline2\tok"}
+
+    # Real Grok 4.7 BPE quirks: transposed `]"},`, omitted comma `}{`, missing final `]`
+    quirks = '[{"id": "a", "tests": ["assert x == 1]"}, {"id": "b", "tests": ["assert y == 2"]}{"id": "c", "tests": ["assert z == 3"]}'
+    parsed_q = mod.extract_json_payload(quirks)
+    assert isinstance(parsed_q, list) and [x["id"] for x in parsed_q] == ["a", "b", "c"]
+
+
+def test_ask_text_out_and_state_dir_shorthand(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    state_dir = tmp_path / "isolated_fleet"
+    md_out = tmp_path / "SPEC.md"
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+
+    p = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "ask",
+            "--preset", "dataset", "--campaign", "c_txt",
+            "--state-dir", str(state_dir),
+            "--text-out", str(md_out),
+            "RAW_MD_OUT generate spec",
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    meta = json.loads(p.stdout)
+    assert meta["ok"] is True
+    assert meta["text_out"] == str(md_out)
+    assert md_out.read_text(encoding="utf-8") == "# Raw Blueprint Title\n\nExact unwrapped markdown body.\n"
+    assert (state_dir / "fleet.db").is_file()
+    assert (state_dir / "artifacts").is_dir()
+    assert (state_dir / "c_txt_checkpoint.json").is_file()
+    assert "reasoning_pct" in meta["summary"]["tokens"]
+    assert meta["summary"]["tokens"]["reasoning_pct"] > 0.0

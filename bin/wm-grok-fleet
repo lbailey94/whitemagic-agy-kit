@@ -76,6 +76,33 @@ FLEET_PRESETS: dict[str, dict[str, Any]] = {
         "read_concurrency": 8,
         "stall_timeout": 75,
         "wall_timeout": 240,
+        "streaming_grace": 60,
+        "inline_files": True,
+    },
+    "dataset": {
+        "description": "High-throughput zero-tool bulk JSON/code generation (~4x faster & ~3-4x cheaper via grok-4.7-low, 12x conc.)",
+        "action": "ask",
+        "model": "low",
+        "empty_cwd": True,
+        "no_tools_guard": True,
+        "max_tool_calls": 0,
+        "read_concurrency": 12,
+        "stall_timeout": 120,
+        "wall_timeout": 240,
+        "streaming_grace": 60,
+        "inline_files": True,
+    },
+    "blueprint": {
+        "description": "Long-form zero-tool architecture specs & blueprints (grok-4.7-high-fast, 480s wall + 90s streaming grace)",
+        "action": "ask",
+        "model": "high-fast",
+        "empty_cwd": True,
+        "no_tools_guard": True,
+        "max_tool_calls": 0,
+        "read_concurrency": 4,
+        "stall_timeout": 150,
+        "wall_timeout": 480,
+        "streaming_grace": 90,
         "inline_files": True,
     },
     "fast": {
@@ -88,6 +115,7 @@ FLEET_PRESETS: dict[str, dict[str, Any]] = {
         "read_concurrency": 8,
         "stall_timeout": 60,
         "wall_timeout": 180,
+        "streaming_grace": 45,
         "inline_files": True,
     },
     "audit": {
@@ -100,6 +128,7 @@ FLEET_PRESETS: dict[str, dict[str, Any]] = {
         "read_concurrency": 6,
         "stall_timeout": 90,
         "wall_timeout": 300,
+        "streaming_grace": 60,
         "inline_files": False,
     },
     "plan": {
@@ -112,6 +141,7 @@ FLEET_PRESETS: dict[str, dict[str, Any]] = {
         "read_concurrency": 4,
         "stall_timeout": 90,
         "wall_timeout": 300,
+        "streaming_grace": 60,
         "inline_files": False,
     },
     "patch": {
@@ -125,6 +155,7 @@ FLEET_PRESETS: dict[str, dict[str, Any]] = {
         "confined": False,
         "stall_timeout": 90,
         "wall_timeout": 300,
+        "streaming_grace": 60,
         "inline_files": False,
     },
 }
@@ -371,6 +402,44 @@ def resolve_fleet_model(
         f"Unsupported Grok model '{raw}'. Use low|medium|high|xhigh|*-fast, explicit grok-X.Y-*, "
         f"or pass --allow-any-model for non-Grok Cursor models"
     )
+
+
+_AUTO_FALLBACK_STEP: dict[str, str] = {
+    "xhigh": "high-fast",
+    "xhigh-fast": "high-fast",
+    "high": "high-fast",
+    "high-fast": "medium-fast",
+    "medium": "medium-fast",
+    "medium-fast": "low",
+    "low": "low-fast",
+}
+
+
+def step_down_timeout_model(
+    current_model: str,
+    fallback_spec: str | None,
+    allow_any_model: bool = False,
+) -> str | None:
+    """Compute a faster fallback model after a wall timeout ('auto' ladder or explicit model)."""
+    if not fallback_spec:
+        return None
+    spec = str(fallback_spec).strip().lower()
+    if not spec or spec in ("none", "off", "false"):
+        return None
+    cur = resolve_fleet_model(current_model, allow_any_model=allow_any_model)
+    if spec == "auto":
+        m = re.match(r"^((?:cursor-)?grok-\d+\.\d+)-(low|medium|high|xhigh)(-fast)?$", cur)
+        if not m:
+            return None
+        fam = m.group(1)
+        cur_tier = m.group(2) + (m.group(3) or "")
+        nxt = _AUTO_FALLBACK_STEP.get(cur_tier)
+        if not nxt:
+            return None
+        cand = f"{fam}-{nxt}"
+        return cand if cand != cur else None
+    cand = resolve_fleet_model(spec, allow_any_model=allow_any_model)
+    return cand if cand != cur else None
 
 
 def _load_swarm_module() -> Any:
@@ -680,16 +749,51 @@ class FleetStore:
                 conn.close()
 
     def reset_failed_to_pending(self, campaign_id: str) -> int:
+        return self.reset_jobs(campaign_id, failed_only=True)
+
+    def reset_jobs(
+        self,
+        campaign_id: str,
+        *,
+        failed_only: bool = True,
+        job_ids: list[str] | None = None,
+        new_model: str | None = None,
+        max_attempts: int | None = None,
+    ) -> int:
+        sets = ["status = 'pending'", "attempts = 0", "error = NULL"]
+        params: list[Any] = []
+        if new_model:
+            sets.append("model = ?")
+            params.append(new_model)
+        if max_attempts is not None:
+            sets.append("max_attempts = ?")
+            params.append(max(1, int(max_attempts)))
+        wheres = ["campaign_id = ?"]
+        params.append(campaign_id)
+        if job_ids:
+            placeholders = ", ".join("?" for _ in job_ids)
+            wheres.append(f"id IN ({placeholders})")
+            params.extend(job_ids)
+        elif failed_only:
+            wheres.append("status = 'failed'")
+        else:
+            wheres.append("status != 'done'")
+        sql = f"UPDATE jobs SET {', '.join(sets)} WHERE {' AND '.join(wheres)}"
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(sql, params)
+                return cur.rowcount
+            finally:
+                conn.close()
+
+    def override_pending_model(self, campaign_id: str, new_model: str) -> int:
         with self._lock:
             conn = self._connect()
             try:
                 cur = conn.execute(
-                    """
-                    UPDATE jobs
-                    SET status = 'pending', attempts = 0, error = COALESCE(error, '') || ' [retried]'
-                    WHERE campaign_id = ? AND status = 'failed'
-                    """,
-                    (campaign_id,),
+                    "UPDATE jobs SET model = ? WHERE campaign_id = ? AND status = 'pending'",
+                    (new_model, campaign_id),
                 )
                 return cur.rowcount
             finally:
@@ -786,6 +890,7 @@ class FleetStore:
 
         denom_in = tot_in + tot_cr
         cache_hit_pct = round((100.0 * tot_cr / denom_in), 2) if denom_in > 0 else 0.0
+        reasoning_pct = round((100.0 * tot_reason / tot_out), 2) if tot_out > 0 else 0.0
         # Reference Grok 4.7 $2/M input, $6/M output base rates (approximate 0.1x cache read)
         est_std_usd = round(
             (tot_in * 2.0 + tot_cr * 0.2 + tot_out * 6.0) / 1_000_000.0,
@@ -805,6 +910,7 @@ class FleetStore:
                 "output": tot_out,
                 "reasoning": tot_reason,
                 "cache_hit_pct": cache_hit_pct,
+                "reasoning_pct": reasoning_pct,
             },
             "est_standard_usd": est_std_usd,
             "est_actual_usd": round(est_actual_usd, 6),
@@ -952,6 +1058,7 @@ def exec_stream_worker(
     stall_timeout_sec: int,
     wall_timeout_sec: int,
     *,
+    streaming_grace_sec: int = 60,
     empty_cwd: bool = False,
     no_tools_guard: bool = False,
     max_tool_calls: int = -1,
@@ -1013,6 +1120,10 @@ def exec_stream_worker(
 
     t0 = time.monotonic()
     last_event_ts = t0
+    thinking_done_ts = 0.0
+    last_output_ts = 0.0
+    grace_notified = False
+    grace_used_s = 0.0
     stderr_chunks: list[str] = []
     session_id: str | None = None
     actual_model: str = resolved_req_model
@@ -1059,13 +1170,15 @@ def exec_stream_worker(
     def _process_line(raw_line: str, log_fp: Any) -> None:
         nonlocal session_id, actual_model, api_ms, usage, result_text, is_error
         nonlocal stream_events, tool_calls, tool_exceeded, last_event_ts
+        nonlocal thinking_done_ts, last_output_ts
         line = raw_line.strip()
         if not line:
             return
         log_fp.write(line + "\n")
         log_fp.flush()
         stream_events += 1
-        last_event_ts = time.monotonic()
+        now_ev = time.monotonic()
+        last_event_ts = now_ev
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
@@ -1079,6 +1192,8 @@ def exec_stream_worker(
         if etype == "system" and subtype == "init":
             if obj.get("model"):
                 actual_model = str(obj["model"])
+        elif etype == "thinking" and subtype == "completed":
+            thinking_done_ts = now_ev
         elif etype == "tool_call":
             if subtype != "completed":
                 tool_calls += 1
@@ -1089,6 +1204,7 @@ def exec_stream_worker(
             for block in msg.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
                     assistant_chunks.append(str(block["text"]))
+                    last_output_ts = now_ev
         elif etype == "result":
             is_error = bool(obj.get("is_error"))
             if obj.get("duration_api_ms") is not None:
@@ -1107,10 +1223,32 @@ def exec_stream_worker(
                     timeout_reason = f"tool budget exceeded ({tool_calls} > {max_tool_calls})"
                     _kill_process_group(proc)
                     break
-                if now - t0 >= wall_timeout_sec:
-                    timeout_reason = f"wall timeout after {wall_timeout_sec}s"
-                    _kill_process_group(proc)
-                    break
+                elapsed = now - t0
+                if elapsed >= wall_timeout_sec:
+                    # Streaming grace window: never kill a worker mid-answer right after thinking finished!
+                    streaming_active = (
+                        streaming_grace_sec > 0
+                        and (last_output_ts > 0.0 or thinking_done_ts > 0.0)
+                        and (now - max(last_output_ts, thinking_done_ts, last_event_ts)) <= 15.0
+                        and elapsed < (wall_timeout_sec + streaming_grace_sec)
+                    )
+                    if streaming_active:
+                        if not grace_notified:
+                            grace_notified = True
+                            print(
+                                f"[grace] job={jid} streaming active at {wall_timeout_sec}s; extending up to +{streaming_grace_sec}s",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        grace_used_s = round(elapsed - wall_timeout_sec, 2)
+                    else:
+                        timeout_reason = (
+                            f"wall timeout after {int(round(elapsed))}s (+{streaming_grace_sec}s grace)"
+                            if grace_notified
+                            else f"wall timeout after {wall_timeout_sec}s"
+                        )
+                        _kill_process_group(proc)
+                        break
                 if now - last_event_ts >= stall_timeout_sec:
                     timeout_reason = f"stream stall timeout after {stall_timeout_sec}s"
                     _kill_process_group(proc)
@@ -1249,6 +1387,8 @@ def exec_stream_worker(
     return {
         "ok": ok,
         "retryable": retryable,
+        "wall_timed_out": is_wall,
+        "grace_used_s": grace_used_s,
         "rate_limited": rate_limited,
         "quota_exhausted": quota_exhausted,
         "session_id": session_id,
@@ -1411,6 +1551,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     store.recover_stale_running(cid)
     if getattr(args, "retry_failed", False):
         store.reset_failed_to_pending(cid)
+    allow_any_model = bool(getattr(args, "allow_any_model", False))
+    run_model_override = getattr(args, "model", None)
+    if run_model_override:
+        resolved_override = resolve_fleet_model(run_model_override, allow_any_model=allow_any_model)
+        store.override_pending_model(cid, resolved_override)
     store.set_campaign_status(cid, "running")
 
     preset_name = getattr(args, "preset", None)
@@ -1443,6 +1588,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     wall_timeout = int(
         args.wall_timeout if args.wall_timeout is not None else preset_cfg.get("wall_timeout", 300)
     )
+    raw_sg = getattr(args, "streaming_grace", None)
+    streaming_grace = max(
+        0,
+        int(raw_sg if raw_sg is not None else preset_cfg.get("streaming_grace", 60)),
+    )
+    timeout_fallback_model = getattr(args, "timeout_fallback_model", None) or preset_cfg.get("timeout_fallback_model")
     read_sem = threading.Semaphore(read_conc)
     write_sem = threading.Semaphore(write_conc)
     backoff = BackoffCoordinator()
@@ -1459,18 +1610,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     raw_mtc = getattr(args, "max_tool_calls", None)
     max_tool_calls = int(raw_mtc) if raw_mtc is not None else int(preset_cfg.get("max_tool_calls", -1))
     retry_wall_timeouts = bool(getattr(args, "retry_wall_timeouts", False))
-    allow_any_model = bool(getattr(args, "allow_any_model", False))
     quiet = bool(getattr(args, "quiet", False))
     suppress_stdout = bool(getattr(args, "_suppress_stdout", False))
     raw_cp = getattr(args, "checkpoint_path", None)
     raw_cjl = getattr(args, "checkpoint_jsonl", None)
     checkpoint_path = Path(raw_cp) if raw_cp else None
     checkpoint_jsonl = Path(raw_cjl) if raw_cjl else None
+    session_completed = 0
+    t_run_start = time.monotonic()
 
     def _emit_progress(job_id: str, status_tag: str, res: dict[str, Any]) -> None:
+        nonlocal session_completed
         if quiet:
             return
         with progress_lock:
+            session_completed += 1
             snap = store.campaign_summary(cid)
             cnt = snap.get("counts") or {}
             done_n = int(cnt.get("done", 0))
@@ -1478,11 +1632,22 @@ def cmd_run(args: argparse.Namespace) -> int:
             tot_n = int(snap.get("total_jobs", 0))
             usd = float(snap.get("est_actual_usd", snap.get("est_standard_usd", 0.0)))
             qpct = float(snap.get("est_cursor_quota_pct", 0.0))
+            toks = snap.get("tokens") or {}
+            r_pct = float(toks.get("reasoning_pct", 0.0))
             wall_s = res.get("wall_s", 0.0)
             tools = res.get("tool_calls", 0)
+            extra = ""
+            if int(toks.get("output", 0)) > 0:
+                extra += f" | reason={r_pct:.0f}%"
+            rem_n = max(0, tot_n - done_n - fail_n)
+            elapsed_run = time.monotonic() - t_run_start
+            if session_completed >= 2 and rem_n > 0 and elapsed_run >= 3.0:
+                eta_s = int(round((elapsed_run / session_completed) * rem_n))
+                eta_str = f"{eta_s // 60}m{eta_s % 60:02d}s" if eta_s >= 60 else f"{eta_s}s"
+                extra += f" | eta ~{eta_str}"
             print(
                 f"[fleet] {done_n}/{tot_n} done ({fail_n} fail) | {status_tag} {job_id} | "
-                f"{wall_s}s | {tools} tools | ${usd:.4f} (~{qpct:.2f}% quota)",
+                f"{wall_s}s | {tools} tools | ${usd:.4f} (~{qpct:.2f}% quota){extra}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -1536,6 +1701,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     def _run_job_with_retries(job: dict[str, Any]) -> None:
         sem = write_sem if job["action"] == "worktree" else read_sem
         max_att = max(1, min(int(job.get("max_attempts") or 3), int(args.max_retries) + 1))
+        job_run = dict(job)
+        cur_wall_timeout = wall_timeout
 
         for attempt in range(1, max_att + 1):
             if _halt_requested():
@@ -1564,14 +1731,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             with sem:
                 if _halt_requested():
                     return
-                store.mark_running(job["id"], attempt)
+                store.mark_running(job_run["id"], attempt)
                 res = exec_stream_worker(
-                    job=job,
+                    job=job_run,
                     attempt=attempt,
                     cursor_bin=cursor_bin,
                     artifact_dir=art_dir,
                     stall_timeout_sec=stall_timeout,
-                    wall_timeout_sec=wall_timeout,
+                    wall_timeout_sec=cur_wall_timeout,
+                    streaming_grace_sec=streaming_grace,
                     empty_cwd=empty_cwd,
                     no_tools_guard=no_tools_guard,
                     max_tool_calls=max_tool_calls,
@@ -1583,9 +1751,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                 backoff.record_success()
                 fin_iso = utc_now_iso()
                 store.update_job_result(
-                    job["id"],
+                    job_run["id"],
                     {
                         "status": "done",
+                        "model": job_run.get("model"),
                         "session_id": res.get("session_id"),
                         "resolved_model": res.get("resolved_model"),
                         "wall_s": res.get("wall_s"),
@@ -1607,9 +1776,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                     },
                 )
                 _write_checkpoint({
-                    "job_id": job["id"],
-                    "stage": job.get("stage"),
-                    "model": res.get("resolved_model") or job.get("model"),
+                    "job_id": job_run["id"],
+                    "stage": job_run.get("stage"),
+                    "model": res.get("resolved_model") or job_run.get("model"),
                     "wall_s": res.get("wall_s"),
                     "output_path": res.get("output_path"),
                     "input_tokens": res.get("input_tokens", 0),
@@ -1619,13 +1788,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "tool_calls": res.get("tool_calls", 0),
                     "finished_at": fin_iso,
                 })
-                _emit_progress(job["id"], "OK", res)
+                _emit_progress(job_run["id"], "OK", res)
                 return
 
             if res.get("quota_exhausted"):
                 quota_halted.set()
                 store.update_job_result(
-                    job["id"],
+                    job_run["id"],
                     {
                         "status": "pending",
                         "wall_s": res.get("wall_s"),
@@ -1643,17 +1812,36 @@ def cmd_run(args: argparse.Namespace) -> int:
             if res.get("rate_limited"):
                 wait_s = backoff.trigger_rate_limit()
                 print(
-                    f"[429] job={job['id']} attempt={attempt}/{max_att}; shared backoff {wait_s}s",
+                    f"[429] job={job_run['id']} attempt={attempt}/{max_att}; shared backoff {wait_s}s",
                     file=sys.stderr,
                 )
+
+            if res.get("wall_timed_out") and timeout_fallback_model and attempt < max_att and not _halt_requested():
+                nxt_model = step_down_timeout_model(
+                    str(job_run.get("model") or "medium"),
+                    str(timeout_fallback_model),
+                    allow_any_model=allow_any_model,
+                )
+                if nxt_model:
+                    prev_model = job_run.get("model")
+                    job_run["model"] = nxt_model
+                    cur_wall_timeout = max(cur_wall_timeout + 1, int(round(cur_wall_timeout * 1.25)))
+                    print(
+                        f"[fallback] job={job_run['id']} wall timeout on {prev_model}; "
+                        f"retrying attempt {attempt + 1}/{max_att} on {nxt_model} (wall_timeout={cur_wall_timeout}s)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
 
             if res.get("retryable") and attempt < max_att and not _halt_requested():
                 continue
 
             store.update_job_result(
-                job["id"],
+                job_run["id"],
                 {
                     "status": "failed",
+                    "model": job_run.get("model"),
                     "session_id": res.get("session_id"),
                     "resolved_model": res.get("resolved_model"),
                     "wall_s": res.get("wall_s"),
@@ -1675,7 +1863,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 },
             )
             _write_checkpoint(None)
-            _emit_progress(job["id"], "FAIL", res)
+            _emit_progress(job_run["id"], "FAIL", res)
             return
 
     pending = store.fetch_pending(cid)
@@ -1727,10 +1915,77 @@ def cmd_run(args: argparse.Namespace) -> int:
     summary["quota_halted"] = q_halted
     summary["interrupted"] = interrupted
     summary["resumable_pending"] = summary["counts"].get("pending", 0)
+
+    hints: list[str] = []
+    done_cnt = int(summary["counts"].get("done", 0))
+    tok_meta = summary.get("tokens") or {}
+    r_pct_final = float(tok_meta.get("reasoning_pct", 0.0))
+    if done_cnt >= 3 and r_pct_final >= 65.0 and float(summary.get("wall_s_avg", 0.0)) >= 120.0:
+        hints.append(
+            f"High reasoning overhead ({r_pct_final:.1f}% of output tokens, avg {summary['wall_s_avg']:.0f}s/worker). "
+            f"For bulk JSON/code generation, try `--preset dataset` (grok-4.7-low) or "
+            f"`cursor-fleet retry --campaign {cid} --non-done --model low --run`."
+        )
+    if failed_cnt > 0:
+        camp_jobs = store.export_campaign(cid).get("jobs") or []
+        wt_fails = [j for j in camp_jobs if j.get("status") == "failed" and "wall timeout" in str(j.get("error") or "")]
+        if wt_fails:
+            hints.append(
+                f"{len(wt_fails)} job(s) hit wall timeout. Retry on a faster tier with: "
+                f"`cursor-fleet retry --campaign {cid} --model high-fast --timeout-fallback-model auto --run` "
+                f"(or `--preset blueprint` for long specs / `--preset dataset` for bulk batches)."
+            )
+    summary["hints"] = hints
+    if hints and not quiet:
+        for h in hints:
+            print(f"[fleet][hint] {h}", file=sys.stderr, flush=True)
+
     summary["ok"] = failed_cnt == 0
     if not suppress_stdout:
         print(json.dumps(summary, indent=2))
     return 0 if failed_cnt == 0 else 1
+
+
+def cmd_retry(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    store = FleetStore(db_path)
+    cid = sanitize_id(args.campaign, 64)
+    allow_any = bool(getattr(args, "allow_any_model", False))
+    new_model = (
+        resolve_fleet_model(args.model, allow_any_model=allow_any)
+        if getattr(args, "model", None)
+        else None
+    )
+    job_ids = list(args.job or []) or None
+    reset_n = store.reset_jobs(
+        cid,
+        failed_only=not bool(getattr(args, "non_done", False)),
+        job_ids=job_ids,
+        new_model=new_model,
+        max_attempts=getattr(args, "max_attempts", None),
+    )
+    info = {
+        "ok": True,
+        "campaign_id": cid,
+        "reset_count": reset_n,
+        "scope": "job_ids" if job_ids else ("non_done" if getattr(args, "non_done", False) else "failed_only"),
+        "model": new_model,
+        "max_attempts": getattr(args, "max_attempts", None),
+    }
+    if getattr(args, "run", False):
+        if not getattr(args, "quiet", False):
+            print(
+                f"[retry] reset {reset_n} job(s) in campaign `{cid}`"
+                + (f" -> model={new_model}" if new_model else ""),
+                file=sys.stderr,
+                flush=True,
+            )
+        # Clear args.model so cmd_run doesn't redundantly re-override unrelated pending jobs if --job was used
+        if job_ids:
+            args.model = None
+        return cmd_run(args)
+    print(json.dumps(info, indent=2))
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1869,29 +2124,126 @@ def cmd_record_win(args: argparse.Namespace) -> int:
     return 0
 
 
+_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+_VALID_JSON_ESCAPES = frozenset('"\\/bfnrt')
+
+
+def _repair_json_candidate(s: str) -> str:
+    """String-aware repair for common LLM JSON bugs (only used after strict json.loads fails):
+    1. Stray Python backslashes inside strings (\\U, \\d, \\s, \\') -> double-escaped
+    2. Trailing commas right before ] or }
+    3. Missing commas between adjacent objects outside strings (`}{` -> `},{`)
+    4. Transposed `]"},` / `]"}]` BPE close-quote tokens (`]"},` -> `"]},`)
+    5. Missing final `]` on a `[...}` top-level array
+    """
+    # Step A: Fix known BPE transposed array-string terminator `]"}` before `, {` or `]`
+    fixed = re.sub(r'\]"\}(\s*,\s*\{)', r'"]}\1', s)
+    fixed = re.sub(r'\]"\}(\s*\]\s*)$', r'"]}\1', fixed)
+
+    out: list[str] = []
+    in_str = False
+    last_non_ws = ""
+    i = 0
+    n = len(fixed)
+    while i < n:
+        ch = fixed[i]
+        if in_str:
+            if ch == '"':
+                in_str = False
+                out.append(ch)
+                last_non_ws = ch
+                i += 1
+            elif ch == "\\":
+                if i + 1 < n:
+                    nxt = fixed[i + 1]
+                    if nxt in _VALID_JSON_ESCAPES:
+                        out.append(ch)
+                        out.append(nxt)
+                        i += 2
+                    elif nxt == "u" and i + 5 < n and all(c in _HEX_CHARS for c in fixed[i + 2 : i + 6]):
+                        out.append(fixed[i : i + 6])
+                        i += 6
+                    else:
+                        # Stray Python escape (e.g. \U0001f60a, \d, \s, \') -> double-escape backslash
+                        out.append("\\\\")
+                        i += 1
+                else:
+                    out.append("\\\\")
+                    i += 1
+            elif ch == "\n":
+                out.append("\\n")
+                i += 1
+            elif ch == "\r":
+                out.append("\\r")
+                i += 1
+            elif ch == "\t":
+                out.append("\\t")
+                i += 1
+            else:
+                out.append(ch)
+                i += 1
+        else:
+            if ch == '"':
+                in_str = True
+                out.append(ch)
+                last_non_ws = ch
+                i += 1
+            elif ch == "{":
+                if last_non_ws == "}":
+                    out.append(",")
+                out.append(ch)
+                last_non_ws = ch
+                i += 1
+            elif ch == ",":
+                # Drop trailing comma right before ] or }
+                j = i + 1
+                while j < n and fixed[j] in " \t\r\n":
+                    j += 1
+                if j < n and fixed[j] in "]}":
+                    i += 1
+                else:
+                    out.append(ch)
+                    last_non_ws = ch
+                    i += 1
+            else:
+                out.append(ch)
+                if ch not in " \t\r\n":
+                    last_non_ws = ch
+                i += 1
+    res = "".join(out).strip()
+    if res.startswith("[") and res.endswith("}") and not res.endswith("]"):
+        res += "]"
+    return res
+
+
 def extract_json_payload(text: str) -> Any:
-    """Best-effort extraction of a JSON object or array from an LLM response."""
+    """Best-effort extraction of a JSON object or array from an LLM response (with Python-escape repair fallback)."""
     raw = (text or "").strip()
     if not raw:
         return None
-    try:
-        return json.loads(raw)
-    except Exception:
-        pass
-    fenced = re.findall(r"```(?:json)?\s*\n(.*?)```", raw, flags=re.DOTALL | re.IGNORECASE)
-    for block in fenced:
-        try:
-            return json.loads(block.strip())
-        except Exception:
-            continue
+    candidates: list[str] = [raw]
+    for block in re.findall(r"```(?:json)?\s*\n(.*?)```", raw, flags=re.DOTALL | re.IGNORECASE):
+        b = block.strip()
+        if b:
+            candidates.append(b)
     for open_ch, close_ch in (("[", "]"), ("{", "}")):
         start = raw.find(open_ch)
         end = raw.rfind(close_ch)
         if start != -1 and end > start:
-            try:
-                return json.loads(raw[start : end + 1])
-            except Exception:
-                continue
+            candidates.append(raw[start : end + 1])
+
+    # Pass 1: strict json.loads (zero mutation on valid JSON)
+    for cand in candidates:
+        try:
+            return json.loads(cand)
+        except Exception:
+            continue
+    # Pass 2: surgical string-aware backslash & trailing-comma repair
+    for cand in candidates:
+        try:
+            return json.loads(_repair_json_candidate(cand))
+        except Exception:
+            continue
     return None
 
 
@@ -2348,6 +2700,9 @@ def _build_run_namespace(
     artifact_dir: str | None,
     allow_any_model: bool,
     quiet: bool,
+    streaming_grace: int | None = None,
+    timeout_fallback_model: str | None = None,
+    model: str | None = None,
     suppress_stdout: bool = False,
 ) -> argparse.Namespace:
     return argparse.Namespace(
@@ -2357,6 +2712,9 @@ def _build_run_namespace(
         write_concurrency=write_concurrency,
         stall_timeout=stall_timeout,
         wall_timeout=wall_timeout,
+        streaming_grace=streaming_grace,
+        timeout_fallback_model=timeout_fallback_model,
+        model=model,
         max_retries=max_retries,
         min_free_ram_mb=min_free_ram_mb,
         min_free_root_gb=min_free_root_gb,
@@ -2454,6 +2812,8 @@ def _enqueue_and_run_inline(
         artifact_dir=str(art_dir),
         allow_any_model=bool(getattr(args, "allow_any_model", False)),
         quiet=bool(getattr(args, "quiet", False)),
+        streaming_grace=getattr(args, "streaming_grace", None),
+        timeout_fallback_model=getattr(args, "timeout_fallback_model", None),
         suppress_stdout=True,
     )
     rc = cmd_run(run_ns)
@@ -2471,17 +2831,30 @@ def _enqueue_and_run_inline(
         out_p = Path(args.out)
         out_p.parent.mkdir(parents=True, exist_ok=True)
         out_p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if getattr(args, "text_out", None):
+        txt_p = Path(args.text_out)
+        txt_p.parent.mkdir(parents=True, exist_ok=True)
+        if len(results) == 1:
+            raw_txt = (results[0].get("output") or results[0].get("text") or "").strip()
+        else:
+            parts = [
+                f"<!-- job: {r.get('id')} ({r.get('status')}) -->\n{(r.get('output') or r.get('text') or '').strip()}"
+                for r in results
+            ]
+            raw_txt = "\n\n---\n\n".join(parts)
+        txt_p.write_text((raw_txt + "\n") if raw_txt else "", encoding="utf-8")
     if getattr(args, "report_md", None):
         md_p = Path(args.report_md)
         md_p.parent.mkdir(parents=True, exist_ok=True)
         md_p.write_text(render_campaign_markdown(export_data, parse_json=parse_json), encoding="utf-8")
 
-    # Emit compact stdout JSON (if --out was written, keep stdout concise; else include results)
-    if getattr(args, "out", None):
+    # Emit compact stdout JSON (if --out or --text-out was written, keep stdout concise; else include results)
+    if getattr(args, "out", None) or getattr(args, "text_out", None):
         stdout_obj = {
             "ok": rc == 0,
             "campaign_id": cid,
-            "out": str(args.out),
+            "out": str(args.out) if getattr(args, "out", None) else None,
+            "text_out": str(args.text_out) if getattr(args, "text_out", None) else None,
             "report_md": str(args.report_md) if getattr(args, "report_md", None) else None,
             "summary": export_data["summary"],
         }
@@ -3956,12 +4329,23 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
         "--preset",
         choices=sorted(FLEET_PRESETS.keys()),
         default=None,
-        help="Preset profile: synthesis (0-tool 18.8x cheaper), fast, audit, plan, patch",
+        help="Preset profile: synthesis, dataset (bulk low-tier 12x), blueprint (long specs), fast, audit, plan, patch",
     )
     p.add_argument("--read-concurrency", type=int, default=None)
     p.add_argument("--write-concurrency", type=int, default=None)
     p.add_argument("--stall-timeout", type=int, default=None)
     p.add_argument("--wall-timeout", type=int, default=None)
+    p.add_argument(
+        "--streaming-grace",
+        type=int,
+        default=None,
+        help="Extra seconds granted past wall-timeout when active output streaming is in progress (default: 60; 0 disables)",
+    )
+    p.add_argument(
+        "--timeout-fallback-model",
+        default=None,
+        help="On wall timeout, retry on a faster model ('auto' steps down tier ladder, or explicit model/tier like 'low')",
+    )
     p.add_argument("--max-retries", type=int, default=2)
     p.add_argument("--min-free-ram-mb", type=float, default=1500.0)
     p.add_argument("--min-free-root-gb", type=float, default=8.0)
@@ -3976,6 +4360,7 @@ def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--allow-any-model", action="store_true", help="Allow any valid cursor-agent model ID (composer, codex, claude, etc.)")
     p.add_argument("--quiet", action="store_true", help="Suppress per-job stderr progress lines")
     p.add_argument("--cursor-bin", default=None)
+    p.add_argument("--state-dir", default=None, help="Shorthand directory for fleet.db, artifacts/, and <campaign>_checkpoint.json")
     p.add_argument("--db-path", default=None)
     p.add_argument("--artifact-dir", default=None)
 
@@ -3988,6 +4373,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     doc = sub.add_parser("doctor", help="Verify cursor-agent auth, models, bwrap, and host headroom")
     doc.add_argument("--cursor-bin", default=None)
+    doc.add_argument("--state-dir", default=None)
     doc.add_argument("--db-path", default=None)
     doc.add_argument("--artifact-dir", default=None)
     doc.add_argument("--fast", action="store_true", help="Skip live `cursor-agent models` query")
@@ -4003,7 +4389,8 @@ def build_parser() -> argparse.ArgumentParser:
     ask_p.add_argument("--verify-cmd", default=None)
     ask_p.add_argument("--confined", action="store_true")
     ask_p.add_argument("--parse-json", action="store_true", help="Extract JSON payloads from worker responses")
-    ask_p.add_argument("--out", default=None, help="Write combined JSON results to path")
+    ask_p.add_argument("--out", default=None, help="Write combined JSON envelope to path")
+    ask_p.add_argument("--text-out", default=None, help="Write clean unwrapped raw text/Markdown output directly to path")
     ask_p.add_argument("--report-md", default=None, help="Write combined Markdown report to path")
     ask_p.add_argument("--dry-run", action="store_true", help="Estimate tokens & cost without running workers")
     _add_common_run_flags(ask_p)
@@ -4012,7 +4399,7 @@ def build_parser() -> argparse.ArgumentParser:
     map_p.add_argument("--instruction", default=None, help="Static instruction applied to every batch")
     map_p.add_argument("--instruction-file", default=None, help="Read static instruction from file")
     map_p.add_argument("--files", action="append", default=None, help="Glob pattern of files to map (repeatable)")
-    map_p.add_argument("--inline-files", action="store_true", help="Inline file contents directly into prompts (default on synthesis/fast presets)")
+    map_p.add_argument("--inline-files", action="store_true", help="Inline file contents directly into prompts (default on synthesis/dataset/blueprint/fast presets)")
     map_p.add_argument("--max-file-kb", type=int, default=64, help="Per-file inline cap in KiB (default 64)")
     map_p.add_argument("--items-jsonl", default=None, help="JSONL file of items to batch across workers")
     map_p.add_argument("--items-json", default=None, help="JSON array file of items to batch across workers")
@@ -4037,6 +4424,7 @@ def build_parser() -> argparse.ArgumentParser:
     map_p.add_argument("--max-trajectories", type=int, default=3)
     map_p.add_argument("--parse-json", action="store_true", help="Extract JSON payloads from worker responses")
     map_p.add_argument("--out", default=None, help="Write combined JSON results to path")
+    map_p.add_argument("--text-out", default=None, help="Write clean concatenated raw outputs to path")
     map_p.add_argument("--report-md", default=None, help="Write combined Markdown report to path")
     map_p.add_argument("--dry-run", action="store_true", help="Estimate batch count, tokens & cost without running workers")
     _add_common_run_flags(map_p)
@@ -4090,6 +4478,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipe_p.add_argument("--out", default=None)
     pipe_p.add_argument("--dry-run", action="store_true")
     pipe_p.add_argument("--cursor-bin", default=None)
+    pipe_p.add_argument("--state-dir", default=None)
     pipe_p.add_argument("--db-path", default=None)
     pipe_p.add_argument("--artifact-dir", default=None)
 
@@ -4097,6 +4486,7 @@ def build_parser() -> argparse.ArgumentParser:
     enq.add_argument("--campaign", required=True)
     enq.add_argument("--manifest", required=True)
     enq.add_argument("--name", default=None)
+    enq.add_argument("--state-dir", default=None)
     enq.add_argument("--db-path", default=None)
     enq.add_argument("--artifact-dir", default=None)
     enq.add_argument("--exclusions-file", default=None, help="JSON/text list of intended-design exclusions")
@@ -4107,17 +4497,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_p = sub.add_parser("run", help="Drain pending jobs for a campaign")
     run_p.add_argument("--campaign", required=True)
+    run_p.add_argument("--model", default=None, help="Optional model override applied to pending jobs before running")
     _add_common_run_flags(run_p)
+
+    ret_p = sub.add_parser("retry", help="Reset failed or non-done campaign jobs (optionally switching model) and optionally re-run")
+    ret_p.add_argument("--campaign", required=True)
+    ret_p.add_argument("--model", default=None, help="Switch reset jobs to a new model/tier (e.g. low, high-fast, medium-fast)")
+    ret_p.add_argument("--non-done", action="store_true", help="Reset ALL non-done jobs (failed + pending + stale running) instead of failed only")
+    ret_p.add_argument("--job", action="append", default=None, help="Specific job ID to reset (repeatable)")
+    ret_p.add_argument("--max-attempts", type=int, default=None, help="Override max_attempts on reset jobs")
+    ret_p.add_argument("--run", action="store_true", help="Immediately drain the campaign after resetting jobs")
+    _add_common_run_flags(ret_p)
 
     st = sub.add_parser("status", help="Show campaign progress and host headroom")
     st.add_argument("--campaign", default=None)
     st.add_argument("--json", action="store_true")
+    st.add_argument("--state-dir", default=None)
     st.add_argument("--db-path", default=None)
     st.add_argument("--artifact-dir", default=None)
 
     ls_p = sub.add_parser("campaigns", aliases=["ls"], help="List campaigns in the fleet database")
     ls_p.add_argument("--limit", type=int, default=30)
     ls_p.add_argument("--json", action="store_true")
+    ls_p.add_argument("--state-dir", default=None)
     ls_p.add_argument("--db-path", default=None)
 
     ins = sub.add_parser("inspect", help="Inspect jobs, errors, and outputs for a campaign")
@@ -4127,6 +4529,7 @@ def build_parser() -> argparse.ArgumentParser:
     ins.add_argument("--show-output", action="store_true")
     ins.add_argument("--max-chars", type=int, default=2000)
     ins.add_argument("--json", action="store_true")
+    ins.add_argument("--state-dir", default=None)
     ins.add_argument("--db-path", default=None)
 
     rep = sub.add_parser("report", help="Render combined Markdown or JSON report from campaign outputs")
@@ -4134,6 +4537,7 @@ def build_parser() -> argparse.ArgumentParser:
     rep.add_argument("--format", choices=["md", "json"], default="md")
     rep.add_argument("--parse-json", action="store_true")
     rep.add_argument("--out", default=None)
+    rep.add_argument("--state-dir", default=None)
     rep.add_argument("--db-path", default=None)
 
     pat = sub.add_parser("patches", help="List, check, or apply harvested worktree patches")
@@ -4142,11 +4546,13 @@ def build_parser() -> argparse.ArgumentParser:
     pat.add_argument("--repo", default=None, help="Target git repo directory for --apply (default: cwd)")
     pat.add_argument("--check", action="store_true", help="Dry-run `git apply --check` without modifying files")
     pat.add_argument("--json", action="store_true")
+    pat.add_argument("--state-dir", default=None)
     pat.add_argument("--db-path", default=None)
 
     exp = sub.add_parser("export", help="Export full campaign records to JSON")
     exp.add_argument("--campaign", required=True)
     exp.add_argument("--out", required=True)
+    exp.add_argument("--state-dir", default=None)
     exp.add_argument("--db-path", default=None)
 
     rec = sub.add_parser("record-win", help="Append a verified winning trajectory exemplar")
@@ -4157,6 +4563,7 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--summary", required=True)
     rec.add_argument("--step", action="append", default=None)
     rec.add_argument("--out", default=None)
+    rec.add_argument("--state-dir", default=None)
     rec.add_argument("--db-path", default=None)
     rec.add_argument("--artifact-dir", default=None)
 
@@ -4166,9 +4573,28 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _apply_state_dir(args: argparse.Namespace) -> None:
+    """Resolve --state-dir shorthand into default db_path, artifact_dir, and checkpoint_path."""
+    sd_raw = getattr(args, "state_dir", None)
+    if not sd_raw:
+        return
+    sd = Path(sd_raw)
+    if hasattr(args, "db_path") and not args.db_path:
+        args.db_path = str(sd / "fleet.db")
+    if hasattr(args, "artifact_dir") and not args.artifact_dir:
+        args.artifact_dir = str(sd / "artifacts")
+    if (
+        hasattr(args, "checkpoint_path")
+        and not args.checkpoint_path
+        and getattr(args, "campaign", None)
+    ):
+        args.checkpoint_path = str(sd / f"{sanitize_id(str(args.campaign), 64)}_checkpoint.json")
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    _apply_state_dir(args)
     if args.cmd == "doctor":
         return cmd_doctor(args)
     if args.cmd == "ask":
@@ -4185,6 +4611,8 @@ def main() -> int:
         return cmd_enqueue(args)
     if args.cmd == "run":
         return cmd_run(args)
+    if args.cmd == "retry":
+        return cmd_retry(args)
     if args.cmd == "status":
         return cmd_status(args)
     if args.cmd in ("campaigns", "ls"):

@@ -44,6 +44,8 @@ NO_TOOLS_BANNER = (
 )
 SWARM_PRESETS = {
     "synthesis": {"model": "medium", "empty_cwd": True, "no_tools_guard": True},
+    "dataset": {"model": "low", "empty_cwd": True, "no_tools_guard": True},
+    "blueprint": {"model": "high-fast", "empty_cwd": True, "no_tools_guard": True},
     "fast": {"model": "medium-fast", "empty_cwd": True, "no_tools_guard": True},
     "audit": {"model": "high", "empty_cwd": False, "no_tools_guard": False},
     "plan": {"model": "high", "empty_cwd": False, "no_tools_guard": False},

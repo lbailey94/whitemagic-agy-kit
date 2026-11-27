@@ -93,8 +93,8 @@ TOOL_SCHEMA = {
             },
             "preset": {
                 "type": "string",
-                "enum": ["synthesis", "fast", "audit", "plan", "patch"],
-                "description": "Efficiency preset (`synthesis` = 0-tool empty_cwd + medium, ~18.8x cheaper)",
+                "enum": ["synthesis", "dataset", "blueprint", "fast", "audit", "plan", "patch"],
+                "description": "Efficiency preset (`synthesis` = 0-tool medium, `dataset` = 0-tool low ~4x faster/cheaper, `blueprint` = 0-tool high-fast)",
             },
             "model": {
                 "type": "string",

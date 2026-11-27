@@ -105,7 +105,7 @@ cursor-fleet map --preset synthesis --files "src/**/*.py" --batch-size 4 --dry-r
   --instruction "List concrete bugs as JSON"
 ```
 
-See [**`docs/CURSOR_FLEET.md`**](./docs/CURSOR_FLEET.md) for the complete standalone Cursor / Grok Fleet guide (`doctor`, `ask`, `map --reduce`, `race`, `council`, `pipeline`, `campaigns`, `inspect`, `report`, `patches`, presets, `--dry-run` cost estimator, crash-safe quota resume, and 1-tool `wm-grok-mcp`) and [**`benchmarks/RESULTS_2026-11-27_cursor_fleet.md`**](./benchmarks/RESULTS_2026-11-27_cursor_fleet.md) for live empirical benchmarks (`363.3×` `bwrap`-confined race speedup, `8/8` execution-verified synthetic pipeline at `$0.029/task`, `39/39` 7.4× map sweep).
+See [**`docs/CURSOR_FLEET.md`**](./docs/CURSOR_FLEET.md) for the complete standalone Cursor / Grok Fleet guide (`doctor`, `ask --text-out`, `map --reduce`, `race`, `council`, `pipeline`, `retry`, `campaigns`, `inspect`, `report`, `patches`, 7 presets incl. `dataset`/`blueprint`, `--streaming-grace`, `--timeout-fallback-model auto`, `--state-dir`, `--dry-run` cost estimator, crash-safe quota resume, and 1-tool `wm-grok-mcp`) and [**`benchmarks/RESULTS_2026-11-27_cursor_fleet.md`**](./benchmarks/RESULTS_2026-11-27_cursor_fleet.md) for live empirical benchmarks (`363.3×` `bwrap`-confined race speedup, `146`-worker `4.77h` 5-lane R&D campaign at `13.8×` speedup & `51.9%` cache hit, `8/8` execution-verified synthetic pipeline at `$0.029/task`, `39/39` `7.4×` map sweep).
 
 > **Turn-0 Context Tip:** Disable domain-specific marketplace plugins globally (e.g., `chrome-devtools-plugin`, `modern-web-guidance-plugin`, `google-antigravity-sdk` ≈ `~1,003` Turn-0 tokens) and re-enable them only in web/SDK repos via `.agents/plugins.json`.
 
