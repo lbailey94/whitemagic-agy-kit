@@ -1791,6 +1791,32 @@ def test_v442_self_heal_and_rust_post_tool():
             f"{len(ss_msg)}B",
         )
 
+        # session_start_brief separates remote Syncthing ThinkPad brief from local host disk/Gen3
+        pf_remote = td_path / "PREFLIGHT_REMOTE.md"
+        pf_remote.write_text(
+            "# ⚡ WhiteMagic Fleet & Estate Pre-Flight Brief (2026-11-27T15:30:51+00:00)\n"
+            "> Compiled in **12439.1 ms** | Disk: **40.77 GiB free** (77.4% used) | Gen3 Primary Store: **460,620 records**\n"
+            "> **Hosted & VPS Health:** api: `up` · mcp: `up`\n"
+            "home-lucas-SharedWorkspace-grok-fleet\n",
+            encoding="utf-8",
+        )
+        _, out_ss_rem, _, _ = run_hook(
+            START_HOOK,
+            {"conversationId": "ss-remote"},
+            env_extra={"WM_PREFLIGHT_PATH": str(pf_remote), "WM_SIM_LEDGER": str(ss_sim), "WM_DREAM_DIGEST": str(d_out), "WM_PREFLIGHT_IS_LOCAL": "0"},
+        )
+        ss_rem_msg = json.loads(out_ss_rem).get("injectSteps", [{}])[0].get("systemMessage", {}).get("systemMessage", "")
+        check(
+            "session_start_brief emits Local Host first & strips remote Disk/Gen3 from ThinkPad brief",
+            "[Local Host |" in ss_rem_msg
+            and "[Remote Estate Brief (Syncthing)" in ss_rem_msg
+            and "40.77 GiB free" not in ss_rem_msg
+            and "460,620 records" not in ss_rem_msg
+            and "Hosted & VPS Health" in ss_rem_msg
+            and len(ss_rem_msg.encode("utf-8")) <= 1450,
+            ss_rem_msg[:220],
+        )
+
 
 def test_v450_rust_pretool_crystal_and_swarm_guards():
     print("\n12. v4.5.0 Rust --pre-tool, Ping-Pong Auto-Crystal, wm-reset & Orchestration:")
@@ -1831,6 +1857,12 @@ def test_v450_rust_pretool_crystal_and_swarm_guards():
             ("cmd_for_rm", {"toolCall": {"name": "run_command", "args": {"CommandLine": 'for f in *; do rm "$f"; done'}}, "conversationId": "v450-c5"}),
             ("cmd_for_redir", {"toolCall": {"name": "run_command", "args": {"CommandLine": 'for f in *.md; do head -n 5 "$f" > out.txt; done'}}, "conversationId": "v450-c6"}),
             ("wm_recall", {"toolCall": {"name": "mcp_whitemagic_memory_recall", "args": {"query": "test"}}, "conversationId": "v450-m1"}),
+            ("read_350_250", {"toolCall": {"name": "read_file", "args": {"Path": str(big400), "StartLine": 350, "EndLine": 250}}, "conversationId": "v450-r2"}),
+            ("read_500_250", {"toolCall": {"name": "read_file", "args": {"Path": str(big400), "StartLine": 500, "EndLine": 250}}, "conversationId": "v450-r3"}),
+            ("read_351_750", {"toolCall": {"name": "read_file", "args": {"Path": str(big400), "StartLine": 351, "EndLine": 750}}, "conversationId": "v450-r4"}),
+            ("read_350_260", {"toolCall": {"name": "read_file", "args": {"Path": str(big400), "StartLine": 350, "EndLine": 260}}, "conversationId": "v450-r5"}),
+            ("read_0_0", {"toolCall": {"name": "read_file", "args": {"Path": str(big400), "StartLine": 0, "EndLine": 0}}, "conversationId": "v450-r6"}),
+            ("read_none_0", {"toolCall": {"name": "read_file", "args": {"Path": str(big400), "EndLine": 0}}, "conversationId": "v450-r7"}),
         ]
         py_res = {}
         rs_res = {}
@@ -1844,7 +1876,17 @@ def test_v450_rust_pretool_crystal_and_swarm_guards():
             py_res[k].get("decision") == rs_res[k].get("decision") and py_res[k].get("overwrite") == rs_res[k].get("overwrite")
             for k in py_res
         )
-        check("Rust wm-squeeze --pre-tool 14-case exact parity vs Python", parity_all)
+        check("Rust wm-squeeze --pre-tool 20-case exact parity vs Python", parity_all)
+        check(
+            "Rust --pre-tool read_file inverted/clamped ranges never emit StartLine > EndLine",
+            rs_res["read_350_250"].get("overwrite") == {"EndLine": 549}
+            and rs_res["read_500_250"].get("overwrite") == {"EndLine": 699}
+            and rs_res["read_351_750"].get("overwrite") == {"EndLine": 550}
+            and rs_res["read_350_260"].get("overwrite") == {"StartLine": 260, "EndLine": 350}
+            and rs_res["read_0_0"].get("overwrite") == {"StartLine": 1, "EndLine": 200}
+            and rs_res["read_none_0"].get("overwrite") == {"StartLine": 1, "EndLine": 200},
+            str({k: rs_res[k] for k in ("read_350_250", "read_500_250", "read_351_750", "read_350_260", "read_0_0", "read_none_0")}),
+        )
         check(">=160k ctx read_file clamps to EndLine=100", rs_res["read_165k"].get("overwrite") == {"StartLine": 1, "EndLine": 100}, str(rs_res["read_165k"]))
         check("swarm(add) fork>=80k / Neon omitted-model / >6KB brief force_ask", all(rs_res[k].get("decision") == "force_ask" for k in ("swarm_fork", "swarm_nomodel", "swarm_bloat")))
         check("post_message >4KB & invoke_subagent(research, inherit on Neon) force_ask", rs_res["post_bloat"].get("decision") == "force_ask" and rs_res["subagent_res"].get("decision") == "force_ask")

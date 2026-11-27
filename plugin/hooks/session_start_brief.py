@@ -12,6 +12,9 @@ Zero slow live probes; preserves Gemini 4 implicit prefix cache across turns.
 
 import json
 import os
+import re
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -62,17 +65,138 @@ def _fit_utf8_lines(text: str, max_bytes: int) -> str:
     return _trunc_word(text, max_bytes - 4)
 
 
+def _resolve_local_wm3_store():
+    explicit = os.environ.get("WM3_STORE", "").strip()
+    if explicit:
+        p = Path(explicit).expanduser()
+        return p if p.is_dir() else None
+    for cand in (HOME / ".local" / "share" / "whitemagic" / "gen3", Path("/Users/Shared/ai/wm-store-gen3")):
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def _probe_local_gen3_records(store_path):
+    if not store_path or os.environ.get("WM_SESSION_START_SKIP_GEN3") == "1":
+        return None
+    wm_bin = (
+        os.environ.get("WM3_BIN")
+        or shutil.which("wm-gen3")
+        or shutil.which("wm3")
+        or next(
+            (str(p) for p in (HOME / ".local" / "bin" / "wm-gen3", HOME / ".local" / "bin" / "wm3") if p.is_file()),
+            None,
+        )
+    )
+    if wm_bin:
+        try:
+            res = subprocess.run(
+                [wm_bin, "status", "--store", str(store_path)],
+                capture_output=True,
+                text=True,
+                timeout=0.5,
+            )
+            if res.returncode == 0:
+                m = re.search(r"Records Count:\s*([\d,]+)", res.stdout)
+                if m:
+                    return int(m.group(1).replace(",", ""))
+        except Exception:
+            pass
+    uidx = store_path / "uuid_index.jsonl"
+    if uidx.is_file():
+        try:
+            with uidx.open("rb") as fh:
+                return sum(1 for _ in fh)
+        except Exception:
+            pass
+    return None
+
+
+def _local_host_telemetry():
+    """Fast (<50ms) local disk & Gen3 store line rounded for Turn-0 prefix stability."""
+    if os.environ.get("WM_LOCAL_TELEMETRY_OFF") == "1":
+        return "", None, None
+    host = socket.gethostname().split(".")[0] or "localhost"
+    free_gb = None
+    disk_part = ""
+    try:
+        du = shutil.disk_usage(str(HOME))
+        free_gb = du.free / (1024 ** 3)
+        used_pct = int(round((du.used / du.total) * 100)) if du.total else 0
+        warn = " [LOW DISK]" if (free_gb < 15.0 or used_pct >= 90) else ""
+        disk_part = f"Disk: {free_gb:.1f} GiB free ({used_pct}% used){warn}"
+    except Exception:
+        pass
+    store = _resolve_local_wm3_store()
+    gen3_cnt = _probe_local_gen3_records(store) if store else None
+    gen3_part = ""
+    if store is not None and gen3_cnt is not None:
+        gen3_part = f"Gen3: {gen3_cnt:,} records ({store})"
+    elif store is not None:
+        gen3_part = f"Gen3: {store}"
+    parts = [p for p in (host, disk_part, gen3_part) if p]
+    return (f"[Local Host | {' | '.join(parts)}]" if parts else ""), free_gb, gen3_cnt
+
+
+def _is_remote_preflight(raw_text, local_free_gb, local_gen3_cnt):
+    flag = os.environ.get("WM_PREFLIGHT_IS_LOCAL", "").strip()
+    if flag == "1":
+        return False
+    if flag == "0":
+        return True
+    # Detect synced brief authored on another OS/user host (e.g. ThinkPad Linux -> macOS Syncthing)
+    if sys.platform == "darwin" and ("/home/" in raw_text or "home-lucas-" in raw_text):
+        return True
+    if "home-" in raw_text and HOME.name and f"home-{HOME.name}-" not in raw_text and "home-lucas-" in raw_text:
+        return True
+    head_block = "\n".join(raw_text.splitlines()[:6])
+    if local_free_gb is not None:
+        m_disk = re.search(r"Disk:\s*\*{0,2}([\d.]+)\s*GiB free", head_block)
+        if m_disk:
+            try:
+                if abs(float(m_disk.group(1)) - local_free_gb) >= 5.0:
+                    return True
+            except ValueError:
+                pass
+    if local_gen3_cnt is not None:
+        m_rec = re.search(r"Gen3 Primary Store:\s*\*{0,2}([\d,]+)\s*records", head_block)
+        if m_rec:
+            try:
+                remote_cnt = int(m_rec.group(1).replace(",", ""))
+                if abs(remote_cnt - local_gen3_cnt) > max(500, int(local_gen3_cnt * 0.25)):
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
 def build_brief():
     preflight_lines = []
+    local_line, local_free_gb, local_gen3_cnt = _local_host_telemetry()
+    if local_line:
+        preflight_lines.append(local_line)
+
     if PREFLIGHT_PATH.exists():
-        lines = PREFLIGHT_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
-        header = [l.strip() for l in lines[:4] if l.strip()]
-        claims = [l.strip() for l in lines if "Claim:" in l or "Release:" in l][:2]
-        preflight_lines.append(f"[SessionStart Cached Brief | source={PREFLIGHT_PATH}]")
-        preflight_lines.extend(_trunc_word(h, 180) for h in header[:3])
-        if claims:
-            preflight_lines.append("Recent Sangha Claims/Releases:")
-            preflight_lines.extend(f"  {_trunc_word(c, 115)}" for c in claims)
+        raw_text = PREFLIGHT_PATH.read_text(encoding="utf-8", errors="replace")
+        lines = raw_text.splitlines()
+        is_remote = _is_remote_preflight(raw_text, local_free_gb, local_gen3_cnt)
+        if not (is_remote and os.environ.get("WM_PREFLIGHT_INCLUDE_REMOTE") == "0"):
+            header = [l.strip() for l in lines[:4] if l.strip()]
+            claims = [l.strip() for l in lines if "Claim:" in l or "Release:" in l][:2]
+            if is_remote:
+                preflight_lines.append(f"[Remote Estate Brief (Syncthing) | source={PREFLIGHT_PATH}]")
+                # Filter out remote host's Disk / Gen3 Primary Store line so it is never confused with localhost
+                filtered_hdr = [
+                    h for h in header
+                    if not ("Disk:" in h and ("Gen3 Primary Store:" in h or "Compiled in" in h))
+                ]
+                preflight_lines.extend(_trunc_word(h, 180) for h in filtered_hdr[:2])
+            else:
+                preflight_lines.append(f"[SessionStart Cached Brief | source={PREFLIGHT_PATH}]")
+                preflight_lines.extend(_trunc_word(h, 180) for h in header[:3])
+            if claims:
+                preflight_lines.append("Recent Sangha Claims/Releases:")
+                preflight_lines.extend(f"  {_trunc_word(c, 115)}" for c in claims)
 
     sim_header = ""
     sim_lines = []
