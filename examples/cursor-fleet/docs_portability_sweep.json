@@ -1,0 +1,18 @@
+{
+  "id": "docs-portability-sweep",
+  "cwd": ".",
+  "max_usd": 1.5,
+  "stages": [
+    {
+      "name": "sweep-files",
+      "type": "map",
+      "preset": "synthesis",
+      "model": "medium",
+      "batch_size": 4,
+      "files": ["bin/*", "README.md", "install.sh"],
+      "inline_files": true,
+      "instruction": "Audit each file for macOS/Linux portability traps, missing subprocess timeouts, unclosed handles, broken flags, or onboarding friction. Return concise bullet findings with file + line hint.",
+      "reduce_instruction": "Deduplicate and rank all findings into P0 (breaks macOS/Linux users), P1 (reliability/timeout hazards), and P2 (docs/UX polish) with exact file targets."
+    }
+  ]
+}

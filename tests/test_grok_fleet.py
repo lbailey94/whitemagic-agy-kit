@@ -122,9 +122,35 @@ if "WORKTREE_EDIT" in prompt and wt_name:
     emit({{"type": "tool_call", "subtype": "started", "session_id": sid}})
     emit({{"type": "tool_call", "subtype": "completed", "session_id": sid}})
 
+if "RACE_BENCH" in prompt and wt_name:
+    repo_root = Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip())
+    wt_dir = Path.home() / ".cursor" / "worktrees" / repo_root.name / wt_name
+    wt_dir.parent.mkdir(parents=True, exist_ok=True)
+    if not wt_dir.exists():
+        subprocess.check_call(["git", "-C", str(repo_root), "worktree", "add", "--detach", str(wt_dir), "HEAD"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if "CANDIDATE 1/" in prompt:
+        (wt_dir / "speed.py").write_text("SCORE_MS = 99.0\\ndef solve(x):\\n    return x - 1\\n", encoding="utf-8")
+    elif "CANDIDATE 2/" in prompt:
+        (wt_dir / "speed.py").write_text("SCORE_MS = 12.4\\ndef solve(x):\\n    return x * 2\\n", encoding="utf-8")
+    else:
+        (wt_dir / "speed.py").write_text("SCORE_MS = 3.1\\ndef solve(x):\\n    return x * 2\\n", encoding="utf-8")
+    emit({{"type": "tool_call", "subtype": "started", "session_id": sid}})
+    emit({{"type": "tool_call", "subtype": "completed", "session_id": sid}})
+
 emit({{"type": "thinking", "subtype": "delta", "text": "analyzing", "session_id": sid}})
 if "RECORD_ENV" in prompt:
     reply = json.dumps({{"cwd": os.getcwd(), "args": args, "prompt": prompt}})
+elif "PIPE_SCREEN" in prompt:
+    import re as _re
+    ids = _re.findall(r"=== ITEM ([^ ]+) ===", prompt)
+    out_arr = [{{"id": iid, "score": 0.9 if iid.endswith(("1", "2")) else 0.2, "summary": f"finding-{{iid}}"}} for iid in ids]
+    reply = json.dumps(out_arr)
+elif "BIG_REDUCE_CHUNK" in prompt:
+    reply = "FINDING_BLOCK: " + ("x" * 1800)
+elif "INTERMEDIATE MERGE STEP" in prompt or "FINAL_REDUCE_SYNTH" in prompt:
+    reply = json.dumps({{"reduced": True, "parts_seen": prompt.count("=== PART "), "model": model}})
+elif "blind consensus judge" in prompt:
+    reply = json.dumps({{"consensus": True, "panelists_seen": prompt.count("=== PANELIST "), "judge_model": model}})
 else:
     reply = json.dumps({{"ok": True, "echo": prompt[:40], "model": model}})
 emit({{"type": "assistant", "message": {{"role": "assistant", "content": [{{"type": "text", "text": reply}}]}}, "session_id": sid}})
@@ -870,3 +896,201 @@ def test_swarm_and_mcp_v2_presets_and_non_fast_defaults():
     assert {"preset", "empty_cwd", "no_tools_guard", "allow_any_model"}.issubset(props.keys())
     task_props = props["tasks"]["items"]["properties"]
     assert {"empty_cwd", "no_tools_guard"}.issubset(task_props.keys())
+
+
+def test_map_tree_reduce_end_to_end(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    db_path = tmp_path / "fleet.db"
+    art_dir = tmp_path / "artifacts"
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+
+    items_p = tmp_path / "items.jsonl"
+    items_p.write_text(
+        "\n".join(json.dumps({"id": f"doc-{i}", "text": f"content {i}"}) for i in range(6)) + "\n",
+        encoding="utf-8",
+    )
+    out_p = tmp_path / "mr.json"
+    md_p = tmp_path / "mr.md"
+    red_p = tmp_path / "reduced.txt"
+
+    # 6 items at batch_size=1 -> 6 map outputs of ~1800 chars (~10.8KB) > 4000 chunk cap -> forces >=2 reduce levels!
+    p = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "map",
+            "--campaign", "c_tree_reduce",
+            "--preset", "synthesis",
+            "--items-jsonl", str(items_p),
+            "--batch-size", "1",
+            "--instruction", "BIG_REDUCE_CHUNK analyze",
+            "--reduce-instruction", "FINAL_REDUCE_SYNTH merge all",
+            "--reduce-max-chunk-chars", "4000",
+            "--reduce-out", str(red_p),
+            "--parse-json",
+            "--out", str(out_p),
+            "--report-md", str(md_p),
+            "--db-path", str(db_path), "--artifact-dir", str(art_dir),
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    res = json.loads(p.stdout)
+    assert res["ok"] is True
+    assert res["reduced"]["ok"] is True
+    assert res["reduced"]["levels"] >= 2
+    assert red_p.is_file()
+    reduced_json = json.loads(red_p.read_text(encoding="utf-8"))
+    assert reduced_json["reduced"] is True and reduced_json["parts_seen"] >= 2
+    md_text = md_p.read_text(encoding="utf-8")
+    assert "## Executive Synthesis" in md_text
+
+
+def test_race_tournament_ranking_score_regex_and_apply_winner(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    repo = tmp_path / "race_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "speed.py").write_text("SCORE_MS = 50.0\ndef solve(x):\n    return x\n", encoding="utf-8")
+    (repo / "verify.py").write_text(
+        "import speed\nassert speed.solve(7) == 14\nprint(f'median={speed.SCORE_MS}ms')\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    db_path = tmp_path / "fleet.db"
+    art_dir = tmp_path / "artifacts"
+    out_p = tmp_path / "race.json"
+    md_p = tmp_path / "race.md"
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+
+    p = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "race",
+            "--campaign", "c_race_test",
+            "--cwd", str(repo),
+            "--n", "3",
+            "--verify-cmd", "python3 verify.py",
+            "--score-regex", r"median=([0-9.]+)ms",
+            "--score-goal", "min",
+            "--apply-winner",
+            "--prompt", "RACE_BENCH optimize solve",
+            "--out", str(out_p),
+            "--report-md", str(md_p),
+            "--db-path", str(db_path), "--artifact-dir", str(art_dir),
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    data = json.loads(p.stdout)
+    assert data["ok"] is True
+    assert data["applied_winner"] is True
+    assert data["ranking"]["passed_count"] == 2
+    assert data["winner"]["name"] == "cand-03"
+    assert data["winner"]["score"] == 3.1
+    assert data["ranking"]["leaderboard"][1]["score"] == 12.4
+    assert data["ranking"]["leaderboard"][2]["passed"] is False
+    # Winner patch applied cleanly to repo
+    assert "SCORE_MS = 3.1" in (repo / "speed.py").read_text(encoding="utf-8")
+    assert md_p.is_file() and "cand-03" in md_p.read_text(encoding="utf-8")
+
+
+def test_council_blind_multi_model_and_judge(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    db_path = tmp_path / "fleet.db"
+    art_dir = tmp_path / "artifacts"
+    target_f = tmp_path / "auth.py"
+    target_f.write_text("def check(tok):\n    return tok == 'secret'\n", encoding="utf-8")
+    out_p = tmp_path / "council.json"
+    md_p = tmp_path / "council.md"
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+
+    p = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "council",
+            "--campaign", "c_council_test",
+            "--cwd", str(tmp_path),
+            "--files", "auth.py",
+            "--models", "grok-4.7-high,composer-2.5,claude-sonnet-5-thinking-high",
+            "--judge-model", "grok-4.7-high",
+            "--prompt", "Review auth.py for timing attacks",
+            "--parse-json",
+            "--out", str(out_p),
+            "--report-md", str(md_p),
+            "--db-path", str(db_path), "--artifact-dir", str(art_dir),
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    res = json.loads(p.stdout)
+    assert res["ok"] is True
+    assert res["panel_done"] == 3
+    assert res["judge_ok"] is True
+    full = json.loads(out_p.read_text(encoding="utf-8"))
+    assert {r["model"] for r in full["panelists"]} == {
+        "grok-4.7-high",
+        "composer-2.5",
+        "claude-sonnet-5-thinking-high",
+    }
+    assert full["judge"]["parsed"]["consensus"] is True
+    assert full["judge"]["parsed"]["panelists_seen"] == 3
+    assert "## Executive Synthesis" in md_p.read_text(encoding="utf-8")
+
+
+def test_pipeline_three_stage_map_filter_audit(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    db_path = tmp_path / "fleet.db"
+    art_dir = tmp_path / "artifacts"
+    seeds = tmp_path / "seeds.jsonl"
+    seeds.write_text(
+        "\n".join(json.dumps({"id": f"s-{i}", "body": f"file {i}"}) for i in (1, 2, 3, 4)) + "\n",
+        encoding="utf-8",
+    )
+    spec = {
+        "id": "pipe-test",
+        "cwd": str(tmp_path),
+        "stages": [
+            {
+                "name": "screen",
+                "type": "map",
+                "preset": "synthesis",
+                "batch_size": 2,
+                "items_jsonl": str(seeds),
+                "parse_json": True,
+                "instruction": "PIPE_SCREEN evaluate items",
+            },
+            {
+                "name": "gate",
+                "type": "filter",
+                "where": {"field": "score", "gte": 0.75},
+            },
+            {
+                "name": "deep",
+                "type": "map",
+                "preset": "synthesis",
+                "from_prev": True,
+                "batch_size": 1,
+                "prompt_template": "Deep verify {id}: {summary}",
+                "instruction": "Verify candidate",
+            },
+        ],
+    }
+    spec_p = tmp_path / "spec.json"
+    spec_p.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+
+    p = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "pipeline", str(spec_p),
+            "--db-path", str(db_path), "--artifact-dir", str(art_dir),
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    res = json.loads(p.stdout)
+    assert res["ok"] is True
+    assert len(res["stages"]) == 3
+    assert res["stages"][0]["items_emitted"] == 4
+    assert res["stages"][1]["in_items"] == 4 and res["stages"][1]["kept_items"] == 2
+    assert res["stages"][2]["items_emitted"] == 2

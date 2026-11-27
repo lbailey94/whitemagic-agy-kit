@@ -157,7 +157,23 @@ def main() -> None:
             continue
         try:
             req = json.loads(line)
-        except Exception:
+        except Exception as exc:
+            err_resp = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": f"Parse error: {exc}"},
+            }
+            sys.stdout.write(json.dumps(err_resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+            continue
+        if not isinstance(req, dict):
+            err_resp = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Invalid Request: expected JSON object"},
+            }
+            sys.stdout.write(json.dumps(err_resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
             continue
         method = str(req.get("method") or "")
         req_id = req.get("id")

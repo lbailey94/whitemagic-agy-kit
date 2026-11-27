@@ -1,0 +1,40 @@
+{
+  "id": "security-funnel-example",
+  "cwd": ".",
+  "max_usd": 2.5,
+  "stages": [
+    {
+      "name": "sink-screen",
+      "type": "map",
+      "preset": "synthesis",
+      "model": "medium",
+      "batch_size": 4,
+      "files": ["src/**/*.py"],
+      "inline_files": true,
+      "parse_json": true,
+      "instruction": "Screen each file for real security bugs (injection, path traversal, auth bypass, SSRF, unsafe deserialization). Return ONLY a JSON array of objects: [{\"id\": \"<file>:<symbol>\", \"file\": \"...\", \"severity\": \"HIGH|MED|LOW\", \"score\": 0.0-1.0, \"summary\": \"...\", \"evidence\": \"...\"}]. Omit speculative or intended behaviors."
+    },
+    {
+      "name": "high-signal-gate",
+      "type": "filter",
+      "where": {
+        "all": [
+          {"field": "score", "gte": 0.75},
+          {"field": "severity", "in": ["HIGH", "MED"]}
+        ]
+      },
+      "limit": 12
+    },
+    {
+      "name": "deep-audit",
+      "type": "audit",
+      "preset": "audit",
+      "model": "high",
+      "from_prev": true,
+      "batch_size": 1,
+      "max_tool_calls": 12,
+      "parse_json": true,
+      "prompt_template": "Verify whether candidate `{id}` in `{file}` ({summary}) is genuinely reachable and exploitable across callers. Cite exact line numbers and return JSON: {{\"id\": \"{id}\", \"confirmed\": true/false, \"poc_outline\": \"...\", \"fix\": \"...\"}}."
+    }
+  ]
+}

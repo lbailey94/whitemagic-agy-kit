@@ -127,6 +127,66 @@ cursor-fleet ask --preset synthesis --allow-any-model --model composer-2.5 \
 
 ---
 
+### 6. Automatic Map-Reduce (`map --reduce-instruction`)
+
+Collapse 10–500 parallel map batches into a single deduplicated executive synthesis (using automatic recursive tree-reduce whenever outputs exceed `--reduce-max-chunk-chars`):
+
+```bash
+cursor-fleet map \
+  --campaign portability-sweep \
+  --preset synthesis \
+  --files "bin/*" \
+  --batch-size 4 \
+  --instruction "List macOS/Linux portability bugs, missing subprocess timeouts, and silent error swallows as JSON." \
+  --reduce-instruction "Deduplicate and rank all findings into P0/P1/P2 with exact files and one-line fixes." \
+  --reduce-out /tmp/portability_summary.md \
+  --out /tmp/portability.json \
+  --report-md /tmp/portability_report.md
+```
+
+### 7. Best-of-N Worktree Tournament (`race`)
+
+Spawn `N` parallel isolated git worktrees with distinct strategies (or competing models via `--models`), verify each against `--verify-cmd` (optionally inside network-isolated Linux `bwrap` via `--confined`), extract a numeric benchmark score via `--score-regex`, and rank survivors deterministically:
+
+```bash
+cursor-fleet race \
+  --campaign hot-loop-race \
+  --cwd /path/to/repo \
+  --n 3 \
+  --verify-cmd "pytest -q && python3 bench.py" \
+  --score-regex "median=([0-9.]+)ms" \
+  --score-goal min \
+  --confined \
+  --prompt "Optimize parser.py hot loop while keeping 100% test pass rate." \
+  --report-md /tmp/race_leaderboard.md
+# Add --apply-winner to auto-apply the #1 verified patch cleanly, or apply later with `cursor-fleet patches`.
+```
+
+### 8. Blind Multi-Model Council (`council`)
+
+Dispatch multiple distinct Cursor model families **blind in parallel** on the same spec, disclosure, or diff, then run a consensus judge that separates **Consensus (`>=2` models agree)** from unique findings and contradictions:
+
+```bash
+cursor-fleet council \
+  --campaign security-council \
+  --files "src/auth.py" \
+  --models "grok-4.7-high,composer-2.5,claude-sonnet-5-thinking-high" \
+  --judge-model "grok-4.7-high" \
+  --prompt "Review this auth module for bypasses, race conditions, and edge cases." \
+  --report-md /tmp/council_report.md
+```
+
+### 9. Declarative Multi-Stage Funnels (`pipeline`)
+
+Chain cheap Stage-1 synthesis screening → `$0` local deterministic Python/shell filtering or execution verification → Stage-2 high-effort audit/patch/race/council waves. See ready-to-use JSON templates in [`examples/cursor-fleet/`](../examples/cursor-fleet/):
+
+```bash
+cursor-fleet pipeline examples/cursor-fleet/security_funnel.json --dry-run
+cursor-fleet pipeline examples/cursor-fleet/security_funnel.json --cwd /path/to/repo --max-usd 2.50
+```
+
+---
+
 ## Managing Campaigns & Crash-Safe Resume
 
 ```bash
@@ -179,3 +239,4 @@ Example MCP call (zero-tool pure synthesis, 18.8× cheaper):
 2. **Pack 4 items per worker (`--batch-size 4`)** for structured triage/classification: beats `N=1` (overhead per worker) and `N=8` (reasoning wall timeouts) on both tokens and wall-time per item.
 3. **Stick to standard non-fast tiers (`medium` / `high`)** for batch fleets; reserve `*-fast` for latency-critical interactive checks.
 4. **Static instructions always go first**: `map` and `enqueue` place guardrails and `--instruction` before varying `[TASK]` / `=== ITEM ===` blocks to maximize Grok 4.7 prefix cache reuse.
+

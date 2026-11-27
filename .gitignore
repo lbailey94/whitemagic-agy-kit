@@ -9,3 +9,4 @@ tools/agy-turbo-mcp/.tmp/
 __pycache__/
 *.pyc
 .DS_Store
+benchmarks/cursor_fleet_v2_run/

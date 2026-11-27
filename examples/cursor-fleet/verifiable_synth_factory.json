@@ -1,0 +1,22 @@
+{
+  "id": "verifiable-synth-factory",
+  "cwd": ".",
+  "max_usd": 2.0,
+  "stages": [
+    {
+      "name": "generate",
+      "type": "map",
+      "preset": "synthesis",
+      "model": "medium",
+      "batch_size": 2,
+      "items_jsonl": "seeds.jsonl",
+      "parse_json": true,
+      "instruction": "For each seed topic, create ONE self-contained Python security/edge-case coding task as JSON array: [{\"id\": \"<seed_id>\", \"title\": \"...\", \"buggy_code\": \"...\", \"fixed_code\": \"...\", \"test_code\": \"...assert...\"}]. The test_code MUST fail on buggy_code and pass on fixed_code using Python stdlib only."
+    },
+    {
+      "name": "exec-verify-gate",
+      "type": "filter",
+      "command": "python3 -c 'import json, subprocess, sys, tempfile, pathlib; inp, outp = sys.argv[1], sys.argv[2]; kept = []\nfor ln in pathlib.Path(inp).read_text().splitlines():\n    if not ln.strip(): continue\n    it = json.loads(ln)\n    if not all(k in it for k in (\"buggy_code\",\"fixed_code\",\"test_code\")): continue\n    with tempfile.TemporaryDirectory() as td:\n        p = pathlib.Path(td)\n        (p/\"sol.py\").write_text(it[\"buggy_code\"]+\"\\n\"+it[\"test_code\"])\n        r_bug = subprocess.run([sys.executable, str(p/\"sol.py\")], capture_output=True, timeout=5)\n        (p/\"sol.py\").write_text(it[\"fixed_code\"]+\"\\n\"+it[\"test_code\"])\n        r_fix = subprocess.run([sys.executable, str(p/\"sol.py\")], capture_output=True, timeout=5)\n        if r_bug.returncode != 0 and r_fix.returncode == 0:\n            it[\"exec_verified\"] = True; kept.append(it)\npathlib.Path(outp).write_text(\"\\n\".join(json.dumps(x) for x in kept) + (\"\\n\" if kept else \"\"))\nprint(f\"admitted {len(kept)}\")' {in_jsonl} {out_jsonl}"
+    }
+  ]
+}

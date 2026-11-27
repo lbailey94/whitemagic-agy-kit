@@ -14,9 +14,12 @@ description: Dispatch 1-6 parallel Grok 4.7 (500K) workers via `grok_dispatch` /
 ## High-Throughput Fleet CLI (`cursor-fleet` / `wm-grok-fleet`)
 - **Preflight check:** `cursor-fleet doctor` (checks `cursor-agent`, login, live models, `bwrap`, host RAM/disk on macOS+Linux, presets).
 - **Zero-manifest map-reduce (recommended for >6 items or corpus sweeps):**
-  - `cursor-fleet map --campaign <id> --preset synthesis --items-jsonl <file> --batch-size 4 --max-usd 1.50 --parse-json --instruction "..." --out out.json --report-md report.md`
+  - `cursor-fleet map --campaign <id> --preset synthesis --items-jsonl <file> --batch-size 4 --max-usd 1.50 --parse-json --instruction "..." --reduce-instruction "..." --out out.json --report-md report.md`
   - Add `--dry-run` first to preview worker count, estimated tokens, and estimated Cursor quota `%` for `$0`.
-  - Also supports `--files "src/**/*.py"`, `--items-json`, `--stdin-items`, `--allow-any-model` (Composer, Codex, Claude, Auto), and `WM_GROK_FAMILY=grok-4.8`.
+  - Supports `--reduce-instruction` (automatic recursive tree-reduce), `--files "src/**/*.py"`, `--items-json`, `--stdin-items`, `--allow-any-model`, and `WM_GROK_FAMILY=grok-4.8`.
+- **Best-of-N Worktree Tournament (`race`):** `cursor-fleet race --cwd <repo> --n 3 --verify-cmd "pytest -q" --score-regex "median=([0-9.]+)ms" --confined --prompt "..."` (ranks by pass → score → diff size → speed; `--apply-winner` or `patches --apply`).
+- **Blind Multi-Model Council (`council`):** `cursor-fleet council --files "auth.py" --models "grok-4.7-high,composer-2.5,claude-sonnet-5-thinking-high" --prompt "..."` (blind panelists + consensus judge).
+- **Multi-Stage Funnel (`pipeline`):** `cursor-fleet pipeline examples/cursor-fleet/security_funnel.json` (`map -> deterministic local filter/exec-gate -> audit/patch/race/council`).
 - **One-shot parallel prompts:** `cursor-fleet ask --preset synthesis "Prompt 1" "Prompt 2" --report-md out.md`
 - **Inspect, report & apply patches:** `cursor-fleet campaigns`, `cursor-fleet inspect --campaign <id> --show-output`, `cursor-fleet report --campaign <id>`, `cursor-fleet patches --campaign <id> --apply <job> --repo <path> --check`.
 - **Standalone install for other Cursor users:** `./install.sh --cursor-fleet-only [--wire-cursor-mcp]` (see `docs/CURSOR_FLEET.md`).

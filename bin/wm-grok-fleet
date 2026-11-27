@@ -25,6 +25,7 @@ import os
 import random
 import re
 import selectors
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -134,6 +135,68 @@ _SWARM_MOD_CACHE: Any = None
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_bool(val: Any, default: bool = False) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
+def _safe_template_sub(template: str, mapping: dict[str, Any]) -> str:
+    """Substitute only simple `{identifier}` placeholders (blocks format-string attr/index traversal)."""
+    return re.sub(
+        r"\{([A-Za-z_][A-Za-z0-9_]*)\}",
+        lambda m: str(mapping[m.group(1)]) if m.group(1) in mapping else m.group(0),
+        template,
+    )
+
+
+def _run_shell_bounded(cmd_str: str, cwd: Path, timeout_sec: int) -> tuple[int, str, str, str | None]:
+    """Run a non-login shell command in its own process group with hard timeout + UTF-8 replace decoding."""
+    tcap = max(1, min(600, int(timeout_sec)))
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        proc = subprocess.Popen(
+            ["bash", "-c", cmd_str],
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        out_b, err_b = proc.communicate(timeout=tcap)
+        return (
+            int(proc.returncode),
+            out_b.decode("utf-8", errors="replace"),
+            err_b.decode("utf-8", errors="replace"),
+            None,
+        )
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            _kill_process_group(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+        return -1, "", f"command timed out after {tcap}s", f"timed out after {tcap}s"
+    except OSError as exc:
+        return -1, "", str(exc), f"os error: {exc}"
+
+
+def _write_json_atomic(dest: Path, obj: Any) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, dest)
 
 
 def sanitize_id(raw: str, max_len: int = 48) -> str:
@@ -1145,15 +1208,44 @@ def exec_stream_worker(
                         ok = False
                         v_err = vres.get("error") or f"confined verify exit={verify_exit_code}"
                         err_msg = f"{err_msg}; {v_err}" if err_msg else v_err
+                elif job.get("verify_cmd"):
+                    vcmd = str(job["verify_cmd"])
+                    v_timeout = min(90, max(5, int(wall_timeout_sec or 90)))
+                    verify_exit_code, v_out_full, v_err_full, v_exc = _run_shell_bounded(vcmd, wt_path, v_timeout)
+                    if verify_exit_code != 0:
+                        ok = False
+                        v_err = v_exc or f"verify_cmd failed (exit={verify_exit_code})"
+                        err_msg = f"{err_msg}; {v_err}" if err_msg else v_err
+                    rcpt = {
+                        "receipt_version": "wm-worktree-verify/1.0",
+                        "issued_at_utc": utc_now_iso(),
+                        "scope_confined": False,
+                        "worktree_path": str(wt_path),
+                        "verify_cmd_sha256": hashlib.sha256(vcmd.encode("utf-8")).hexdigest(),
+                        "verify_exit_code": verify_exit_code,
+                        "verify_stdout_tail": v_out_full[-4000:],
+                        "verify_stderr_tail": v_err_full[-2000:],
+                    }
+                    rcpt_dest = camp_art / "receipts" / f"{sanitize_id(jid, 64)}.json"
+                    try:
+                        _write_json_atomic(rcpt_dest, rcpt)
+                        receipt_path_str = str(rcpt_dest)
+                    except OSError as exc:
+                        ok = False
+                        err_msg = f"{err_msg}; receipt write failed: {exc}" if err_msg else f"receipt write failed: {exc}"
             elif ok:
                 ok = False
                 err_msg = f"worktree directory missing after run: {wt_name}"
         finally:
-            _prune_single_worktree(repo_root, wt_path)
+            try:
+                _prune_single_worktree(repo_root, wt_path)
+            except Exception:
+                pass
 
     is_stall = bool(timeout_reason and "stream stall" in timeout_reason)
     is_wall = bool(timeout_reason and "wall timeout" in timeout_reason)
-    retryable = bool((not quota_exhausted) and (rate_limited or is_stall or (is_wall and retry_wall_timeouts)))
+    is_action_req = "ActionRequiredError" in combined_err
+    retryable = bool((not quota_exhausted) and (not is_action_req) and (rate_limited or is_stall or (is_wall and retry_wall_timeouts)))
     return {
         "ok": ok,
         "retryable": retryable,
@@ -1901,7 +1993,24 @@ def render_campaign_markdown(export_data: dict[str, Any], parse_json: bool = Fal
         f"- **Cost & Speed:** est_actual=`${summary.get('est_actual_usd', summary.get('est_standard_usd', 0.0)):.4f}` (~`{summary.get('est_cursor_quota_pct', 0.0)}%` quota) | wall_sum=`{summary.get('wall_s_sum', 0)}s` (avg `{summary.get('wall_s_avg', 0)}s`) | tools=`{summary.get('total_tool_calls', 0)}`",
         "",
     ]
-    for rec in _collect_campaign_outputs(export_data, parse_json=parse_json):
+    all_outputs = _collect_campaign_outputs(export_data, parse_json=parse_json)
+    final_reduces = [r for r in all_outputs if str(r.get("stage") or "") in ("reduce", "judge") and str(r.get("id") or "").startswith(("reduce-final", "judge-"))]
+    if final_reduces:
+        fr = final_reduces[-1]
+        lines.append(f"## Executive Synthesis (`{fr['id']}` · `{fr['model']}` · `{fr['wall_s']}s`)")
+        lines.append("")
+        if parse_json and fr.get("parsed") is not None:
+            lines.append("```json")
+            lines.append(json.dumps(fr["parsed"], indent=2, ensure_ascii=False))
+            lines.append("```")
+        else:
+            lines.append((fr.get("output") or "").strip() or "_(empty output)_")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    for rec in all_outputs:
+        if rec in final_reduces:
+            continue
         lines.append(f"## {rec['id']} (`{rec['status']}` · `{rec['model']}` · `{rec['wall_s']}s` · `{rec['tool_calls']}` tools)")
         if rec.get("error"):
             lines.append(f"> Error: `{rec['error']}`")
@@ -2554,7 +2663,1292 @@ def cmd_map(args: argparse.Namespace) -> int:
             }
         )
 
-    return _enqueue_and_run_inline(cid=cid, rows_spec=rows_spec, args=args, preset_cfg=preset_cfg, model_str=model)
+    if getattr(args, "dry_run", False):
+        est = estimate_batch_cost([r["prompt"] for r in rows_spec], model)
+        reduce_inst = _resolve_reduce_instruction(args)
+        preview = {
+            "ok": True,
+            "dry_run": True,
+            "campaign_id": cid,
+            "preset": getattr(args, "preset", None),
+            "action": rows_spec[0]["action"] if rows_spec else "ask",
+            "reduce_enabled": bool(reduce_inst),
+            "estimate": est,
+            "sample_jobs": [
+                {"id": r["id"], "name": r["name"], "prompt_chars": len(r["prompt"])}
+                for r in rows_spec[:10]
+            ],
+        }
+        print(json.dumps(preview, indent=2))
+        return 0
+
+    reduce_inst = _resolve_reduce_instruction(args)
+    if not reduce_inst:
+        return _enqueue_and_run_inline(cid=cid, rows_spec=rows_spec, args=args, preset_cfg=preset_cfg, model_str=model)
+
+    # Run map stage, then recursive zero-tool tree reduce inside the same resumable campaign
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    art_dir = Path(args.artifact_dir) if args.artifact_dir else default_artifact_dir()
+    prompts_dir = art_dir / "campaigns" / cid / "prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    store = FleetStore(db_path)
+    store.ensure_campaign(cid, name=cid, config={"preset": getattr(args, "preset", None), "mode": "map-reduce"})
+
+    db_rows: list[dict[str, Any]] = []
+    for r in rows_spec:
+        p_file = prompts_dir / f"{r['id']}.txt"
+        p_file.write_text(r["prompt"], encoding="utf-8")
+        db_rows.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "stage": "map",
+                "action": r["action"],
+                "model": r["model"],
+                "cwd": r["cwd"],
+                "prompt_path": str(p_file),
+                "verify_cmd": r.get("verify_cmd"),
+                "confined": 1 if r.get("confined") else 0,
+                "max_attempts": max(1, int(r.get("max_attempts", 3))),
+                "priority": int(r.get("priority", 0)),
+            }
+        )
+    store.enqueue_jobs(cid, db_rows)
+
+    map_run_ns = _build_run_namespace(
+        campaign=cid,
+        preset=getattr(args, "preset", None),
+        read_concurrency=getattr(args, "read_concurrency", None),
+        write_concurrency=getattr(args, "write_concurrency", None),
+        stall_timeout=getattr(args, "stall_timeout", None),
+        wall_timeout=getattr(args, "wall_timeout", None),
+        max_retries=int(getattr(args, "max_retries", 2)),
+        min_free_ram_mb=float(getattr(args, "min_free_ram_mb", 1500.0)),
+        min_free_root_gb=float(getattr(args, "min_free_root_gb", 8.0)),
+        empty_cwd=bool(getattr(args, "empty_cwd", False)),
+        no_tools_guard=bool(getattr(args, "no_tools_guard", False)),
+        max_tool_calls=getattr(args, "max_tool_calls", None),
+        max_usd=float(getattr(args, "max_usd", 0.0) or 0.0),
+        retry_wall_timeouts=bool(getattr(args, "retry_wall_timeouts", False)),
+        checkpoint_path=getattr(args, "checkpoint_path", None),
+        checkpoint_jsonl=getattr(args, "checkpoint_jsonl", None),
+        retry_failed=bool(getattr(args, "retry_failed", False)),
+        cursor_bin=getattr(args, "cursor_bin", None),
+        db_path=str(db_path),
+        artifact_dir=str(art_dir),
+        allow_any_model=bool(getattr(args, "allow_any_model", False)),
+        quiet=bool(getattr(args, "quiet", False)),
+        suppress_stdout=True,
+    )
+    rc_map = cmd_run(map_run_ns)
+    parse_json = bool(getattr(args, "parse_json", False))
+    export_map = store.export_campaign(cid)
+    map_outputs = [r for r in _collect_campaign_outputs(export_map, parse_json=parse_json) if r.get("stage") == "map" and r.get("status") == "done"]
+
+    reduce_model = resolve_fleet_model(
+        getattr(args, "reduce_model", None) or model,
+        allow_any_model=bool(getattr(args, "allow_any_model", False)),
+    )
+    max_chunk_chars = max(4000, int(getattr(args, "reduce_max_chunk_chars", 96000) or 96000))
+    reduced_info = _run_tree_reduce(
+        store=store,
+        cid=cid,
+        art_dir=art_dir,
+        source_pairs=[(r["id"], r["output"]) for r in map_outputs],
+        reduce_instruction=reduce_inst,
+        reduce_model=reduce_model,
+        args=args,
+        max_chunk_chars=max_chunk_chars,
+        parse_json=parse_json,
+    )
+
+    export_final = store.export_campaign(cid)
+    results = _collect_campaign_outputs(export_final, parse_json=parse_json)
+    rc_all = 0 if (rc_map == 0 and reduced_info.get("ok", False)) else 1
+    payload = {
+        "ok": rc_all == 0,
+        "campaign_id": cid,
+        "summary": export_final["summary"],
+        "reduced": reduced_info,
+        "results": results,
+    }
+    if getattr(args, "reduce_out", None) and reduced_info.get("output") is not None:
+        ro = Path(args.reduce_out)
+        ro.parent.mkdir(parents=True, exist_ok=True)
+        ro.write_text(str(reduced_info["output"]), encoding="utf-8")
+    if getattr(args, "out", None):
+        out_p = Path(args.out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if getattr(args, "report_md", None):
+        md_p = Path(args.report_md)
+        md_p.parent.mkdir(parents=True, exist_ok=True)
+        md_p.write_text(render_campaign_markdown(export_final, parse_json=parse_json), encoding="utf-8")
+
+    stdout_obj = (
+        {
+            "ok": rc_all == 0,
+            "campaign_id": cid,
+            "out": str(args.out),
+            "report_md": str(args.report_md) if getattr(args, "report_md", None) else None,
+            "reduce_out": str(args.reduce_out) if getattr(args, "reduce_out", None) else None,
+            "reduced": {k: v for k, v in reduced_info.items() if k != "output"},
+            "summary": export_final["summary"],
+        }
+        if getattr(args, "out", None)
+        else payload
+    )
+    print(json.dumps(stdout_obj, indent=2, ensure_ascii=False))
+    return rc_all
+
+
+def _resolve_reduce_instruction(args: argparse.Namespace) -> str:
+    txt = str(getattr(args, "reduce_instruction", None) or "").strip()
+    rf = getattr(args, "reduce_instruction_file", None)
+    if rf:
+        txt = Path(rf).read_text(encoding="utf-8").strip()
+    return txt
+
+
+def _run_tree_reduce(
+    *,
+    store: FleetStore,
+    cid: str,
+    art_dir: Path,
+    source_pairs: list[tuple[str, str]],
+    reduce_instruction: str,
+    reduce_model: str,
+    args: argparse.Namespace,
+    max_chunk_chars: int = 96000,
+    parse_json: bool = False,
+) -> dict[str, Any]:
+    """Recursively reduce map outputs in zero-tool synthesis waves until one final synthesis remains."""
+    if not source_pairs:
+        return {"ok": False, "error": "no completed map outputs to reduce", "levels": 0, "output": ""}
+    prompts_dir = art_dir / "campaigns" / cid / "prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    current = list(source_pairs)
+    level = 0
+    last_job_id = ""
+    while True:
+        level += 1
+        chunks: list[list[tuple[str, str]]] = []
+        cur_chunk: list[tuple[str, str]] = []
+        cur_len = 0
+        for label, body in current:
+            blen = len(body) + len(label) + 40
+            if cur_chunk and (cur_len + blen > max_chunk_chars):
+                chunks.append(cur_chunk)
+                cur_chunk = []
+                cur_len = 0
+            cur_chunk.append((label, body))
+            cur_len += blen
+        if cur_chunk:
+            chunks.append(cur_chunk)
+
+        is_final = len(chunks) == 1
+        rows: list[dict[str, Any]] = []
+        chunk_ids: list[str] = []
+        for idx, ch in enumerate(chunks, 1):
+            body = "\n\n".join(f"=== PART {lbl} ===\n{txt}" for lbl, txt in ch)
+            if is_final:
+                prompt = f"{reduce_instruction}\n\n{body}"
+                tag = "reduce-final"
+            else:
+                prompt = (
+                    "INTERMEDIATE MERGE STEP: Consolidate and deduplicate the partial worker outputs below "
+                    "while preserving ALL concrete findings, IDs, metrics, and evidence verbatim for the final synthesis.\n"
+                    f"Target rubric:\n{reduce_instruction}\n\n{body}"
+                )
+                tag = f"reduce-L{level}-{idx:03d}"
+            digest = hashlib.sha256(f"{tag}:{body[:2048]}:{len(body)}".encode("utf-8")).hexdigest()[:8]
+            jid = sanitize_id(f"{tag}-{digest}", 64)
+            p_file = prompts_dir / f"{jid}.txt"
+            p_file.write_text(prompt, encoding="utf-8")
+            rows.append(
+                {
+                    "id": jid,
+                    "name": tag,
+                    "stage": "reduce",
+                    "action": "ask",
+                    "model": reduce_model,
+                    "cwd": str(art_dir),
+                    "prompt_path": str(p_file),
+                    "verify_cmd": None,
+                    "confined": 0,
+                    "max_attempts": 3,
+                    "priority": 1000 - level * 10 - idx,
+                }
+            )
+            chunk_ids.append(jid)
+
+        store.enqueue_jobs(cid, rows)
+        red_ns = _build_run_namespace(
+            campaign=cid,
+            preset="synthesis",
+            read_concurrency=getattr(args, "read_concurrency", None) or 4,
+            write_concurrency=1,
+            stall_timeout=getattr(args, "stall_timeout", None) or 90,
+            wall_timeout=getattr(args, "wall_timeout", None) or 240,
+            max_retries=int(getattr(args, "max_retries", 2)),
+            min_free_ram_mb=float(getattr(args, "min_free_ram_mb", 1500.0)),
+            min_free_root_gb=float(getattr(args, "min_free_root_gb", 8.0)),
+            empty_cwd=True,
+            no_tools_guard=True,
+            max_tool_calls=0,
+            max_usd=float(getattr(args, "max_usd", 0.0) or 0.0),
+            retry_wall_timeouts=bool(getattr(args, "retry_wall_timeouts", False)),
+            checkpoint_path=getattr(args, "checkpoint_path", None),
+            checkpoint_jsonl=getattr(args, "checkpoint_jsonl", None),
+            retry_failed=bool(getattr(args, "retry_failed", False)),
+            cursor_bin=getattr(args, "cursor_bin", None),
+            db_path=str(store.db_path),
+            artifact_dir=str(art_dir),
+            allow_any_model=bool(getattr(args, "allow_any_model", False)),
+            quiet=bool(getattr(args, "quiet", False)),
+            suppress_stdout=True,
+        )
+        cmd_run(red_ns)
+        exp = store.export_campaign(cid)
+        by_id = {j["id"]: j for j in exp["jobs"]}
+        next_pairs: list[tuple[str, str]] = []
+        for jid in chunk_ids:
+            j = by_id.get(jid) or {}
+            out_txt = ""
+            if j.get("output_path") and Path(j["output_path"]).is_file():
+                out_txt = Path(j["output_path"]).read_text(encoding="utf-8", errors="replace")
+            if j.get("status") == "done":
+                next_pairs.append((jid, out_txt))
+        if is_final:
+            last_job_id = chunk_ids[0]
+            j_fin = by_id.get(last_job_id) or {}
+            fin_txt = next_pairs[0][1] if next_pairs else ""
+            return {
+                "ok": j_fin.get("status") == "done",
+                "job_id": last_job_id,
+                "model": j_fin.get("resolved_model") or reduce_model,
+                "levels": level,
+                "wall_s": j_fin.get("wall_s"),
+                "output_path": j_fin.get("output_path"),
+                "output": fin_txt,
+                "parsed": extract_json_payload(fin_txt) if parse_json else None,
+                "error": j_fin.get("error"),
+            }
+        if not next_pairs or len(next_pairs) >= len(current):
+            # Guard against non-shrinking loop if chunks couldn't shrink further
+            return {
+                "ok": False,
+                "error": f"tree-reduce stopped at level {level} with {len(next_pairs)} outputs",
+                "levels": level,
+                "output": "\n\n".join(txt for _, txt in next_pairs),
+            }
+        current = next_pairs
+
+
+DEFAULT_RACE_STRATEGIES = [
+    "Minimal Surgical Fix: make the smallest, lowest-risk change that satisfies every requirement and test cleanly.",
+    "Algorithmic & Performance Focus: optimize hot paths, eliminate redundant work/allocations, and preserve 100% correctness.",
+    "Clean Refactor & Edge-Case Hardening: structure cleanly with explicit boundary checks and thorough unit tests.",
+    "Data-Structure & Caching Redesign: rethink internal data structures or caching to maximize throughput cleanly.",
+]
+
+
+def _inspect_patch_stats(patch_path: str | None) -> tuple[int, int, int]:
+    if not patch_path or not Path(patch_path).is_file():
+        return 0, 0, 0
+    txt = Path(patch_path).read_text(encoding="utf-8", errors="replace")
+    added = sum(1 for ln in txt.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in txt.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+    return len(txt.encode("utf-8")), added, removed
+
+
+def rank_race_candidates(
+    results: list[dict[str, Any]],
+    *,
+    verify_required: bool = True,
+    score_regex: str | None = None,
+    score_goal: str = "min",
+) -> dict[str, Any]:
+    """Deterministically rank Best-of-N worktree candidates by pass, patch presence, score, diff size, and speed."""
+    pat = re.compile(score_regex) if score_regex else None
+    goal = str(score_goal or "min").strip().lower()
+    ranked: list[dict[str, Any]] = []
+
+    for r in results:
+        pbytes, added, removed = _inspect_patch_stats(r.get("patch_path"))
+        diff_lines = added + removed
+        verify_rc: int | None = None
+        scope_confined: bool | None = None
+        v_out = ""
+        v_err = ""
+        if r.get("receipt_path") and Path(r["receipt_path"]).is_file():
+            try:
+                rcpt = json.loads(Path(r["receipt_path"]).read_text(encoding="utf-8"))
+                verify_rc = rcpt.get("verify_exit_code")
+                scope_confined = rcpt.get("scope_confined")
+                v_out = str(rcpt.get("verify_stdout_tail") or "")
+                v_err = str(rcpt.get("verify_stderr_tail") or "")
+            except Exception:
+                pass
+
+        passed = (r.get("status") == "done") and ((not verify_required) or (verify_rc == 0))
+        non_empty = pbytes > 0
+        score_val: float | None = None
+        if pat is not None:
+            haystack = v_out + "\n" + v_err + "\n" + str(r.get("output") or "")
+            matches = pat.findall(haystack)
+            if matches:
+                last_m = matches[-1]
+                raw_num = last_m[0] if isinstance(last_m, tuple) else last_m
+                try:
+                    score_val = float(raw_num)
+                except ValueError:
+                    score_val = None
+
+        ranked.append(
+            {
+                "id": r.get("id"),
+                "name": r.get("name"),
+                "model": r.get("model"),
+                "status": r.get("status"),
+                "passed": passed,
+                "verify_exit_code": verify_rc,
+                "scope_confined": scope_confined,
+                "score": score_val,
+                "patch_bytes": pbytes,
+                "diff_added": added,
+                "diff_removed": removed,
+                "diff_lines": diff_lines,
+                "wall_s": float(r.get("wall_s") or 0.0),
+                "tool_calls": int(r.get("tool_calls") or 0),
+                "patch_path": r.get("patch_path"),
+                "receipt_path": r.get("receipt_path"),
+                "error": r.get("error"),
+            }
+        )
+
+    def _sort_key(c: dict[str, Any]) -> tuple[Any, ...]:
+        has_score = c["score"] is not None
+        if pat is not None:
+            if has_score:
+                score_ord = float(c["score"]) if goal == "min" else -float(c["score"])
+            else:
+                score_ord = float("inf")
+        else:
+            score_ord = 0.0
+        return (
+            0 if c["passed"] else 1,
+            0 if c["patch_bytes"] > 0 else 1,
+            0 if (pat is None or has_score) else 1,
+            score_ord,
+            c["diff_lines"] if c["diff_lines"] > 0 else 10**9,
+            c["wall_s"],
+        )
+
+    ranked.sort(key=_sort_key)
+    for idx, c in enumerate(ranked, 1):
+        c["rank"] = idx
+
+    winner = ranked[0] if (ranked and ranked[0]["passed"] and ranked[0]["patch_bytes"] > 0) else None
+    return {
+        "winner": winner,
+        "passed_count": sum(1 for c in ranked if c["passed"]),
+        "total_candidates": len(ranked),
+        "score_goal": goal if pat is not None else None,
+        "leaderboard": ranked,
+    }
+
+
+def cmd_race(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd or os.getcwd()).resolve()
+    prompt_base = str(args.prompt or "").strip()
+    if args.prompt_file:
+        prompt_base = Path(args.prompt_file).read_text(encoding="utf-8").strip()
+    if not prompt_base:
+        print(json.dumps({"ok": False, "error": "--prompt or --prompt-file is required for `race`"}))
+        return 1
+
+    raw_models = [m.strip() for m in str(args.models or "").split(",") if m.strip()]
+    allow_any = bool(args.allow_any_model) or bool(raw_models)
+    raw_strats = [s.strip() for s in (args.strategies or []) if s.strip()]
+
+    candidates: list[tuple[str, str, str]] = []  # (label, model, strategy)
+    if raw_models and raw_strats:
+        for idx, (m_raw, strat) in enumerate(zip(raw_models, raw_strats), 1):
+            m = resolve_fleet_model(m_raw, allow_any_model=allow_any)
+            candidates.append((f"cand-{idx:02d}-{sanitize_id(m, 20)}", m, strat))
+    elif raw_models:
+        for idx, m_raw in enumerate(raw_models, 1):
+            m = resolve_fleet_model(m_raw, allow_any_model=allow_any)
+            strat = DEFAULT_RACE_STRATEGIES[(idx - 1) % len(DEFAULT_RACE_STRATEGIES)]
+            candidates.append((f"cand-{idx:02d}-{sanitize_id(m, 20)}", m, strat))
+    else:
+        m = resolve_fleet_model(args.model or "high", allow_any_model=bool(args.allow_any_model))
+        strats = raw_strats if raw_strats else DEFAULT_RACE_STRATEGIES[: max(1, int(args.n or 3))]
+        for idx, strat in enumerate(strats, 1):
+            candidates.append((f"cand-{idx:02d}", m, strat))
+
+    cid = sanitize_id(
+        args.campaign or f"race-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+        64,
+    )
+    rows_spec: list[dict[str, Any]] = []
+    for idx, (label, model_str, strat) in enumerate(candidates, 1):
+        full_prompt = (
+            f"[TOURNAMENT CANDIDATE {idx}/{len(candidates)} — STRATEGY]\n{strat}\n\n"
+            f"[OBJECTIVE]\n{prompt_base}\n\n"
+            "Requirements:\n"
+            "- Edit files directly in this isolated git worktree within your first 2-3 tool calls.\n"
+            "- Do NOT spend turns running prolonged exploratory micro-benchmarks before writing your edit.\n"
+            "- Keep the diff focused and clean.\n"
+            + (f"- Run `{args.verify_cmd}` at most ONCE to confirm your edit passes, then finish immediately.\n" if args.verify_cmd else "")
+        )
+        digest = hashlib.sha256(f"{cid}:{idx}:{model_str}:{strat}".encode("utf-8")).hexdigest()[:8]
+        jid = sanitize_id(f"{label}-{digest}", 64)
+        rows_spec.append(
+            {
+                "id": jid,
+                "name": label,
+                "stage": "race",
+                "action": "worktree",
+                "model": model_str,
+                "cwd": str(cwd),
+                "prompt": full_prompt,
+                "verify_cmd": args.verify_cmd,
+                "confined": bool(args.confined),
+                "priority": len(candidates) - idx,
+            }
+        )
+
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    art_dir = Path(args.artifact_dir) if args.artifact_dir else default_artifact_dir()
+    if args.dry_run:
+        est = estimate_batch_cost([r["prompt"] for r in rows_spec], rows_spec[0]["model"])
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "campaign_id": cid,
+                    "repo": str(cwd),
+                    "confined": bool(args.confined),
+                    "verify_cmd": args.verify_cmd,
+                    "score_regex": args.score_regex,
+                    "score_goal": args.score_goal,
+                    "candidates": [{"id": r["id"], "model": r["model"], "name": r["name"]} for r in rows_spec],
+                    "estimate": est,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    prompts_dir = art_dir / "campaigns" / cid / "prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    store = FleetStore(db_path)
+    store.ensure_campaign(cid, name=cid, config={"mode": "race", "repo": str(cwd), "verify_cmd": args.verify_cmd})
+    db_rows = []
+    for r in rows_spec:
+        p_file = prompts_dir / f"{r['id']}.txt"
+        p_file.write_text(r["prompt"], encoding="utf-8")
+        db_rows.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "stage": "race",
+                "action": "worktree",
+                "model": r["model"],
+                "cwd": r["cwd"],
+                "prompt_path": str(p_file),
+                "verify_cmd": r["verify_cmd"],
+                "confined": 1 if r["confined"] else 0,
+                "max_attempts": max(1, int(getattr(args, "max_retries", 1)) + 1),
+                "priority": r["priority"],
+            }
+        )
+    store.enqueue_jobs(cid, db_rows)
+
+    run_ns = _build_run_namespace(
+        campaign=cid,
+        preset="patch",
+        read_concurrency=getattr(args, "read_concurrency", None),
+        write_concurrency=getattr(args, "write_concurrency", None) or min(6, len(rows_spec)),
+        stall_timeout=getattr(args, "stall_timeout", None) or 90,
+        wall_timeout=getattr(args, "wall_timeout", None) or 300,
+        max_retries=int(getattr(args, "max_retries", 1)),
+        min_free_ram_mb=float(getattr(args, "min_free_ram_mb", 1500.0)),
+        min_free_root_gb=float(getattr(args, "min_free_root_gb", 8.0)),
+        empty_cwd=False,
+        no_tools_guard=False,
+        max_tool_calls=getattr(args, "max_tool_calls", None),
+        max_usd=float(getattr(args, "max_usd", 0.0) or 0.0),
+        retry_wall_timeouts=bool(getattr(args, "retry_wall_timeouts", False)),
+        checkpoint_path=getattr(args, "checkpoint_path", None),
+        checkpoint_jsonl=getattr(args, "checkpoint_jsonl", None),
+        retry_failed=bool(getattr(args, "retry_failed", False)),
+        cursor_bin=getattr(args, "cursor_bin", None),
+        db_path=str(db_path),
+        artifact_dir=str(art_dir),
+        allow_any_model=allow_any,
+        quiet=bool(getattr(args, "quiet", False)),
+        suppress_stdout=True,
+    )
+    cmd_run(run_ns)
+    export_data = store.export_campaign(cid)
+    results = _collect_campaign_outputs(export_data, parse_json=False)
+    ranking = rank_race_candidates(
+        results,
+        verify_required=bool(args.verify_cmd),
+        score_regex=args.score_regex,
+        score_goal=args.score_goal,
+    )
+    winner = ranking["winner"]
+    applied_winner = False
+    apply_error = None
+    if args.apply_winner and winner and winner.get("patch_path"):
+        chk = subprocess.run(["git", "-C", str(cwd), "apply", "--check", winner["patch_path"]], capture_output=True, text=True)
+        if chk.returncode == 0:
+            ap = subprocess.run(["git", "-C", str(cwd), "apply", winner["patch_path"]], capture_output=True, text=True)
+            applied_winner = ap.returncode == 0
+            if not applied_winner:
+                apply_error = ap.stderr.strip()
+        else:
+            apply_error = chk.stderr.strip()
+
+    payload = {
+        "ok": winner is not None,
+        "campaign_id": cid,
+        "repo": str(cwd),
+        "winner": winner,
+        "applied_winner": applied_winner,
+        "apply_error": apply_error,
+        "apply_cmd": f"cursor-fleet patches --campaign {cid} --apply {winner['id']} --repo {cwd}" if winner else None,
+        "ranking": ranking,
+        "summary": export_data["summary"],
+    }
+    if args.out:
+        out_p = Path(args.out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if args.report_md:
+        md_lines = [
+            f"# Worktree Tournament Report: `{cid}`",
+            "",
+            f"- **Repo:** `{cwd}` | **Verify:** `{args.verify_cmd or 'none'}` | **Confined (`bwrap`):** `{bool(args.confined)}`",
+            f"- **Winner:** `{winner['id'] if winner else 'NONE'}` ({ranking['passed_count']}/{ranking['total_candidates']} passed)",
+            f"- **Spend:** `${export_data['summary'].get('est_actual_usd', 0.0):.4f}` (~`{export_data['summary'].get('est_cursor_quota_pct', 0.0)}%` quota)",
+            "",
+            "| Rank | Candidate | Model | Passed | Score | Diff (+ / -) | Wall (s) | Confined |",
+            "| ---: | :--- | :--- | :---: | ---: | :---: | ---: | :---: |",
+        ]
+        for c in ranking["leaderboard"]:
+            sc = f"{c['score']}" if c["score"] is not None else "—"
+            md_lines.append(
+                f"| {c['rank']} | `{c['id']}` | `{c['model']}` | {'PASS' if c['passed'] else 'FAIL'} | {sc} | +{c['diff_added']}/-{c['diff_removed']} | {c['wall_s']} | {c['scope_confined']} |"
+            )
+        if winner:
+            md_lines.extend(["", f"Apply winner: `{payload['apply_cmd']}`", ""])
+        md_p = Path(args.report_md)
+        md_p.parent.mkdir(parents=True, exist_ok=True)
+        md_p.write_text("\n".join(md_lines), encoding="utf-8")
+
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if winner is not None else 1
+
+
+DEFAULT_COUNCIL_JUDGE_PROMPT = (
+    "You are the blind consensus judge for a multi-model review council. "
+    "Each panelist below independently reviewed the same artifact without seeing the other panelists' responses.\n"
+    "Synthesize their findings cleanly into:\n"
+    "1. **Consensus Findings (>=2 panelists independently agree)** — highest confidence, cite which panelists agreed.\n"
+    "2. **High-Value Unique Findings (1 panelist only)** — concrete issues worth checking.\n"
+    "3. **Disagreements / Contradictions** — where panelists conflicted and why.\n"
+    "4. **Prioritized Action Checklist** — concise, deduplicated next steps."
+)
+
+
+def cmd_council(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd or os.getcwd()).resolve()
+    prompt_base = str(args.prompt or "").strip()
+    if args.prompt_file:
+        prompt_base = Path(args.prompt_file).read_text(encoding="utf-8").strip()
+    if not prompt_base:
+        print(json.dumps({"ok": False, "error": "--prompt or --prompt-file is required for `council`"}))
+        return 1
+
+    max_file_bytes = max(1024, int((args.max_file_kb or 64) * 1024))
+    inlined_blocks: list[str] = []
+    for pattern in (args.files or []):
+        p_obj = Path(pattern)
+        matches = sorted(Path(p_obj.anchor).glob(str(p_obj.relative_to(p_obj.anchor)))) if p_obj.is_absolute() else sorted(cwd.glob(pattern))
+        for m in matches:
+            if not m.is_file():
+                continue
+            raw_bytes = m.read_bytes()
+            body = raw_bytes[:max_file_bytes].decode("utf-8", errors="replace")
+            if len(raw_bytes) > max_file_bytes:
+                body += f"\n... [truncated at {max_file_bytes} bytes]"
+            try:
+                rel = str(m.resolve().relative_to(cwd))
+            except ValueError:
+                rel = str(m)
+            inlined_blocks.append(f"FILE: {rel}\n```\n{body}\n```")
+
+    full_prompt = prompt_base + ("\n\n" + "\n\n".join(inlined_blocks) if inlined_blocks else "")
+    raw_models = [m.strip() for m in str(args.models or "grok-4.7-medium,grok-4.7-high,grok-4.7-xhigh").split(",") if m.strip()]
+    panel_models = [resolve_fleet_model(m, allow_any_model=True) for m in raw_models]
+    judge_model = resolve_fleet_model(args.judge_model or "high", allow_any_model=True)
+    preset_name = args.preset or "synthesis"
+    preset_cfg = FLEET_PRESETS.get(preset_name, {})
+    action = str(args.action or preset_cfg.get("action") or "ask").strip().lower()
+
+    cid = sanitize_id(
+        args.campaign or f"council-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+        64,
+    )
+    rows_spec: list[dict[str, Any]] = []
+    for idx, m_str in enumerate(panel_models, 1):
+        digest = hashlib.sha256(f"{cid}:panel:{idx}:{m_str}".encode("utf-8")).hexdigest()[:8]
+        jid = sanitize_id(f"panel-{idx:02d}-{sanitize_id(m_str, 24)}-{digest}", 64)
+        rows_spec.append(
+            {
+                "id": jid,
+                "name": f"panel-{idx:02d} ({m_str})",
+                "stage": "panel",
+                "action": action,
+                "model": m_str,
+                "cwd": str(cwd),
+                "prompt": full_prompt,
+                "priority": len(panel_models) - idx,
+            }
+        )
+
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    art_dir = Path(args.artifact_dir) if args.artifact_dir else default_artifact_dir()
+    if args.dry_run:
+        est = estimate_batch_cost([r["prompt"] for r in rows_spec], panel_models[0])
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "campaign_id": cid,
+                    "preset": preset_name,
+                    "panel_models": panel_models,
+                    "judge_model": None if args.no_judge else judge_model,
+                    "estimate_panel": est,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    prompts_dir = art_dir / "campaigns" / cid / "prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    store = FleetStore(db_path)
+    store.ensure_campaign(cid, name=cid, config={"mode": "council", "panel_models": panel_models, "judge_model": None if args.no_judge else judge_model})
+    db_rows = []
+    for r in rows_spec:
+        p_file = prompts_dir / f"{r['id']}.txt"
+        p_file.write_text(r["prompt"], encoding="utf-8")
+        db_rows.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "stage": "panel",
+                "action": r["action"],
+                "model": r["model"],
+                "cwd": r["cwd"],
+                "prompt_path": str(p_file),
+                "verify_cmd": None,
+                "confined": 0,
+                "max_attempts": max(1, int(getattr(args, "max_retries", 2)) + 1),
+                "priority": r["priority"],
+            }
+        )
+    store.enqueue_jobs(cid, db_rows)
+
+    panel_ns = _build_run_namespace(
+        campaign=cid,
+        preset=preset_name,
+        read_concurrency=getattr(args, "read_concurrency", None) or len(panel_models),
+        write_concurrency=1,
+        stall_timeout=getattr(args, "stall_timeout", None) or 90,
+        wall_timeout=getattr(args, "wall_timeout", None) or 360,
+        max_retries=int(getattr(args, "max_retries", 2)),
+        min_free_ram_mb=float(getattr(args, "min_free_ram_mb", 1500.0)),
+        min_free_root_gb=float(getattr(args, "min_free_root_gb", 8.0)),
+        empty_cwd=bool(getattr(args, "empty_cwd", False)),
+        no_tools_guard=bool(getattr(args, "no_tools_guard", False)),
+        max_tool_calls=getattr(args, "max_tool_calls", None),
+        max_usd=float(getattr(args, "max_usd", 0.0) or 0.0),
+        retry_wall_timeouts=bool(getattr(args, "retry_wall_timeouts", False)),
+        checkpoint_path=getattr(args, "checkpoint_path", None),
+        checkpoint_jsonl=getattr(args, "checkpoint_jsonl", None),
+        retry_failed=bool(getattr(args, "retry_failed", False)),
+        cursor_bin=getattr(args, "cursor_bin", None),
+        db_path=str(db_path),
+        artifact_dir=str(art_dir),
+        allow_any_model=True,
+        quiet=bool(getattr(args, "quiet", False)),
+        suppress_stdout=True,
+    )
+    rc_panel = cmd_run(panel_ns)
+    parse_json = bool(getattr(args, "parse_json", False))
+    exp_panel = store.export_campaign(cid)
+    panel_outputs = [r for r in _collect_campaign_outputs(exp_panel, parse_json=parse_json) if r.get("stage") == "panel"]
+    done_panels = [r for r in panel_outputs if r.get("status") == "done"]
+
+    judge_info: dict[str, Any] | None = None
+    rc_judge = 0
+    if not args.no_judge and done_panels:
+        judge_rubric = str(args.judge_instruction or "").strip() or DEFAULT_COUNCIL_JUDGE_PROMPT
+        blocks = [
+            f"=== PANELIST {i} (model={r['model']}, wall={r['wall_s']}s) ===\n{r['output']}"
+            for i, r in enumerate(done_panels, 1)
+        ]
+        judge_prompt = f"{judge_rubric}\n\n" + "\n\n".join(blocks)
+        j_digest = hashlib.sha256(judge_prompt.encode("utf-8")).hexdigest()[:8]
+        j_id = sanitize_id(f"judge-{sanitize_id(judge_model, 24)}-{j_digest}", 64)
+        jp_file = prompts_dir / f"{j_id}.txt"
+        jp_file.write_text(judge_prompt, encoding="utf-8")
+        store.enqueue_jobs(
+            cid,
+            [
+                {
+                    "id": j_id,
+                    "name": f"judge ({judge_model})",
+                    "stage": "judge",
+                    "action": "ask",
+                    "model": judge_model,
+                    "cwd": str(art_dir),
+                    "prompt_path": str(jp_file),
+                    "verify_cmd": None,
+                    "confined": 0,
+                    "max_attempts": 3,
+                    "priority": 100,
+                }
+            ],
+        )
+        judge_ns = _build_run_namespace(
+            campaign=cid,
+            preset="synthesis",
+            read_concurrency=1,
+            write_concurrency=1,
+            stall_timeout=getattr(args, "stall_timeout", None) or 90,
+            wall_timeout=getattr(args, "wall_timeout", None) or 240,
+            max_retries=2,
+            min_free_ram_mb=float(getattr(args, "min_free_ram_mb", 1500.0)),
+            min_free_root_gb=float(getattr(args, "min_free_root_gb", 8.0)),
+            empty_cwd=True,
+            no_tools_guard=True,
+            max_tool_calls=0,
+            max_usd=float(getattr(args, "max_usd", 0.0) or 0.0),
+            retry_wall_timeouts=False,
+            checkpoint_path=None,
+            checkpoint_jsonl=None,
+            retry_failed=False,
+            cursor_bin=getattr(args, "cursor_bin", None),
+            db_path=str(db_path),
+            artifact_dir=str(art_dir),
+            allow_any_model=True,
+            quiet=bool(getattr(args, "quiet", False)),
+            suppress_stdout=True,
+        )
+        rc_judge = cmd_run(judge_ns)
+        exp_all = store.export_campaign(cid)
+        all_outs = _collect_campaign_outputs(exp_all, parse_json=parse_json)
+        j_rec = next((r for r in all_outs if r["id"] == j_id), None)
+        if j_rec:
+            judge_info = {
+                "ok": j_rec["status"] == "done",
+                "id": j_rec["id"],
+                "model": j_rec["model"],
+                "wall_s": j_rec["wall_s"],
+                "output": j_rec["output"],
+                "parsed": j_rec.get("parsed"),
+            }
+    else:
+        exp_all = exp_panel
+
+    min_pan = int(getattr(args, "min_panelists", 0) or 0)
+    if min_pan > 0:
+        panel_ok = len(done_panels) >= min_pan
+    else:
+        panel_ok = (len(done_panels) > 0) and (rc_panel == 0)
+    judge_passed = True if args.no_judge else bool(judge_info and judge_info.get("ok"))
+    ok = panel_ok and judge_passed
+    degraded = (len(done_panels) < len(panel_models))
+    payload = {
+        "ok": ok,
+        "degraded": degraded,
+        "campaign_id": cid,
+        "panel_models": panel_models,
+        "judge": judge_info,
+        "panelists": panel_outputs,
+        "summary": exp_all["summary"],
+    }
+    if args.out:
+        out_p = Path(args.out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if args.report_md:
+        md_p = Path(args.report_md)
+        md_p.parent.mkdir(parents=True, exist_ok=True)
+        md_p.write_text(render_campaign_markdown(exp_all, parse_json=parse_json), encoding="utf-8")
+
+    stdout_obj = (
+        {
+            "ok": ok,
+            "campaign_id": cid,
+            "out": str(args.out),
+            "report_md": str(args.report_md) if args.report_md else None,
+            "panel_done": len(done_panels),
+            "panel_total": len(panel_models),
+            "judge_ok": judge_info["ok"] if judge_info else None,
+            "summary": exp_all["summary"],
+        }
+        if args.out
+        else payload
+    )
+    print(json.dumps(stdout_obj, indent=2, ensure_ascii=False))
+    return 0 if ok else 1
+
+
+def _eval_where_predicate(item: dict[str, Any], pred: dict[str, Any]) -> bool:
+    if not isinstance(pred, dict):
+        return False
+    if "all" in pred and isinstance(pred["all"], list):
+        return bool(pred["all"]) and all(isinstance(p, dict) and _eval_where_predicate(item, p) for p in pred["all"])
+    if "any" in pred and isinstance(pred["any"], list):
+        return any(isinstance(p, dict) and _eval_where_predicate(item, p) for p in pred["any"])
+    field = str(pred.get("field") or "")
+    val = item.get(field) if field else None
+    if "eq" in pred and val != pred["eq"]:
+        return False
+    if "neq" in pred and val == pred["neq"]:
+        return False
+    if "in" in pred:
+        if not isinstance(pred["in"], (list, tuple, set)) or val not in pred["in"]:
+            return False
+    if "not_in" in pred:
+        if not isinstance(pred["not_in"], (list, tuple, set)) or val in pred["not_in"]:
+            return False
+    if "contains" in pred and str(pred["contains"]).lower() not in str(val or "").lower():
+        return False
+    if "truthy" in pred and bool(val) != _parse_bool(pred["truthy"], True):
+        return False
+    for op_name, cmp_fn in (
+        ("gte", lambda a, b: a >= b),
+        ("gt", lambda a, b: a > b),
+        ("lte", lambda a, b: a <= b),
+        ("lt", lambda a, b: a < b),
+    ):
+        if op_name in pred:
+            try:
+                if not cmp_fn(float(val), float(pred[op_name])):
+                    return False
+            except (TypeError, ValueError):
+                return False
+    return True
+
+
+def _flatten_stage_results_to_items(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for r in results:
+        if r.get("status") != "done":
+            continue
+        parsed = r.get("parsed")
+        if parsed is None:
+            parsed = extract_json_payload(r.get("output") or "")
+        if isinstance(parsed, list):
+            for el in parsed:
+                if isinstance(el, dict):
+                    items.append(el)
+                else:
+                    items.append({"id": r["id"], "value": el})
+        elif isinstance(parsed, dict):
+            items.append(parsed)
+        else:
+            items.append({"id": r["id"], "output": r.get("output") or ""})
+    return items
+
+
+class _SafeFormatDict(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def cmd_pipeline(args: argparse.Namespace) -> int:
+    spec_path = Path(args.spec).resolve()
+    if not spec_path.is_file():
+        print(json.dumps({"ok": False, "error": f"pipeline spec not found: {spec_path}"}))
+        return 1
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    pid = sanitize_id(args.campaign or spec.get("id") or spec_path.stem, 48)
+    base_cwd = Path(args.cwd or spec.get("cwd") or spec_path.parent).resolve()
+    db_path = Path(args.db_path or spec.get("db_path") or default_db_path())
+    art_dir = Path(args.artifact_dir or spec.get("artifact_dir") or default_artifact_dir())
+    pipe_dir = art_dir / "pipelines" / pid
+    stages = spec.get("stages") or []
+    if not isinstance(stages, list) or not stages:
+        print(json.dumps({"ok": False, "error": "pipeline spec requires non-empty 'stages' list"}))
+        return 1
+
+    if args.dry_run:
+        plan = [
+            {
+                "index": idx,
+                "name": st.get("name") or f"stage-{idx}",
+                "type": st.get("type"),
+                "preset": st.get("preset"),
+                "model": st.get("model"),
+                "from_prev": bool(st.get("from_prev", False)),
+            }
+            for idx, st in enumerate(stages, 1)
+        ]
+        print(json.dumps({"ok": True, "dry_run": True, "pipeline_id": pid, "cwd": str(base_cwd), "stages": plan}, indent=2))
+        return 0
+
+    pipe_dir.mkdir(parents=True, exist_ok=True)
+    prev_jsonl: Path | None = None
+    prev_json: Path | None = None
+    stage_reports: list[dict[str, Any]] = []
+    overall_ok = True
+    max_usd_default = float(args.max_usd if args.max_usd and args.max_usd > 0 else spec.get("max_usd", 0.0) or 0.0)
+
+    for idx, st in enumerate(stages, 1):
+        sname = sanitize_id(str(st.get("name") or f"s{idx}"), 24)
+        stype = str(st.get("type") or "map").strip().lower()
+        sdir = pipe_dir / f"s{idx:02d}_{sname}"
+        sdir.mkdir(parents=True, exist_ok=True)
+        scid = sanitize_id(f"{pid}-s{idx:02d}-{sname}", 64)
+        scwd = str(Path(st.get("cwd") or base_cwd).resolve())
+
+        if stype == "filter":
+            if prev_jsonl is None or not prev_jsonl.is_file():
+                overall_ok = False
+                stage_reports.append({"stage": sname, "type": "filter", "ok": False, "error": "no previous stage items JSONL to filter"})
+                break
+            out_jsonl = sdir / "filtered.jsonl"
+            if out_jsonl.exists():
+                out_jsonl.unlink()
+            if st.get("command"):
+                # Shell-quote all substituted path variables (prevents injection & supports paths with spaces!)
+                q_vars = {
+                    "in_jsonl": shlex.quote(str(prev_jsonl)),
+                    "out_jsonl": shlex.quote(str(out_jsonl)),
+                    "stage_dir": shlex.quote(str(sdir)),
+                    "prev_json": shlex.quote(str(prev_json or "")),
+                    "cwd": shlex.quote(scwd),
+                }
+                cmd_str = _safe_template_sub(str(st["command"]), q_vars)
+                f_rc, f_out, f_err, f_exc = _run_shell_bounded(cmd_str, Path(scwd), int(st.get("timeout_sec") or 180))
+                in_cnt = sum(1 for ln in prev_jsonl.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip())
+                out_cnt = sum(1 for ln in out_jsonl.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()) if out_jsonl.is_file() else 0
+                ok_f = (f_rc == 0) and out_jsonl.is_file()
+                stage_reports.append(
+                    {
+                        "stage": sname,
+                        "type": "filter",
+                        "ok": ok_f,
+                        "in_items": in_cnt,
+                        "kept_items": out_cnt,
+                        "out_jsonl": str(out_jsonl),
+                        "error": f_exc if not ok_f else None,
+                        "stdout_tail": f_out[-600:],
+                        "stderr_tail": f_err[-400:],
+                    }
+                )
+                if not ok_f:
+                    overall_ok = False
+                    break
+            else:
+                where = st.get("where") or {}
+                in_items = []
+                bad_lines = 0
+                for ln in prev_jsonl.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if not ln.strip():
+                        continue
+                    try:
+                        in_items.append(json.loads(ln))
+                    except json.JSONDecodeError:
+                        bad_lines += 1
+                kept = [it for it in in_items if isinstance(it, dict) and _eval_where_predicate(it, where)]
+                if st.get("limit"):
+                    kept = kept[: int(st["limit"])]
+                out_jsonl.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in kept) + ("\n" if kept else ""), encoding="utf-8")
+                stage_reports.append(
+                    {
+                        "stage": sname,
+                        "type": "filter",
+                        "ok": True,
+                        "in_items": len(in_items),
+                        "bad_lines": bad_lines,
+                        "kept_items": len(kept),
+                        "out_jsonl": str(out_jsonl),
+                    }
+                )
+            prev_jsonl = out_jsonl
+            if stage_reports[-1]["kept_items"] == 0 and not _parse_bool(st.get("continue_on_empty"), False):
+                overall_ok = False
+                break
+
+        elif stype in ("map", "audit", "patch"):
+            stage_out = sdir / "stage_out.json"
+            stage_md = sdir / "stage_report.md"
+            stage_ckpt = sdir / "stage_checkpoint.json"
+            if stage_out.exists():
+                stage_out.unlink()
+            stage_in_jsonl = st.get("items_jsonl")
+            if _parse_bool(st.get("from_prev"), False) and prev_jsonl and prev_jsonl.is_file():
+                if st.get("prompt_template"):
+                    tmpl = str(st["prompt_template"])
+                    templated_p = sdir / "templated_items.jsonl"
+                    t_lines = []
+                    for i_ln, raw_ln in enumerate(prev_jsonl.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                        if not raw_ln.strip():
+                            continue
+                        try:
+                            obj = json.loads(raw_ln)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(obj, dict):
+                            iid = sanitize_id(str(obj.get(st.get("id_field") or "id") or f"item-{i_ln:04d}"), 64)
+                            rendered_p = _safe_template_sub(tmpl, obj)
+                            t_lines.append(json.dumps({"id": iid, "task": rendered_p}, ensure_ascii=False))
+                    templated_p.write_text("\n".join(t_lines) + ("\n" if t_lines else ""), encoding="utf-8")
+                    stage_in_jsonl = str(templated_p)
+                else:
+                    stage_in_jsonl = str(prev_jsonl)
+
+            map_ns = argparse.Namespace(
+                cmd="map",
+                instruction=st.get("instruction") or "Complete the task for each item cleanly.",
+                instruction_file=st.get("instruction_file"),
+                files=st.get("files"),
+                inline_files=_parse_bool(st.get("inline_files"), False),
+                max_file_kb=int(st.get("max_file_kb", 64)),
+                items_jsonl=stage_in_jsonl,
+                items_json=st.get("items_json"),
+                stdin_items=False,
+                id_field=str(st.get("id_field") or "id"),
+                batch_size=int(st.get("batch_size") or 1),
+                batch_max_chars=int(st.get("batch_max_chars") or 48000),
+                campaign=scid,
+                action=st.get("action") or ("worktree" if stype == "patch" else None),
+                model=st.get("model"),
+                cwd=scwd,
+                verify_cmd=st.get("verify_cmd"),
+                confined=_parse_bool(st.get("confined"), False),
+                exclusions_file=st.get("exclusions_file"),
+                forbidden=st.get("forbidden"),
+                trajectories_file=st.get("trajectories_file"),
+                max_trajectories=int(st.get("max_trajectories", 3)),
+                parse_json=_parse_bool(st.get("parse_json"), True),
+                reduce_instruction=st.get("reduce_instruction"),
+                reduce_instruction_file=st.get("reduce_instruction_file"),
+                reduce_model=st.get("reduce_model"),
+                reduce_max_chunk_chars=int(st.get("reduce_max_chunk_chars", 96000)),
+                reduce_out=str(sdir / "reduced.txt") if (st.get("reduce_instruction") or st.get("reduce_instruction_file")) else None,
+                out=str(stage_out),
+                report_md=str(stage_md),
+                dry_run=False,
+                preset=st.get("preset") or ("patch" if stype == "patch" else ("audit" if stype == "audit" else "synthesis")),
+                read_concurrency=st.get("read_concurrency"),
+                write_concurrency=st.get("write_concurrency"),
+                stall_timeout=st.get("stall_timeout"),
+                wall_timeout=st.get("wall_timeout"),
+                max_retries=int(st.get("max_retries", 2)),
+                min_free_ram_mb=float(st.get("min_free_ram_mb", 1500.0)),
+                min_free_root_gb=float(st.get("min_free_root_gb", 8.0)),
+                empty_cwd=_parse_bool(st.get("empty_cwd"), False),
+                no_tools_guard=_parse_bool(st.get("no_tools_guard"), False),
+                max_tool_calls=st.get("max_tool_calls"),
+                max_usd=float(st.get("max_usd", max_usd_default) or 0.0),
+                retry_wall_timeouts=_parse_bool(st.get("retry_wall_timeouts"), False),
+                checkpoint_path=str(stage_ckpt),
+                checkpoint_jsonl=None,
+                retry_failed=bool(args.retry_failed),
+                allow_any_model=_parse_bool(st.get("allow_any_model"), bool(args.allow_any_model)),
+                quiet=bool(args.quiet),
+                cursor_bin=args.cursor_bin,
+                db_path=str(db_path),
+                artifact_dir=str(art_dir),
+            )
+            # Capture cmd_map stdout quietly so pipeline emits a single clean summary JSON
+            old_stdout = sys.stdout
+            import io
+            buf = io.StringIO()
+            sys.stdout = buf
+            try:
+                rc_s = cmd_map(map_ns)
+            finally:
+                sys.stdout = old_stdout
+            s_data = json.loads(stage_out.read_text(encoding="utf-8")) if stage_out.is_file() else {"ok": False}
+            flat_items = _flatten_stage_results_to_items([r for r in (s_data.get("results") or []) if r.get("stage") == "map"])
+            next_jsonl = sdir / "items_out.jsonl"
+            next_jsonl.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in flat_items) + ("\n" if flat_items else ""), encoding="utf-8")
+            prev_jsonl = next_jsonl
+            prev_json = stage_out
+            stage_reports.append(
+                {
+                    "stage": sname,
+                    "type": stype,
+                    "campaign_id": scid,
+                    "ok": rc_s == 0,
+                    "items_emitted": len(flat_items),
+                    "out": str(stage_out),
+                    "items_jsonl": str(next_jsonl),
+                    "summary": s_data.get("summary"),
+                }
+            )
+            if rc_s != 0 and not st.get("continue_on_error"):
+                overall_ok = False
+                break
+
+        elif stype == "race":
+            stage_out = sdir / "race_out.json"
+            stage_md = sdir / "race_report.md"
+            race_ns = argparse.Namespace(
+                cmd="race",
+                campaign=scid,
+                cwd=scwd,
+                prompt=st.get("prompt"),
+                prompt_file=st.get("prompt_file"),
+                model=st.get("model"),
+                models=",".join(st["models"]) if isinstance(st.get("models"), list) else st.get("models"),
+                strategies=st.get("strategies"),
+                n=int(st.get("n", 3)),
+                verify_cmd=st.get("verify_cmd"),
+                confined=bool(st.get("confined", False)),
+                score_regex=st.get("score_regex"),
+                score_goal=str(st.get("score_goal") or "min"),
+                apply_winner=bool(st.get("apply_winner", False)),
+                out=str(stage_out),
+                report_md=str(stage_md),
+                dry_run=False,
+                preset="patch",
+                read_concurrency=None,
+                write_concurrency=st.get("write_concurrency"),
+                stall_timeout=st.get("stall_timeout"),
+                wall_timeout=st.get("wall_timeout"),
+                max_retries=int(st.get("max_retries", 1)),
+                min_free_ram_mb=1500.0,
+                min_free_root_gb=8.0,
+                empty_cwd=False,
+                no_tools_guard=False,
+                max_tool_calls=st.get("max_tool_calls"),
+                max_usd=float(st.get("max_usd", max_usd_default) or 0.0),
+                retry_wall_timeouts=False,
+                checkpoint_path=None,
+                checkpoint_jsonl=None,
+                retry_failed=bool(args.retry_failed),
+                allow_any_model=bool(st.get("allow_any_model", args.allow_any_model)),
+                quiet=bool(args.quiet),
+                cursor_bin=args.cursor_bin,
+                db_path=str(db_path),
+                artifact_dir=str(art_dir),
+            )
+            old_stdout = sys.stdout
+            import io
+            sys.stdout = io.StringIO()
+            try:
+                rc_s = cmd_race(race_ns)
+            finally:
+                sys.stdout = old_stdout
+            s_data = json.loads(stage_out.read_text(encoding="utf-8")) if stage_out.is_file() else {"ok": False}
+            prev_json = stage_out
+            stage_reports.append({"stage": sname, "type": "race", "campaign_id": scid, "ok": rc_s == 0, "winner": s_data.get("winner"), "out": str(stage_out)})
+            if rc_s != 0 and not st.get("continue_on_error"):
+                overall_ok = False
+                break
+
+        elif stype == "council":
+            stage_out = sdir / "council_out.json"
+            stage_md = sdir / "council_report.md"
+            c_prompt = str(st.get("prompt") or "")
+            if st.get("from_prev") and prev_jsonl and prev_jsonl.is_file():
+                c_prompt = (c_prompt + "\n\n" if c_prompt else "") + prev_jsonl.read_text(encoding="utf-8")[:60000]
+            council_ns = argparse.Namespace(
+                cmd="council",
+                campaign=scid,
+                cwd=scwd,
+                prompt=c_prompt,
+                prompt_file=st.get("prompt_file"),
+                files=st.get("files"),
+                max_file_kb=int(st.get("max_file_kb", 64)),
+                models=",".join(st["models"]) if isinstance(st.get("models"), list) else st.get("models"),
+                judge_model=st.get("judge_model"),
+                judge_instruction=st.get("judge_instruction"),
+                no_judge=bool(st.get("no_judge", False)),
+                action=st.get("action"),
+                parse_json=bool(st.get("parse_json", False)),
+                out=str(stage_out),
+                report_md=str(stage_md),
+                dry_run=False,
+                preset=st.get("preset") or "synthesis",
+                read_concurrency=st.get("read_concurrency"),
+                write_concurrency=1,
+                stall_timeout=st.get("stall_timeout"),
+                wall_timeout=st.get("wall_timeout"),
+                max_retries=int(st.get("max_retries", 2)),
+                min_free_ram_mb=1500.0,
+                min_free_root_gb=8.0,
+                empty_cwd=False,
+                no_tools_guard=False,
+                max_tool_calls=st.get("max_tool_calls"),
+                max_usd=float(st.get("max_usd", max_usd_default) or 0.0),
+                retry_wall_timeouts=False,
+                checkpoint_path=None,
+                checkpoint_jsonl=None,
+                retry_failed=bool(args.retry_failed),
+                allow_any_model=True,
+                quiet=bool(args.quiet),
+                cursor_bin=args.cursor_bin,
+                db_path=str(db_path),
+                artifact_dir=str(art_dir),
+            )
+            old_stdout = sys.stdout
+            import io
+            sys.stdout = io.StringIO()
+            try:
+                rc_s = cmd_council(council_ns)
+            finally:
+                sys.stdout = old_stdout
+            s_data = json.loads(stage_out.read_text(encoding="utf-8")) if stage_out.is_file() else {"ok": False}
+            prev_json = stage_out
+            stage_reports.append({"stage": sname, "type": "council", "campaign_id": scid, "ok": rc_s == 0, "out": str(stage_out), "summary": s_data.get("summary")})
+            if rc_s != 0 and not st.get("continue_on_error"):
+                overall_ok = False
+                break
+        else:
+            overall_ok = False
+            stage_reports.append({"stage": sname, "type": stype, "ok": False, "error": f"unsupported stage type: {stype}"})
+            break
+
+    total_usd = round(
+        sum(float((sr.get("summary") or {}).get("est_actual_usd") or 0.0) for sr in stage_reports),
+        6,
+    )
+    pipe_summary = {
+        "ok": overall_ok,
+        "pipeline_id": pid,
+        "spec": str(spec_path),
+        "total_est_usd": total_usd,
+        "est_cursor_quota_pct": round(total_usd / CURSOR_USD_PER_1PCT, 2),
+        "stages": stage_reports,
+        "final_items_jsonl": str(prev_jsonl) if prev_jsonl else None,
+        "final_json": str(prev_json) if prev_json else None,
+    }
+    summary_file = pipe_dir / "pipeline_summary.json"
+    summary_file.write_text(json.dumps(pipe_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    if args.out:
+        op = Path(args.out)
+        op.parent.mkdir(parents=True, exist_ok=True)
+        op.write_text(json.dumps(pipe_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps(pipe_summary, indent=2, ensure_ascii=False))
+    return 0 if overall_ok else 1
 
 
 def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
@@ -2626,6 +4020,11 @@ def build_parser() -> argparse.ArgumentParser:
     map_p.add_argument("--id-field", default="id", help="Field name for item IDs in JSON/JSONL (default: id)")
     map_p.add_argument("--batch-size", type=int, default=1, help="Items packed per worker (empirical sweet spot: 4 for synthesis)")
     map_p.add_argument("--batch-max-chars", type=int, default=48000, help="Max payload chars per batch before splitting")
+    map_p.add_argument("--reduce-instruction", default=None, help="Enable automatic recursive tree-reduce synthesis over map outputs")
+    map_p.add_argument("--reduce-instruction-file", default=None, help="Read reduce instruction from file")
+    map_p.add_argument("--reduce-model", default=None, help="Model for reduce stage (default: same as map model)")
+    map_p.add_argument("--reduce-max-chunk-chars", type=int, default=96000, help="Max chars per tree-reduce chunk")
+    map_p.add_argument("--reduce-out", default=None, help="Write final reduced synthesis text to path")
     map_p.add_argument("--campaign", default=None, help="Stable campaign ID for crash-safe resume")
     map_p.add_argument("--action", choices=["ask", "plan", "worktree"], default=None)
     map_p.add_argument("--model", default=None)
@@ -2641,6 +4040,58 @@ def build_parser() -> argparse.ArgumentParser:
     map_p.add_argument("--report-md", default=None, help="Write combined Markdown report to path")
     map_p.add_argument("--dry-run", action="store_true", help="Estimate batch count, tokens & cost without running workers")
     _add_common_run_flags(map_p)
+
+    race_p = sub.add_parser("race", help="Best-of-N parallel isolated worktree tournament with deterministic ranking")
+    race_p.add_argument("--prompt", default=None, help="Shared objective for all competing worktree candidates")
+    race_p.add_argument("--prompt-file", default=None)
+    race_p.add_argument("--cwd", default=None, help="Target git repo directory (default: cwd)")
+    race_p.add_argument("--n", type=int, default=3, help="Number of competing worktrees (when --strategies/--models not set)")
+    race_p.add_argument("--strategies", action="append", default=None, help="Strategy lens for a candidate (repeatable)")
+    race_p.add_argument("--model", default="high", help="Model for homogeneous race (default: high)")
+    race_p.add_argument("--models", default=None, help="Comma-separated models to race head-to-head (e.g. grok-4.7-high,composer-2.5)")
+    race_p.add_argument("--verify-cmd", default=None, help="Verification / benchmark command run in each isolated worktree")
+    race_p.add_argument("--confined", action="store_true", help="Run verify-cmd inside network-isolated Linux bwrap confinement")
+    race_p.add_argument("--score-regex", default=None, help="Regex with numeric capture group from verify output to rank candidates")
+    race_p.add_argument("--score-goal", choices=["min", "max"], default="min", help="Whether lower (min) or higher (max) score wins")
+    race_p.add_argument("--apply-winner", action="store_true", help="Auto-apply winning verified patch to --cwd via git apply")
+    race_p.add_argument("--campaign", default=None)
+    race_p.add_argument("--out", default=None)
+    race_p.add_argument("--report-md", default=None)
+    race_p.add_argument("--dry-run", action="store_true")
+    _add_common_run_flags(race_p)
+
+    cn_p = sub.add_parser("council", help="Blind multi-model council review with consensus judge synthesis")
+    cn_p.add_argument("--prompt", default=None, help="Review prompt shared across all panelists")
+    cn_p.add_argument("--prompt-file", default=None)
+    cn_p.add_argument("--files", action="append", default=None, help="Files to inline into the shared council brief")
+    cn_p.add_argument("--max-file-kb", type=int, default=64)
+    cn_p.add_argument("--models", default="grok-4.7-medium,grok-4.7-high,grok-4.7-xhigh", help="Comma-separated panelist models")
+    cn_p.add_argument("--judge-model", default="high", help="Model for blind consensus judge (default: high)")
+    cn_p.add_argument("--judge-instruction", default=None, help="Override default consensus/unique/contradictions judge rubric")
+    cn_p.add_argument("--no-judge", action="store_true", help="Skip judge synthesis and return raw blind panelist outputs")
+    cn_p.add_argument("--min-panelists", type=int, default=0, help="Succeed if at least N panelists complete (0 = require all)")
+    cn_p.add_argument("--action", choices=["ask", "plan"], default=None)
+    cn_p.add_argument("--cwd", default=None)
+    cn_p.add_argument("--campaign", default=None)
+    cn_p.add_argument("--parse-json", action="store_true")
+    cn_p.add_argument("--out", default=None)
+    cn_p.add_argument("--report-md", default=None)
+    cn_p.add_argument("--dry-run", action="store_true")
+    _add_common_run_flags(cn_p)
+
+    pipe_p = sub.add_parser("pipeline", help="Run a declarative multi-stage funnel (map -> filter -> audit/patch/race/council)")
+    pipe_p.add_argument("spec", help="Path to JSON pipeline specification")
+    pipe_p.add_argument("--campaign", default=None, help="Override pipeline ID")
+    pipe_p.add_argument("--cwd", default=None, help="Override base workspace directory")
+    pipe_p.add_argument("--max-usd", type=float, default=0.0, help="Override per-stage USD budget cap")
+    pipe_p.add_argument("--retry-failed", action="store_true")
+    pipe_p.add_argument("--allow-any-model", action="store_true")
+    pipe_p.add_argument("--quiet", action="store_true")
+    pipe_p.add_argument("--out", default=None)
+    pipe_p.add_argument("--dry-run", action="store_true")
+    pipe_p.add_argument("--cursor-bin", default=None)
+    pipe_p.add_argument("--db-path", default=None)
+    pipe_p.add_argument("--artifact-dir", default=None)
 
     enq = sub.add_parser("enqueue", help="Enqueue jobs from a JSONL manifest")
     enq.add_argument("--campaign", required=True)
@@ -2724,6 +4175,12 @@ def main() -> int:
         return cmd_ask(args)
     if args.cmd == "map":
         return cmd_map(args)
+    if args.cmd == "race":
+        return cmd_race(args)
+    if args.cmd == "council":
+        return cmd_council(args)
+    if args.cmd == "pipeline":
+        return cmd_pipeline(args)
     if args.cmd == "enqueue":
         return cmd_enqueue(args)
     if args.cmd == "run":
