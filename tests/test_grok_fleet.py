@@ -47,6 +47,15 @@ STATE_DIR = Path({str(state_dir)!r})
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 args = sys.argv[1:]
+if args == ["--version"]:
+    print("2026.11.25-stub")
+    sys.exit(0)
+if args == ["status"]:
+    print("✓ Logged in as stub@example.com")
+    sys.exit(0)
+if args == ["models"]:
+    print("Available models\\n\\ngrok-4.7-medium - Grok 4.7 Medium\\ngrok-4.7-high - Grok 4.7 High\\ncomposer-2.5 - Composer 2.5\\n")
+    sys.exit(0)
 model = "grok-4.7-medium"
 wt_name = None
 i = 0
@@ -606,3 +615,258 @@ def test_wall_timeout_non_retryable_by_default(tmp_path):
     j = mod.FleetStore(db_path).export_campaign("c_wall")["jobs"][0]
     assert j["attempts"] == 1
     assert "wall timeout" in (j["error"] or "")
+
+
+def test_doctor_campaigns_inspect_and_report(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    db_path = tmp_path / "fleet.db"
+    art_dir = tmp_path / "artifacts"
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+
+    p_doc = subprocess.run(
+        [sys.executable, "-B", str(FLEET_BIN), "doctor", "--json", "--db-path", str(db_path), "--artifact-dir", str(art_dir)],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    doc = json.loads(p_doc.stdout)
+    assert doc["ok"] is True
+    assert doc["auth_ok"] is True
+    assert doc["grok_models_count"] == 2
+    assert doc["other_models_count"] == 1
+    assert "synthesis" in doc["presets"]
+
+    # Zero-manifest ask with synthesis preset
+    out_json = tmp_path / "ask_out.json"
+    out_md = tmp_path / "ask_out.md"
+    p_ask = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "ask",
+            "--campaign", "c_ask_test",
+            "--preset", "synthesis",
+            "--parse-json",
+            "--out", str(out_json),
+            "--report-md", str(out_md),
+            "--db-path", str(db_path), "--artifact-dir", str(art_dir),
+            "RECORD_ENV prompt one",
+            "RECORD_ENV prompt two",
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    ask_res = json.loads(p_ask.stdout)
+    assert ask_res["ok"] is True
+    assert ask_res["summary"]["counts"]["done"] == 2
+    assert out_json.is_file() and out_md.is_file()
+    full_out = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(full_out["results"]) == 2
+    for r in full_out["results"]:
+        # Verify synthesis preset enforced empty_cwd + NO_TOOLS_BANNER + non-fast medium
+        assert r["model"] == "grok-4.7-medium"
+        assert r["parsed"]["cwd"].endswith("_empty_cwd")
+        assert r["parsed"]["prompt"].startswith("PURE SYNTHESIS MODE:")
+
+    # campaigns / inspect / report
+    p_ls = subprocess.run(
+        [sys.executable, "-B", str(FLEET_BIN), "campaigns", "--json", "--db-path", str(db_path)],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    ls_data = json.loads(p_ls.stdout)
+    assert len(ls_data["campaigns"]) == 1
+    assert ls_data["campaigns"][0]["id"] == "c_ask_test"
+
+    p_ins = subprocess.run(
+        [sys.executable, "-B", str(FLEET_BIN), "inspect", "--campaign", "c_ask_test", "--show-output", "--json", "--db-path", str(db_path)],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    ins_data = json.loads(p_ins.stdout)
+    assert len(ins_data["jobs"]) == 2
+    assert "output_preview" in ins_data["jobs"][0]
+
+    rep_path = tmp_path / "rep.json"
+    subprocess.run(
+        [sys.executable, "-B", str(FLEET_BIN), "report", "--campaign", "c_ask_test", "--format", "json", "--parse-json", "--out", str(rep_path), "--db-path", str(db_path)],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    rep_data = json.loads(rep_path.read_text(encoding="utf-8"))
+    assert rep_data["ok"] is True and len(rep_data["results"]) == 2
+
+
+def test_map_batching_dry_run_files_and_jsonl(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    db_path = tmp_path / "fleet.db"
+    art_dir = tmp_path / "artifacts"
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(5):
+        (src / f"mod_{i}.py").write_text(f"def fn_{i}():\n    return {i}\n", encoding="utf-8")
+
+    # Dry-run over 5 files packed N=2 -> 3 workers, zero DB created
+    p_dry = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "map",
+            "--preset", "synthesis",
+            "--cwd", str(tmp_path),
+            "--files", "src/*.py",
+            "--batch-size", "2",
+            "--instruction", "Audit each file",
+            "--dry-run",
+            "--db-path", str(db_path), "--artifact-dir", str(art_dir),
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    dry = json.loads(p_dry.stdout)
+    assert dry["dry_run"] is True
+    assert dry["estimate"]["workers"] == 3
+    assert dry["estimate"]["model"] == "grok-4.7-medium"
+    assert not db_path.exists()
+
+    # Live map over JSONL items packed N=4 -> 2 workers for 6 items
+    jsonl_p = tmp_path / "items.jsonl"
+    jsonl_p.write_text(
+        "\n".join(json.dumps({"cid": f"c-{i}", "text": f"Conversation {i}"}) for i in range(6)) + "\n",
+        encoding="utf-8",
+    )
+    out_p = tmp_path / "map_out.json"
+    md_p = tmp_path / "map_out.md"
+    p_map = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "map",
+            "--campaign", "c_map_jsonl",
+            "--preset", "synthesis",
+            "--items-jsonl", str(jsonl_p),
+            "--id-field", "cid",
+            "--batch-size", "4",
+            "--instruction", "RECORD_ENV summarize",
+            "--parse-json",
+            "--out", str(out_p),
+            "--report-md", str(md_p),
+            "--db-path", str(db_path), "--artifact-dir", str(art_dir),
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    m_res = json.loads(p_map.stdout)
+    assert m_res["ok"] is True
+    assert m_res["summary"]["counts"]["done"] == 2
+    assert m_res["summary"]["total_tool_calls"] == 0
+    full = json.loads(out_p.read_text(encoding="utf-8"))
+    # Batch 1 has 4 items (c-0..c-3), Batch 2 has 2 items (c-4..c-5)
+    p0 = full["results"][0]["parsed"]["prompt"]
+    p1 = full["results"][1]["parsed"]["prompt"]
+    assert "=== ITEM c-0 ===" in p0 and "=== ITEM c-3 ===" in p0
+    assert "=== ITEM c-4 ===" in p1 and "=== ITEM c-5 ===" in p1
+    assert md_p.is_file() and "c_map_jsonl" in md_p.read_text(encoding="utf-8")
+
+
+def test_allow_any_model_and_host_health_unknown_ram(tmp_path, monkeypatch):
+    mod = _load_fleet_mod()
+    with pytest.raises(ValueError):
+        mod.resolve_fleet_model("composer-2.5")
+    assert mod.resolve_fleet_model("composer-2.5", allow_any_model=True) == "composer-2.5"
+    assert mod.resolve_fleet_model("gpt-5.3-codex-high", allow_any_model=True) == "gpt-5.3-codex-high"
+    with pytest.raises(ValueError):
+        mod.resolve_fleet_model("bad model; rm -rf /", allow_any_model=True)
+
+    # Simulate non-Linux host where read_mem_available_mb returns None -> does not falsely block
+    monkeypatch.setattr(mod, "read_mem_available_mb", lambda _t=None: None)
+    healthy, snap = mod.check_host_health(
+        min_free_ram_mb=1500.0,
+        min_free_root_gb=8.0,
+        min_free_artifact_gb=1.5,
+        artifact_dir=tmp_path,
+        root_free_bytes=int(20 * (1024 ** 3)),
+        artifact_free_bytes=int(20 * (1024 ** 3)),
+    )
+    assert healthy is True
+    assert snap["mem_available_mb"] is None
+
+
+def test_patches_check_and_apply_roundtrip(tmp_path):
+    stub = _make_stub_cursor(tmp_path / "stub_cursor", tmp_path / "stub_state")
+    repo = tmp_path / "patch_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "calc.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    db_path = tmp_path / "fleet.db"
+    art_dir = tmp_path / "artifacts"
+    env = os.environ.copy()
+    env["WM_CURSOR_AGENT_BIN"] = str(stub)
+
+    p_run = subprocess.run(
+        [
+            sys.executable, "-B", str(FLEET_BIN), "ask",
+            "--campaign", "c_patch_apply",
+            "--preset", "patch",
+            "--cwd", str(repo),
+            "--db-path", str(db_path), "--artifact-dir", str(art_dir),
+            "WORKTREE_EDIT fix calc",
+        ],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    run_out = json.loads(p_run.stdout)
+    assert run_out["ok"] is True
+    jid = run_out["results"][0]["id"]
+
+    # List patches
+    p_list = subprocess.run(
+        [sys.executable, "-B", str(FLEET_BIN), "patches", "--campaign", "c_patch_apply", "--json", "--db-path", str(db_path)],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    plist = json.loads(p_list.stdout)
+    assert len(plist["patches"]) == 1 and plist["patches"][0]["patch_bytes"] > 0
+
+    # Dry-run --check leaves repo untouched
+    p_chk = subprocess.run(
+        [sys.executable, "-B", str(FLEET_BIN), "patches", "--campaign", "c_patch_apply", "--apply", jid, "--repo", str(repo), "--check", "--db-path", str(db_path)],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    assert json.loads(p_chk.stdout)["dry_run"] is True
+    assert "return a - b" in (repo / "calc.py").read_text(encoding="utf-8")
+
+    # Actual apply updates calc.py and creates new_helper.py
+    p_app = subprocess.run(
+        [sys.executable, "-B", str(FLEET_BIN), "patches", "--campaign", "c_patch_apply", "--apply", jid, "--repo", str(repo), "--db-path", str(db_path)],
+        check=True, env=env, capture_output=True, text=True,
+    )
+    assert json.loads(p_app.stdout)["applied"] is True
+    assert "return a + b" in (repo / "calc.py").read_text(encoding="utf-8")
+    assert (repo / "new_helper.py").is_file()
+
+
+def test_swarm_and_mcp_v2_presets_and_non_fast_defaults():
+    swarm_bin = REPO_ROOT / "bin" / "wm-grok-swarm"
+    mcp_bin = REPO_ROOT / "bin" / "wm-grok-mcp"
+    prev = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader = importlib.machinery.SourceFileLoader("wm_grok_swarm_v2_mod", str(swarm_bin))
+        spec = importlib.util.spec_from_loader("wm_grok_swarm_v2_mod", loader)
+        assert spec is not None and spec.loader is not None
+        smod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smod)
+    finally:
+        sys.dont_write_bytecode = prev
+
+    assert smod.resolve_model("high") == "grok-4.7-high"
+    assert smod.resolve_model("medium") == "grok-4.7-medium"
+    assert smod.resolve_model("high-fast") == "grok-4.7-high-fast"
+    assert smod.resolve_model("composer-2.5", allow_any_model=True) == "composer-2.5"
+    with pytest.raises(ValueError, match="Unsupported Grok 4.7 model"):
+        smod.resolve_model("claude-opus")
+
+    p_mcp = subprocess.run(
+        [sys.executable, "-B", str(mcp_bin)],
+        input='{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n',
+        capture_output=True, text=True, check=True,
+    )
+    schema = json.loads(p_mcp.stdout.strip())["result"]["tools"][0]["inputSchema"]
+    props = schema["properties"]
+    assert {"preset", "empty_cwd", "no_tools_guard", "allow_any_model"}.issubset(props.keys())
+    task_props = props["tasks"]["items"]["properties"]
+    assert {"empty_cwd", "no_tools_guard"}.issubset(task_props.keys())

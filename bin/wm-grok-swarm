@@ -27,14 +27,28 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+DEFAULT_FAMILY = "grok-4.7"
+SHORTHAND_TIERS = ("low", "medium", "high", "xhigh")
 MODEL_MAP = {
-    "low": "grok-4.7-low-fast",
-    "medium": "grok-4.7-medium-fast",
-    "high": "grok-4.7-high-fast",
-    "xhigh": "grok-4.7-xhigh-fast",
+    "low": "grok-4.7-low",
+    "medium": "grok-4.7-medium",
+    "high": "grok-4.7-high",
+    "xhigh": "grok-4.7-xhigh",
 }
-VALID_EXPLICIT_RE = re.compile(r"^grok-4\.7(?:-(?:low|medium|high|xhigh)(?:-fast)?)?$")
+VALID_EXPLICIT_RE = re.compile(r"^(?:cursor-)?grok-\d+\.\d+(?:-(?:low|medium|high|xhigh))?(?:-fast)?$")
+ANY_CURSOR_MODEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}$")
 SAFE_WT_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+NO_TOOLS_BANNER = (
+    "PURE SYNTHESIS MODE: Do NOT call any file, search, or shell tools. "
+    "Respond directly in a single turn with ONLY the requested output.\n\n"
+)
+SWARM_PRESETS = {
+    "synthesis": {"model": "medium", "empty_cwd": True, "no_tools_guard": True},
+    "fast": {"model": "medium-fast", "empty_cwd": True, "no_tools_guard": True},
+    "audit": {"model": "high", "empty_cwd": False, "no_tools_guard": False},
+    "plan": {"model": "high", "empty_cwd": False, "no_tools_guard": False},
+    "patch": {"model": "high", "empty_cwd": False, "no_tools_guard": False},
+}
 TELEM_PATH = Path(
     os.environ.get(
         "WM_GROK_TELEMETRY",
@@ -928,13 +942,21 @@ def run_confined_verify(
     return out_res
 
 
-def resolve_model(raw: str | None) -> str:
+def resolve_model(raw: str | None, allow_any_model: bool = False) -> str:
+    fam = (os.environ.get("WM_GROK_FAMILY") or DEFAULT_FAMILY).strip().lower()
+    if not re.match(r"^(?:cursor-)?grok-\d+\.\d+$", fam):
+        fam = DEFAULT_FAMILY
     m = (raw or "high").strip().lower()
-    if m in MODEL_MAP:
-        return MODEL_MAP[m]
+    if m in SHORTHAND_TIERS:
+        return f"{fam}-{m}"
+    if m.endswith("-fast") and m[:-5] in SHORTHAND_TIERS:
+        return f"{fam}-{m}"
     if VALID_EXPLICIT_RE.match(m):
         return m
-    raise ValueError(f"Unsupported Grok 4.7 model '{raw}'. Use low|medium|high|xhigh or grok-4.7-*")
+    env_any = os.environ.get("WM_GROK_ALLOW_ANY_MODEL", "").strip().lower() in _TRUTHY
+    if (allow_any_model or env_any) and ANY_CURSOR_MODEL_RE.match(m):
+        return m
+    raise ValueError(f"Unsupported Grok 4.7 model '{raw}'. Use low|medium|high|xhigh|*-fast or grok-4.7-*")
 
 
 def cmd_status() -> int:
@@ -949,11 +971,15 @@ def cmd_status() -> int:
         for p in sorted(wt_root.glob("*/*"))[:12]:
             if p.is_dir():
                 worktrees.append(str(p.relative_to(wt_root)))
+    fam = (os.environ.get("WM_GROK_FAMILY") or DEFAULT_FAMILY).strip().lower()
     out = {
         "ok": st.returncode == 0,
         "cursor_agent": ca,
         "auth": (st.stdout or st.stderr).strip().splitlines()[-1] if (st.stdout or st.stderr).strip() else "unknown",
-        "models": list(MODEL_MAP.values()),
+        "default_family": fam,
+        "models": [f"{fam}-{t}" for t in SHORTHAND_TIERS] + [f"{fam}-{t}-fast" for t in SHORTHAND_TIERS],
+        "presets": list(SWARM_PRESETS.keys()),
+        "bwrap": find_bwrap(),
         "worktrees": worktrees,
     }
     print(json.dumps(out, indent=2))
@@ -974,15 +1000,28 @@ def _run_one(
     payload_receipt_log: str | None = None,
     payload_attest_remote: bool = False,
     payload_attest_url: str | None = None,
+    payload_empty_cwd: bool = False,
+    payload_no_tools_guard: bool = False,
 ) -> dict:
     name = str(task.get("name") or f"grok-{idx + 1}")
     prompt = str(task.get("prompt") or "").strip()
     if not prompt:
         return {"name": name, "ok": False, "error": "empty prompt"}
 
-    cwd = str(task.get("cwd") or os.getcwd())
-    if not Path(cwd).is_dir():
-        return {"name": name, "ok": False, "error": f"cwd does not exist: {cwd}"}
+    empty_cwd = bool(task.get("empty_cwd", payload_empty_cwd))
+    no_tools_guard = bool(task.get("no_tools_guard", payload_no_tools_guard))
+    ws_override: str | None = None
+    if empty_cwd and action in ("ask", "plan"):
+        empty_dir = Path.home() / ".local" / "share" / "whitemagic" / "grok_fleet" / "_empty_cwd"
+        empty_dir.mkdir(parents=True, exist_ok=True)
+        cwd = str(empty_dir)
+        ws_override = cwd
+    else:
+        cwd = str(task.get("cwd") or os.getcwd())
+        if not Path(cwd).is_dir():
+            return {"name": name, "ok": False, "error": f"cwd does not exist: {cwd}"}
+    if no_tools_guard and action == "ask" and not prompt.startswith("PURE SYNTHESIS MODE:"):
+        prompt = NO_TOOLS_BANNER + prompt
 
     confined = bool(task.get("confined", payload_confined))
     verify_cmd = task.get("verify_cmd", payload_verify_cmd)
@@ -1063,6 +1102,8 @@ def _run_one(
     else:
         return {"name": name, "ok": False, "error": f"unknown action: {action}"}
 
+    if ws_override is not None:
+        cmd.extend(["--workspace", ws_override])
     cmd.append(prompt)
     t0 = time.perf_counter()
     try:
@@ -1185,8 +1226,11 @@ def run_swarm(payload: dict) -> dict:
     action = str(payload.get("action") or "ask").strip().lower()
     if action not in ("ask", "plan", "worktree", "resume"):
         return {"ok": False, "error": f"Invalid action '{action}' (expected ask|plan|worktree|resume)"}
+    preset_name = str(payload.get("preset") or "").strip().lower()
+    preset_cfg = SWARM_PRESETS.get(preset_name, {}) if preset_name else {}
+    allow_any_model = bool(payload.get("allow_any_model", False))
     try:
-        model = resolve_model(payload.get("model"))
+        model = resolve_model(payload.get("model") or preset_cfg.get("model"), allow_any_model=allow_any_model)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -1202,6 +1246,8 @@ def run_swarm(payload: dict) -> dict:
     payload_receipt_log = payload.get("receipt_log")
     payload_attest_remote = bool(payload.get("attest_remote", False))
     payload_attest_url = payload.get("attest_url")
+    payload_empty_cwd = bool(payload.get("empty_cwd", preset_cfg.get("empty_cwd", False)))
+    payload_no_tools_guard = bool(payload.get("no_tools_guard", preset_cfg.get("no_tools_guard", False)))
 
     any_confined = any(
         bool(t.get("confined", payload_confined)) if isinstance(t, dict) else payload_confined
@@ -1330,6 +1376,8 @@ def run_swarm(payload: dict) -> dict:
                 payload_receipt_log,
                 payload_attest_remote,
                 payload_attest_url,
+                payload_empty_cwd,
+                payload_no_tools_guard,
             ): i
             for i, t in enumerate(tasks)
         }
@@ -1343,6 +1391,11 @@ def run_swarm(payload: dict) -> dict:
     wall_s = round(time.perf_counter() - t_wall0, 2)
     sum_worker_s = round(sum(float(r.get("wall_s") or 0) for r in results if r), 2)
     speedup = round(sum_worker_s / max(wall_s, 0.01), 2)
+    tot_in = sum(int((r.get("usage") or {}).get("in") or 0) for r in results if r)
+    tot_cr = sum(int((r.get("usage") or {}).get("cache_read") or 0) for r in results if r)
+    tot_out = sum(int((r.get("usage") or {}).get("out") or 0) for r in results if r)
+    rate_mult = 2.0 if str(model).lower().endswith("-fast") else 1.0
+    est_usd = round(rate_mult * (tot_in * 2.0 + tot_cr * 0.2 + tot_out * 6.0) / 1_000_000.0, 5)
 
     try:
         TELEM_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1353,10 +1406,12 @@ def run_swarm(payload: dict) -> dict:
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "action": action,
                         "model": model,
+                        "preset": preset_name or None,
                         "workers": len(tasks),
                         "wall_s": wall_s,
                         "sum_worker_s": sum_worker_s,
                         "speedup_x": speedup,
+                        "est_usd": est_usd,
                         "ok_count": sum(1 for r in results if r and r.get("ok")),
                     }
                 )
@@ -1377,6 +1432,7 @@ def run_swarm(payload: dict) -> dict:
         "wall_s": wall_s,
         "sum_worker_s": sum_worker_s,
         "speedup_x": speedup,
+        "est_usd": est_usd,
         "workers": results,
     }
     encoded = json.dumps(out, ensure_ascii=False, indent=2)

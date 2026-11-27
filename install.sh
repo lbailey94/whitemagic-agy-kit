@@ -22,6 +22,8 @@ SKIP_TRICAMERAL_ENGINE=0
 KEEP_HEAVY_PLUGINS=0
 SYNC_GLOBAL=0
 PRUNE_CODEX_OFFICE=0
+CURSOR_FLEET_ONLY=0
+WIRE_CURSOR_MCP=0
 HOSTS="${WM_HOSTS:-agy}"
 PULL_PROFILE=""
 
@@ -32,6 +34,8 @@ while [ "$#" -gt 0 ]; do
         --keep-heavy-plugins) KEEP_HEAVY_PLUGINS=1; shift ;;
         --sync-global) SYNC_GLOBAL=1; shift ;;
         --prune-codex-office) PRUNE_CODEX_OFFICE=1; shift ;;
+        --cursor-fleet-only) CURSOR_FLEET_ONLY=1; shift ;;
+        --wire-cursor-mcp) WIRE_CURSOR_MCP=1; shift ;;
         --hosts)
             HOSTS="${2:?--hosts requires a comma-separated list (e.g. agy,codex,cursor)}"
             shift 2
@@ -44,12 +48,48 @@ while [ "$#" -gt 0 ]; do
         --with-ravens) PULL_PROFILE="ravens"; shift ;;
         --with-tricameral) PULL_PROFILE="tricameral"; shift ;;
         -h|--help)
-            echo "Usage: ./install.sh [--hosts agy,codex,cursor|all] [--prune-codex-office] [--skip-agy-fast] [--skip-tricameral-engine] [--keep-heavy-plugins] [--sync-global] [--with-huginn|--with-ravens|--with-tricameral]"
+            echo "Usage: ./install.sh [--cursor-fleet-only [--wire-cursor-mcp]] [--hosts agy,codex,cursor|all] [--prune-codex-office] [--skip-agy-fast] [--skip-tricameral-engine] [--keep-heavy-plugins] [--sync-global] [--with-huginn|--with-ravens|--with-tricameral]"
             exit 0
             ;;
         *) shift ;;
     esac
 done
+
+install_bin() {
+    # Atomic temp-file + mv replaces the directory entry with a fresh inode,
+    # avoiding Apple Silicon macOS AMFI SIGKILL (exit 137) and Linux ETXTBSY
+    # when upgrading a running/mapped binary (e.g. wm-codegraph --mcp) in place.
+    local src="$1" dst="$2"
+    local tmp="${dst}.tmp.$$"
+    cp "$src" "$tmp"
+    chmod +x "$tmp"
+    mv -f "$tmp" "$dst"
+}
+
+if [ "$CURSOR_FLEET_ONLY" -eq 1 ]; then
+    echo "=== Standalone Cursor / Grok Fleet Install (zero Rust/Node/WhiteMagic deps) ==="
+    mkdir -p "$LOCAL_BIN"
+    for tool in wm-grok-fleet wm-grok-swarm wm-grok-mcp; do
+        install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
+    done
+    ln -sf "${LOCAL_BIN}/wm-grok-fleet" "${LOCAL_BIN}/cursor-fleet"
+    echo "Installed: wm-grok-fleet (alias: cursor-fleet), wm-grok-swarm, wm-grok-mcp -> ${LOCAL_BIN}"
+    if [ "$WIRE_CURSOR_MCP" -eq 1 ]; then
+        python3 - <<'PY'
+import json
+from pathlib import Path
+mcp_path = Path.home() / ".cursor" / "mcp.json"
+mcp_path.parent.mkdir(parents=True, exist_ok=True)
+data = json.loads(mcp_path.read_text(encoding="utf-8")) if mcp_path.is_file() else {}
+servers = data.setdefault("mcpServers", {})
+servers["grok"] = {"command": str(Path.home() / ".local" / "bin" / "wm-grok-mcp"), "args": []}
+mcp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+print(f"Registered `grok` MCP server in {mcp_path}")
+PY
+    fi
+    "${LOCAL_BIN}/wm-grok-fleet" doctor --fast || true
+    exit 0
+fi
 
 if [ "$HOSTS" = "all" ]; then
     HOSTS="agy,codex,cursor"
@@ -63,17 +103,6 @@ mkdir -p "$LOCAL_BIN" "$MODELS_DIR" "$FAST_MCP_DIR"
 if [ "$HAS_AGY" -eq 1 ]; then
     mkdir -p "$PLUGINS_DIR" "$AGY_CLI_DIR" "${HOME}/.gemini/config/hooks"
 fi
-
-install_bin() {
-    # Atomic temp-file + mv replaces the directory entry with a fresh inode,
-    # avoiding Apple Silicon macOS AMFI SIGKILL (exit 137) and Linux ETXTBSY
-    # when upgrading a running/mapped binary (e.g. wm-codegraph --mcp) in place.
-    local src="$1" dst="$2"
-    local tmp="${dst}.tmp.$$"
-    cp "$src" "$tmp"
-    chmod +x "$tmp"
-    mv -f "$tmp" "$dst"
-}
 
 echo "=== 1. Building Rust binaries: wm-squeeze, wm-codegraph & Safe-Rust muninn-engine ==="
 if [ "${WM_SKIP_CARGO:-0}" -eq 1 ]; then
@@ -348,6 +377,9 @@ for tool in wm-sim agy-bench agy-mode agy-token-audit wm-local-digest wm-dream w
         install_bin "${KIT_DIR}/bin/${tool}" "${LOCAL_BIN}/${tool}"
     fi
 done
+if [ -f "${LOCAL_BIN}/wm-grok-fleet" ]; then
+    ln -sf "${LOCAL_BIN}/wm-grok-fleet" "${LOCAL_BIN}/cursor-fleet"
+fi
 cp "${KIT_DIR}/models/manifest.json" "${MODELS_DIR}/manifest.json"
 
 if [ "$HAS_AGY" -eq 1 ]; then

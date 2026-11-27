@@ -46,6 +46,7 @@ SHORTHAND_TIERS = ("low", "medium", "high", "xhigh")
 EXPLICIT_MODEL_RE = re.compile(
     r"^(?:cursor-)?grok-\d+\.\d+(?:-(?:low|medium|high|xhigh))?(?:-fast)?$"
 )
+ANY_CURSOR_MODEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}$")
 RATE_LIMIT_RE = re.compile(
     r"(?:\b429\b|rate[\s_-]*limit|too many requests|overloaded|capacity|quota exceeded)",
     re.IGNORECASE,
@@ -62,6 +63,70 @@ NO_TOOLS_BANNER = (
     "PURE SYNTHESIS MODE: Do NOT call any file, search, or shell tools. "
     "Respond directly in a single turn with ONLY the requested output.\n\n"
 )
+
+FLEET_PRESETS: dict[str, dict[str, Any]] = {
+    "synthesis": {
+        "description": "Zero-tool pure synthesis (~18.8x fewer tokens, ~$0.05/worker, 0 workspace tools)",
+        "action": "ask",
+        "model": "medium",
+        "empty_cwd": True,
+        "no_tools_guard": True,
+        "max_tool_calls": 0,
+        "read_concurrency": 8,
+        "stall_timeout": 75,
+        "wall_timeout": 240,
+        "inline_files": True,
+    },
+    "fast": {
+        "description": "Latency-optimized zero-tool synthesis (~2x faster wall, ~2x quota cost)",
+        "action": "ask",
+        "model": "medium-fast",
+        "empty_cwd": True,
+        "no_tools_guard": True,
+        "max_tool_calls": 0,
+        "read_concurrency": 8,
+        "stall_timeout": 60,
+        "wall_timeout": 180,
+        "inline_files": True,
+    },
+    "audit": {
+        "description": "Read-only repository/codebase audit with bounded tool budget",
+        "action": "ask",
+        "model": "high",
+        "empty_cwd": False,
+        "no_tools_guard": False,
+        "max_tool_calls": 15,
+        "read_concurrency": 6,
+        "stall_timeout": 90,
+        "wall_timeout": 300,
+        "inline_files": False,
+    },
+    "plan": {
+        "description": "Read-only architecture second opinion and refactor planning",
+        "action": "plan",
+        "model": "high",
+        "empty_cwd": False,
+        "no_tools_guard": False,
+        "max_tool_calls": 15,
+        "read_concurrency": 4,
+        "stall_timeout": 90,
+        "wall_timeout": 300,
+        "inline_files": False,
+    },
+    "patch": {
+        "description": "Isolated git-worktree edits with patch harvest & auto-prune (add --confined for Linux bwrap verify)",
+        "action": "worktree",
+        "model": "high",
+        "empty_cwd": False,
+        "no_tools_guard": False,
+        "max_tool_calls": 40,
+        "write_concurrency": 3,
+        "confined": False,
+        "stall_timeout": 90,
+        "wall_timeout": 300,
+        "inline_files": False,
+    },
+}
 
 _SWARM_MOD_LOCK = threading.Lock()
 _SWARM_MOD_CACHE: Any = None
@@ -215,8 +280,16 @@ def find_cursor_agent(override: str | None = None) -> str | None:
     return None
 
 
-def resolve_fleet_model(raw: str | None, family: str | None = None) -> str:
-    """Resolve tier shorthand or explicit Grok model string. Defaults to standard non-fast."""
+def resolve_fleet_model(
+    raw: str | None,
+    family: str | None = None,
+    allow_any_model: bool = False,
+) -> str:
+    """Resolve tier shorthand or explicit Grok model string. Defaults to standard non-fast.
+
+    Set allow_any_model=True (or WM_GROK_ALLOW_ANY_MODEL=1) to also allow any valid
+    cursor-agent model slug (e.g., auto, composer-2.5, gpt-5.3-codex-high, claude-sonnet-5-thinking-high).
+    """
     fam = (family or os.environ.get("WM_GROK_FAMILY") or DEFAULT_FAMILY).strip().lower()
     if not re.match(r"^(?:cursor-)?grok-\d+\.\d+$", fam):
         raise ValueError(f"Invalid WM_GROK_FAMILY '{fam}'")
@@ -228,8 +301,12 @@ def resolve_fleet_model(raw: str | None, family: str | None = None) -> str:
         return f"{fam}-{tok}"
     if EXPLICIT_MODEL_RE.match(tok):
         return tok
+    env_any = os.environ.get("WM_GROK_ALLOW_ANY_MODEL", "").strip().lower() in ("1", "true", "yes", "on")
+    if (allow_any_model or env_any) and ANY_CURSOR_MODEL_RE.match(tok):
+        return tok
     raise ValueError(
-        f"Unsupported Grok model '{raw}'. Use low|medium|high|xhigh|*-fast or explicit grok-X.Y-*"
+        f"Unsupported Grok model '{raw}'. Use low|medium|high|xhigh|*-fast, explicit grok-X.Y-*, "
+        f"or pass --allow-any-model for non-Grok Cursor models"
     )
 
 
@@ -256,13 +333,41 @@ def _load_swarm_module() -> Any:
             sys.dont_write_bytecode = prev_dont_write
 
 
-def read_mem_available_mb(meminfo_text: str | None = None) -> float:
+def _read_macos_mem_available_mb() -> float | None:
+    """Compute approximate available RAM on macOS via vm_stat + sysctl hw.pagesize."""
+    try:
+        ps = subprocess.run(["sysctl", "-n", "hw.pagesize"], capture_output=True, text=True, timeout=3)
+        page_size = int(ps.stdout.strip()) if ps.returncode == 0 and ps.stdout.strip().isdigit() else 4096
+        vs = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3)
+        if vs.returncode != 0:
+            return None
+        pages = 0
+        wanted = ("Pages free:", "Pages inactive:", "Pages speculative:", "Pages purgeable:")
+        for line in vs.stdout.splitlines():
+            for prefix in wanted:
+                if line.startswith(prefix):
+                    m = re.search(r"(\d+)", line[len(prefix):])
+                    if m:
+                        pages += int(m.group(1))
+                    break
+        return (pages * page_size) / (1024.0 * 1024.0) if pages > 0 else None
+    except Exception:
+        return None
+
+
+def read_mem_available_mb(meminfo_text: str | None = None) -> float | None:
     text = meminfo_text
     if text is None:
-        try:
-            text = Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return 0.0
+        proc_mem = Path("/proc/meminfo")
+        if proc_mem.is_file():
+            try:
+                text = proc_mem.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return None
+        elif sys.platform == "darwin":
+            return _read_macos_mem_available_mb()
+        else:
+            return None
     for line in text.splitlines():
         if line.startswith("MemAvailable:"):
             parts = line.split()
@@ -303,7 +408,7 @@ def check_host_health(
     root_gb = root_free_bytes / (1024.0 ** 3)
     art_gb = artifact_free_bytes / (1024.0 ** 3)
     reasons: list[str] = []
-    if ram_mb < min_free_ram_mb:
+    if ram_mb is not None and ram_mb < min_free_ram_mb:
         reasons.append(f"MemAvailable {ram_mb:.0f} MiB < {min_free_ram_mb:.0f} MiB")
     if root_gb < min_free_root_gb:
         reasons.append(f"root / free {root_gb:.2f} GiB < {min_free_root_gb:.2f} GiB")
@@ -311,7 +416,7 @@ def check_host_health(
         reasons.append(f"artifact dir free {art_gb:.2f} GiB < {min_free_artifact_gb:.2f} GiB")
 
     snapshot = {
-        "mem_available_mb": round(ram_mb, 1),
+        "mem_available_mb": round(ram_mb, 1) if ram_mb is not None else None,
         "root_free_gb": round(root_gb, 2),
         "artifact_free_gb": round(art_gb, 2),
         "reasons": reasons,
@@ -595,17 +700,26 @@ class FleetStore:
         counts: dict[str, int] = {}
         wall_vals: list[float] = []
         tot_in = tot_cr = tot_cw = tot_out = tot_reason = tot_tools = 0
+        est_actual_usd = 0.0
         for j in jobs:
             st = j.get("status") or "unknown"
             counts[st] = counts.get(st, 0) + 1
             if j.get("wall_s") is not None:
                 wall_vals.append(float(j["wall_s"]))
-            tot_in += int(j.get("input_tokens") or 0)
-            tot_cr += int(j.get("cache_read_tokens") or 0)
-            tot_cw += int(j.get("cache_write_tokens") or 0)
-            tot_out += int(j.get("output_tokens") or 0)
-            tot_reason += int(j.get("reasoning_tokens") or 0)
+            jin = int(j.get("input_tokens") or 0)
+            jcr = int(j.get("cache_read_tokens") or 0)
+            jcw = int(j.get("cache_write_tokens") or 0)
+            jout = int(j.get("output_tokens") or 0)
+            jrs = int(j.get("reasoning_tokens") or 0)
+            tot_in += jin
+            tot_cr += jcr
+            tot_cw += jcw
+            tot_out += jout
+            tot_reason += jrs
             tot_tools += int(j.get("tool_calls") or 0)
+            jm = str(j.get("resolved_model") or j.get("model") or "").lower()
+            mult = 2.0 if jm.endswith("-fast") else 1.0
+            est_actual_usd += mult * (jin * 2.0 + jcr * 0.2 + jout * 6.0) / 1_000_000.0
 
         denom_in = tot_in + tot_cr
         cache_hit_pct = round((100.0 * tot_cr / denom_in), 2) if denom_in > 0 else 0.0
@@ -630,9 +744,40 @@ class FleetStore:
                 "cache_hit_pct": cache_hit_pct,
             },
             "est_standard_usd": est_std_usd,
+            "est_actual_usd": round(est_actual_usd, 6),
             "est_fast_usd": round(est_std_usd * 2.0, 6),
             "est_cursor_quota_pct": round(est_std_usd / CURSOR_USD_PER_1PCT, 2),
         }
+
+    def list_campaigns(self) -> list[dict[str, Any]]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                camps = [
+                    dict(r)
+                    for r in conn.execute("SELECT * FROM campaigns ORDER BY created_at DESC").fetchall()
+                ]
+            finally:
+                conn.close()
+        out: list[dict[str, Any]] = []
+        for c in camps:
+            s = self.campaign_summary(c["id"])
+            out.append(
+                {
+                    "id": c["id"],
+                    "name": c.get("name") or c["id"],
+                    "status": c.get("status") or "unknown",
+                    "created_at": c.get("created_at"),
+                    "total_jobs": s["total_jobs"],
+                    "counts": s["counts"],
+                    "total_tool_calls": s["total_tool_calls"],
+                    "wall_s_sum": s["wall_s_sum"],
+                    "est_standard_usd": s["est_standard_usd"],
+                    "est_actual_usd": s["est_actual_usd"],
+                    "est_cursor_quota_pct": s["est_cursor_quota_pct"],
+                }
+            )
+        return out
 
     def export_campaign(self, campaign_id: str) -> dict[str, Any]:
         with self._lock:
@@ -748,13 +893,14 @@ def exec_stream_worker(
     no_tools_guard: bool = False,
     max_tool_calls: int = -1,
     retry_wall_timeouts: bool = False,
+    allow_any_model: bool = False,
 ) -> dict[str, Any]:
     cid = job["campaign_id"]
     jid = job["id"]
     action = job["action"]
     cwd = job["cwd"]
     prompt = Path(job["prompt_path"]).read_text(encoding="utf-8")
-    resolved_req_model = resolve_fleet_model(job.get("model"))
+    resolved_req_model = resolve_fleet_model(job.get("model"), allow_any_model=allow_any_model)
 
     camp_art = artifact_dir / "campaigns" / sanitize_id(cid, 64)
     stream_log_path = camp_art / "streams" / f"{sanitize_id(jid, 64)}.ndjson"
@@ -1072,7 +1218,10 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
         action = str(item.get("action") or "ask").strip().lower()
         if action not in ("ask", "plan", "worktree"):
             raise ValueError(f"Line {idx + 1}: invalid action '{action}'")
-        model = resolve_fleet_model(item.get("model"))
+        model = resolve_fleet_model(
+            item.get("model"),
+            allow_any_model=bool(getattr(args, "allow_any_model", False)),
+        )
         name = str(item.get("name") or f"job-{idx + 1}")
         stage = str(item.get("stage") or "default")
         cwd = str(item.get("cwd") or os.getcwd())
@@ -1172,26 +1321,79 @@ def cmd_run(args: argparse.Namespace) -> int:
         store.reset_failed_to_pending(cid)
     store.set_campaign_status(cid, "running")
 
-    read_conc = max(1, min(24, int(args.read_concurrency)))
-    write_conc = max(1, min(6, int(args.write_concurrency)))
+    preset_name = getattr(args, "preset", None)
+    preset_cfg = FLEET_PRESETS.get(str(preset_name).strip().lower(), {}) if preset_name else {}
+    read_conc = max(
+        1,
+        min(
+            24,
+            int(
+                args.read_concurrency
+                if args.read_concurrency is not None
+                else preset_cfg.get("read_concurrency", 8)
+            ),
+        ),
+    )
+    write_conc = max(
+        1,
+        min(
+            6,
+            int(
+                args.write_concurrency
+                if args.write_concurrency is not None
+                else preset_cfg.get("write_concurrency", 3)
+            ),
+        ),
+    )
+    stall_timeout = int(
+        args.stall_timeout if args.stall_timeout is not None else preset_cfg.get("stall_timeout", 75)
+    )
+    wall_timeout = int(
+        args.wall_timeout if args.wall_timeout is not None else preset_cfg.get("wall_timeout", 300)
+    )
     read_sem = threading.Semaphore(read_conc)
     write_sem = threading.Semaphore(write_conc)
     backoff = BackoffCoordinator()
     health_lock = threading.Lock()
     budget_lock = threading.Lock()
     checkpoint_lock = threading.Lock()
+    progress_lock = threading.Lock()
     budget_capped = threading.Event()
     quota_halted = threading.Event()
     stop_requested = threading.Event()
     max_usd = float(getattr(args, "max_usd", 0.0) or 0.0)
-    empty_cwd = bool(getattr(args, "empty_cwd", False))
-    no_tools_guard = bool(getattr(args, "no_tools_guard", False))
-    max_tool_calls = int(getattr(args, "max_tool_calls", -1))
+    empty_cwd = bool(getattr(args, "empty_cwd", False)) or bool(preset_cfg.get("empty_cwd", False))
+    no_tools_guard = bool(getattr(args, "no_tools_guard", False)) or bool(preset_cfg.get("no_tools_guard", False))
+    raw_mtc = getattr(args, "max_tool_calls", None)
+    max_tool_calls = int(raw_mtc) if raw_mtc is not None else int(preset_cfg.get("max_tool_calls", -1))
     retry_wall_timeouts = bool(getattr(args, "retry_wall_timeouts", False))
+    allow_any_model = bool(getattr(args, "allow_any_model", False))
+    quiet = bool(getattr(args, "quiet", False))
+    suppress_stdout = bool(getattr(args, "_suppress_stdout", False))
     raw_cp = getattr(args, "checkpoint_path", None)
     raw_cjl = getattr(args, "checkpoint_jsonl", None)
     checkpoint_path = Path(raw_cp) if raw_cp else None
     checkpoint_jsonl = Path(raw_cjl) if raw_cjl else None
+
+    def _emit_progress(job_id: str, status_tag: str, res: dict[str, Any]) -> None:
+        if quiet:
+            return
+        with progress_lock:
+            snap = store.campaign_summary(cid)
+            cnt = snap.get("counts") or {}
+            done_n = int(cnt.get("done", 0))
+            fail_n = int(cnt.get("failed", 0))
+            tot_n = int(snap.get("total_jobs", 0))
+            usd = float(snap.get("est_actual_usd", snap.get("est_standard_usd", 0.0)))
+            qpct = float(snap.get("est_cursor_quota_pct", 0.0))
+            wall_s = res.get("wall_s", 0.0)
+            tools = res.get("tool_calls", 0)
+            print(
+                f"[fleet] {done_n}/{tot_n} done ({fail_n} fail) | {status_tag} {job_id} | "
+                f"{wall_s}s | {tools} tools | ${usd:.4f} (~{qpct:.2f}% quota)",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _write_checkpoint(done_job: dict[str, Any] | None = None) -> None:
         if checkpoint_jsonl is None and checkpoint_path is None:
@@ -1276,12 +1478,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                     attempt=attempt,
                     cursor_bin=cursor_bin,
                     artifact_dir=art_dir,
-                    stall_timeout_sec=args.stall_timeout,
-                    wall_timeout_sec=args.wall_timeout,
+                    stall_timeout_sec=stall_timeout,
+                    wall_timeout_sec=wall_timeout,
                     empty_cwd=empty_cwd,
                     no_tools_guard=no_tools_guard,
                     max_tool_calls=max_tool_calls,
                     retry_wall_timeouts=retry_wall_timeouts,
+                    allow_any_model=allow_any_model,
                 )
 
             if res["ok"]:
@@ -1324,6 +1527,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "tool_calls": res.get("tool_calls", 0),
                     "finished_at": fin_iso,
                 })
+                _emit_progress(job["id"], "OK", res)
                 return
 
             if res.get("quota_exhausted"):
@@ -1379,6 +1583,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 },
             )
             _write_checkpoint(None)
+            _emit_progress(job["id"], "FAIL", res)
             return
 
     pending = store.fetch_pending(cid)
@@ -1431,7 +1636,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     summary["interrupted"] = interrupted
     summary["resumable_pending"] = summary["counts"].get("pending", 0)
     summary["ok"] = failed_cnt == 0
-    print(json.dumps(summary, indent=2))
+    if not suppress_stdout:
+        print(json.dumps(summary, indent=2))
     return 0 if failed_cnt == 0 else 1
 
 
@@ -1571,9 +1777,870 @@ def cmd_record_win(args: argparse.Namespace) -> int:
     return 0
 
 
+def extract_json_payload(text: str) -> Any:
+    """Best-effort extraction of a JSON object or array from an LLM response."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    fenced = re.findall(r"```(?:json)?\s*\n(.*?)```", raw, flags=re.DOTALL | re.IGNORECASE)
+    for block in fenced:
+        try:
+            return json.loads(block.strip())
+        except Exception:
+            continue
+    for open_ch, close_ch in (("[", "]"), ("{", "}")):
+        start = raw.find(open_ch)
+        end = raw.rfind(close_ch)
+        if start != -1 and end > start:
+            try:
+                return json.loads(raw[start : end + 1])
+            except Exception:
+                continue
+    return None
+
+
+def pack_map_items(
+    items: list[dict[str, Any]],
+    batch_size: int = 1,
+    batch_max_chars: int = 48000,
+) -> list[list[dict[str, Any]]]:
+    """Pack map items into size-bounded batches (empirical sweet spot N=4 for Grok 4.7 synthesis)."""
+    bs = max(1, int(batch_size))
+    cap = max(2000, int(batch_max_chars))
+    batches: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    cur_chars = 0
+    for item in items:
+        body_len = len(str(item.get("body") or "")) + 120
+        if cur and (len(cur) >= bs or (cur_chars + body_len > cap)):
+            batches.append(cur)
+            cur = []
+            cur_chars = 0
+        cur.append(item)
+        cur_chars += body_len
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def estimate_batch_cost(
+    prompts: list[str],
+    model: str,
+    est_output_tokens_per_worker: int = 4200,
+) -> dict[str, Any]:
+    """Estimate input/output tokens (incl. Grok 4.7 reasoning), USD, and Cursor quota % before running."""
+    lens = [len(p) for p in prompts]
+    tot_chars = sum(lens)
+    est_in_tok = max(1, tot_chars // 4) if tot_chars else 0
+    est_out_tok = len(prompts) * max(100, int(est_output_tokens_per_worker))
+    mult = 2.0 if str(model).lower().endswith("-fast") else 1.0
+    est_std_usd = round((est_in_tok * 2.0 + est_out_tok * 6.0) / 1_000_000.0, 4)
+    est_act_usd = round(est_std_usd * mult, 4)
+    return {
+        "workers": len(prompts),
+        "model": model,
+        "prompt_chars_total": tot_chars,
+        "prompt_chars_min": min(lens) if lens else 0,
+        "prompt_chars_avg": round(tot_chars / len(lens), 1) if lens else 0.0,
+        "prompt_chars_max": max(lens) if lens else 0,
+        "est_input_tokens": est_in_tok,
+        "est_output_tokens": est_out_tok,
+        "est_standard_usd": est_std_usd,
+        "est_actual_usd": est_act_usd,
+        "est_cursor_quota_pct": round(est_act_usd / CURSOR_USD_PER_1PCT, 2),
+    }
+
+
+def _collect_campaign_outputs(export_data: dict[str, Any], parse_json: bool = False) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for j in export_data.get("jobs") or []:
+        out_p = j.get("output_path")
+        text = ""
+        if out_p and Path(out_p).is_file():
+            try:
+                text = Path(out_p).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+        rec: dict[str, Any] = {
+            "id": j.get("id"),
+            "name": j.get("name"),
+            "stage": j.get("stage"),
+            "status": j.get("status"),
+            "model": j.get("resolved_model") or j.get("model"),
+            "wall_s": j.get("wall_s"),
+            "tool_calls": j.get("tool_calls"),
+            "input_tokens": j.get("input_tokens"),
+            "cache_read_tokens": j.get("cache_read_tokens"),
+            "output_tokens": j.get("output_tokens"),
+            "error": j.get("error"),
+            "output_path": out_p,
+            "patch_path": j.get("patch_path"),
+            "receipt_path": j.get("receipt_path"),
+            "output": text,
+        }
+        if parse_json:
+            rec["parsed"] = extract_json_payload(text)
+        rows.append(rec)
+    return rows
+
+
+def render_campaign_markdown(export_data: dict[str, Any], parse_json: bool = False) -> str:
+    camp = export_data.get("campaign") or {}
+    summary = export_data.get("summary") or {}
+    cid = camp.get("id") or "unknown"
+    t = summary.get("tokens") or {}
+    lines = [
+        f"# Fleet Campaign Report: `{cid}`",
+        "",
+        f"- **Status:** `{camp.get('status', 'unknown')}` | **Jobs:** `{summary.get('total_jobs', 0)}` (`{summary.get('counts', {})}`)",
+        f"- **Tokens:** in=`{t.get('input', 0):,}` cache_read=`{t.get('cache_read', 0):,}` ({t.get('cache_hit_pct', 0)}%) out=`{t.get('output', 0):,}` reason=`{t.get('reasoning', 0):,}`",
+        f"- **Cost & Speed:** est_actual=`${summary.get('est_actual_usd', summary.get('est_standard_usd', 0.0)):.4f}` (~`{summary.get('est_cursor_quota_pct', 0.0)}%` quota) | wall_sum=`{summary.get('wall_s_sum', 0)}s` (avg `{summary.get('wall_s_avg', 0)}s`) | tools=`{summary.get('total_tool_calls', 0)}`",
+        "",
+    ]
+    for rec in _collect_campaign_outputs(export_data, parse_json=parse_json):
+        lines.append(f"## {rec['id']} (`{rec['status']}` · `{rec['model']}` · `{rec['wall_s']}s` · `{rec['tool_calls']}` tools)")
+        if rec.get("error"):
+            lines.append(f"> Error: `{rec['error']}`")
+        if rec.get("patch_path"):
+            lines.append(f"- Patch: `{rec['patch_path']}`")
+        if parse_json and rec.get("parsed") is not None:
+            lines.append("```json")
+            lines.append(json.dumps(rec["parsed"], indent=2, ensure_ascii=False))
+            lines.append("```")
+        else:
+            body = (rec.get("output") or "").strip()
+            lines.append(body if body else "_(empty output)_")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _discover_cursor_models(cursor_bin: str) -> tuple[list[str], list[str]]:
+    grok_models: list[str] = []
+    other_models: list[str] = []
+    try:
+        proc = subprocess.run([cursor_bin, "models"], capture_output=True, text=True, timeout=15)
+        if proc.returncode != 0:
+            return grok_models, other_models
+        for line in proc.stdout.splitlines():
+            s = line.strip()
+            if not s or " - " not in s or s.lower().startswith("available models"):
+                continue
+            mid = s.split(" - ", 1)[0].strip()
+            if not mid:
+                continue
+            if "grok" in mid.lower():
+                grok_models.append(mid)
+            else:
+                other_models.append(mid)
+    except Exception:
+        pass
+    return grok_models, other_models
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    cursor_bin = find_cursor_agent(args.cursor_bin)
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    art_dir = Path(args.artifact_dir) if args.artifact_dir else default_artifact_dir()
+    bwrap_bin = shutil.which("bwrap")
+
+    version_str = None
+    auth_ok = False
+    auth_msg = "not checked"
+    grok_models: list[str] = []
+    other_models: list[str] = []
+    hints: list[str] = []
+
+    if cursor_bin:
+        try:
+            vp = subprocess.run([cursor_bin, "--version"], capture_output=True, text=True, timeout=8)
+            version_str = (vp.stdout or vp.stderr).strip().splitlines()[0] if (vp.stdout or vp.stderr).strip() else None
+        except Exception:
+            version_str = None
+        try:
+            sp = subprocess.run([cursor_bin, "status"], capture_output=True, text=True, timeout=10)
+            lines = [ln.strip() for ln in (sp.stdout or sp.stderr).splitlines() if ln.strip()]
+            auth_msg = lines[-1] if lines else f"exit {sp.returncode}"
+            auth_ok = sp.returncode == 0
+            if not auth_ok:
+                hints.append("Run `cursor-agent login` (or set CURSOR_API_KEY) to authenticate Cursor CLI.")
+        except Exception as exc:
+            auth_msg = str(exc)
+            hints.append("Verify `cursor-agent status` works interactively.")
+        if auth_ok and not getattr(args, "fast", False):
+            grok_models, other_models = _discover_cursor_models(cursor_bin)
+    else:
+        hints.append("Install Cursor CLI: `curl https://cursor.com/install -fsS | bash` then `cursor-agent login`.")
+
+    if not bwrap_bin:
+        hints.append("Optional: install `bubblewrap` (`sudo apt install bubblewrap`) for confined worktree verification.")
+
+    healthy, host_snap = check_host_health(artifact_dir=art_dir)
+    if not healthy:
+        hints.append("Host headroom below threshold: " + "; ".join(host_snap["reasons"]))
+
+    ok = bool(cursor_bin) and auth_ok
+    report = {
+        "ok": ok,
+        "platform": sys.platform,
+        "cursor_agent": cursor_bin,
+        "cursor_version": version_str,
+        "auth_ok": auth_ok,
+        "auth": auth_msg,
+        "default_family": os.environ.get("WM_GROK_FAMILY") or DEFAULT_FAMILY,
+        "grok_models_count": len(grok_models),
+        "grok_models": grok_models,
+        "other_models_count": len(other_models),
+        "bwrap": bwrap_bin,
+        "db_path": str(db_path),
+        "artifact_dir": str(art_dir),
+        "host_healthy": healthy,
+        "host": host_snap,
+        "presets": {k: v["description"] for k, v in FLEET_PRESETS.items()},
+        "hints": hints,
+    }
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print("wm-grok-fleet doctor")
+        print(f"  cursor-agent : {cursor_bin or 'MISSING'} ({version_str or 'unknown'})")
+        print(f"  auth         : {'OK' if auth_ok else 'FAIL'} — {auth_msg}")
+        if getattr(args, "fast", False):
+            print(f"  grok models  : skipped (--fast; default family: {report['default_family']})")
+        else:
+            print(f"  grok models  : {len(grok_models)} detected (default family: {report['default_family']}; other Cursor models: {len(other_models)})")
+        print(f"  bwrap        : {bwrap_bin or 'not installed (optional; Linux confinement)'}")
+        ram_disp = f"{host_snap['mem_available_mb']} MiB" if host_snap["mem_available_mb"] is not None else "n/a"
+        print(f"  host health  : {'OK' if healthy else 'WARN'} — RAM={ram_disp}, /={host_snap['root_free_gb']} GiB, artifacts={host_snap['artifact_free_gb']} GiB")
+        print(f"  fleet db     : {db_path}")
+        print(f"  artifacts    : {art_dir}")
+        print("  presets      :")
+        for pk, pv in FLEET_PRESETS.items():
+            print(f"    - {pk:10s} : {pv['description']}")
+        if hints:
+            print("  next steps   :")
+            for h in hints:
+                print(f"    * {h}")
+    return 0 if ok else 1
+
+
+def cmd_campaigns(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    if not db_path.is_file():
+        if args.json:
+            print(json.dumps({"ok": True, "db_path": str(db_path), "campaigns": []}, indent=2))
+        else:
+            print(f"No fleet database yet at {db_path}")
+        return 0
+    store = FleetStore(db_path)
+    camps = store.list_campaigns()
+    if args.limit and args.limit > 0:
+        camps = camps[: args.limit]
+    if args.json:
+        print(json.dumps({"ok": True, "db_path": str(db_path), "campaigns": camps}, indent=2))
+    else:
+        print(f"Fleet DB: {db_path} ({len(camps)} campaigns)")
+        for c in camps:
+            cnt = c["counts"]
+            print(
+                f"  {c['id']:32s} | {c['status']:14s} | "
+                f"done={cnt.get('done',0)} pend={cnt.get('pending',0)} fail={cnt.get('failed',0)} | "
+                f"${c['est_actual_usd']:.4f} (~{c['est_cursor_quota_pct']:.2f}%) | "
+                f"{str(c.get('created_at') or '')[:19]}"
+            )
+    return 0
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    if not db_path.is_file():
+        print(json.dumps({"ok": False, "error": f"db not found: {db_path}"}))
+        return 1
+    store = FleetStore(db_path)
+    cid = sanitize_id(args.campaign, 64)
+    data = store.export_campaign(cid)
+    jobs = data["jobs"]
+    if args.job:
+        jobs = [j for j in jobs if j.get("id") == args.job or j.get("name") == args.job]
+    if args.failed_only:
+        jobs = [j for j in jobs if j.get("status") != "done"]
+
+    max_chars = max(100, int(args.max_chars or 2000))
+    if args.json:
+        enriched = []
+        for j in jobs:
+            item = dict(j)
+            if args.show_output and j.get("output_path") and Path(j["output_path"]).is_file():
+                item["output_preview"] = Path(j["output_path"]).read_text(encoding="utf-8", errors="replace")[:max_chars]
+            enriched.append(item)
+        print(json.dumps({"ok": True, "campaign": cid, "jobs": enriched}, indent=2))
+    else:
+        print(f"Campaign: {cid} ({len(jobs)} matching jobs)")
+        for j in jobs:
+            print(
+                f"  - {j['id']} [{j['status']}] model={j.get('resolved_model') or j.get('model')} "
+                f"wall={j.get('wall_s')}s tools={j.get('tool_calls')} "
+                f"in={j.get('input_tokens') or 0} cr={j.get('cache_read_tokens') or 0} out={j.get('output_tokens') or 0}"
+            )
+            if j.get("error"):
+                print(f"    error: {j['error']}")
+            if j.get("patch_path"):
+                print(f"    patch: {j['patch_path']}")
+            if args.show_output and j.get("output_path") and Path(j["output_path"]).is_file():
+                txt = Path(j["output_path"]).read_text(encoding="utf-8", errors="replace").strip()
+                print(f"    output ({len(txt)} chars):\n{txt[:max_chars]}")
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    if not db_path.is_file():
+        print(json.dumps({"ok": False, "error": f"db not found: {db_path}"}))
+        return 1
+    store = FleetStore(db_path)
+    cid = sanitize_id(args.campaign, 64)
+    data = store.export_campaign(cid)
+    if data.get("campaign") is None and not data.get("jobs"):
+        print(json.dumps({"ok": False, "error": f"campaign not found: {cid}"}))
+        return 1
+
+    fmt = str(args.format or "md").strip().lower()
+    if fmt == "json":
+        payload = {
+            "ok": True,
+            "campaign": data["campaign"],
+            "summary": data["summary"],
+            "results": _collect_campaign_outputs(data, parse_json=bool(args.parse_json)),
+        }
+        rendered = json.dumps(payload, indent=2, ensure_ascii=False)
+    else:
+        rendered = render_campaign_markdown(data, parse_json=bool(args.parse_json))
+
+    if args.out:
+        out_p = Path(args.out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(rendered, encoding="utf-8")
+        print(json.dumps({"ok": True, "campaign": cid, "format": fmt, "out": str(out_p), "bytes": len(rendered.encode("utf-8"))}, indent=2))
+    else:
+        print(rendered)
+    return 0
+
+
+def cmd_patches(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    if not db_path.is_file():
+        print(json.dumps({"ok": False, "error": f"db not found: {db_path}"}))
+        return 1
+    store = FleetStore(db_path)
+    cid = sanitize_id(args.campaign, 64)
+    data = store.export_campaign(cid)
+    patch_jobs = [j for j in data["jobs"] if j.get("patch_path")]
+
+    if args.apply:
+        repo = Path(args.repo or os.getcwd()).resolve()
+        matches = [j for j in patch_jobs if j.get("id") == args.apply or j.get("name") == args.apply]
+        if not matches:
+            print(json.dumps({"ok": False, "error": f"no patch found for job '{args.apply}' in campaign '{cid}'"}))
+            return 1
+        p_path = Path(matches[0]["patch_path"])
+        if not p_path.is_file() or not p_path.read_text(encoding="utf-8", errors="replace").strip():
+            print(json.dumps({"ok": False, "error": f"patch file empty or missing: {p_path}"}))
+            return 1
+        chk = subprocess.run(
+            ["git", "-C", str(repo), "apply", "--check", str(p_path)],
+            capture_output=True,
+            text=True,
+        )
+        if chk.returncode != 0:
+            print(json.dumps({"ok": False, "dry_run": bool(args.check), "error": chk.stderr.strip() or "git apply --check failed"}))
+            return 1
+        if args.check:
+            print(json.dumps({"ok": True, "dry_run": True, "job_id": matches[0]["id"], "patch": str(p_path), "repo": str(repo)}, indent=2))
+            return 0
+        ap = subprocess.run(
+            ["git", "-C", str(repo), "apply", str(p_path)],
+            capture_output=True,
+            text=True,
+        )
+        ok = ap.returncode == 0
+        print(
+            json.dumps(
+                {
+                    "ok": ok,
+                    "applied": ok,
+                    "job_id": matches[0]["id"],
+                    "patch": str(p_path),
+                    "repo": str(repo),
+                    "error": ap.stderr.strip() if not ok else None,
+                },
+                indent=2,
+            )
+        )
+        return 0 if ok else 1
+
+    entries = []
+    for j in patch_jobs:
+        p_path = Path(j["patch_path"])
+        size_b = p_path.stat().st_size if p_path.is_file() else 0
+        rcpt_ok = None
+        if j.get("receipt_path") and Path(j["receipt_path"]).is_file():
+            try:
+                rcpt = json.loads(Path(j["receipt_path"]).read_text(encoding="utf-8"))
+                rcpt_ok = bool(rcpt.get("scope_confined")) and rcpt.get("verify_exit_code") == 0
+            except Exception:
+                rcpt_ok = False
+        entries.append(
+            {
+                "id": j["id"],
+                "name": j["name"],
+                "status": j["status"],
+                "patch_path": str(p_path),
+                "patch_bytes": size_b,
+                "verify_exit_code": j.get("verify_exit_code"),
+                "confined_verified": rcpt_ok,
+            }
+        )
+    if args.json:
+        print(json.dumps({"ok": True, "campaign": cid, "patches": entries}, indent=2))
+    else:
+        print(f"Patches for campaign `{cid}` ({len(entries)} total):")
+        for e in entries:
+            print(
+                f"  - {e['id']} [{e['status']}] {e['patch_bytes']}B | "
+                f"verify_rc={e['verify_exit_code']} | confined_ok={e['confined_verified']} | {e['patch_path']}"
+            )
+    return 0
+
+
+def _build_run_namespace(
+    *,
+    campaign: str,
+    preset: str | None,
+    read_concurrency: int | None,
+    write_concurrency: int | None,
+    stall_timeout: int | None,
+    wall_timeout: int | None,
+    max_retries: int,
+    min_free_ram_mb: float,
+    min_free_root_gb: float,
+    empty_cwd: bool,
+    no_tools_guard: bool,
+    max_tool_calls: int | None,
+    max_usd: float,
+    retry_wall_timeouts: bool,
+    checkpoint_path: str | None,
+    checkpoint_jsonl: str | None,
+    retry_failed: bool,
+    cursor_bin: str | None,
+    db_path: str | None,
+    artifact_dir: str | None,
+    allow_any_model: bool,
+    quiet: bool,
+    suppress_stdout: bool = False,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        campaign=campaign,
+        preset=preset,
+        read_concurrency=read_concurrency,
+        write_concurrency=write_concurrency,
+        stall_timeout=stall_timeout,
+        wall_timeout=wall_timeout,
+        max_retries=max_retries,
+        min_free_ram_mb=min_free_ram_mb,
+        min_free_root_gb=min_free_root_gb,
+        empty_cwd=empty_cwd,
+        no_tools_guard=no_tools_guard,
+        max_tool_calls=max_tool_calls,
+        max_usd=max_usd,
+        retry_wall_timeouts=retry_wall_timeouts,
+        checkpoint_path=checkpoint_path,
+        checkpoint_jsonl=checkpoint_jsonl,
+        retry_failed=retry_failed,
+        cursor_bin=cursor_bin,
+        db_path=db_path,
+        artifact_dir=artifact_dir,
+        allow_any_model=allow_any_model,
+        quiet=quiet,
+        _suppress_stdout=suppress_stdout,
+    )
+
+
+def _enqueue_and_run_inline(
+    *,
+    cid: str,
+    rows_spec: list[dict[str, Any]],
+    args: argparse.Namespace,
+    preset_cfg: dict[str, Any],
+    model_str: str,
+) -> int:
+    db_path = Path(args.db_path) if args.db_path else default_db_path()
+    art_dir = Path(args.artifact_dir) if args.artifact_dir else default_artifact_dir()
+    prompts_dir = art_dir / "campaigns" / cid / "prompts"
+
+    if getattr(args, "dry_run", False):
+        est = estimate_batch_cost([r["prompt"] for r in rows_spec], model_str)
+        preview = {
+            "ok": True,
+            "dry_run": True,
+            "campaign_id": cid,
+            "preset": getattr(args, "preset", None),
+            "action": rows_spec[0]["action"] if rows_spec else "ask",
+            "estimate": est,
+            "sample_jobs": [
+                {"id": r["id"], "name": r["name"], "prompt_chars": len(r["prompt"])}
+                for r in rows_spec[:10]
+            ],
+        }
+        print(json.dumps(preview, indent=2))
+        return 0
+
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    store = FleetStore(db_path)
+    store.ensure_campaign(cid, name=cid, config={"preset": getattr(args, "preset", None), "mode": args.cmd})
+
+    db_rows: list[dict[str, Any]] = []
+    for r in rows_spec:
+        p_file = prompts_dir / f"{r['id']}.txt"
+        p_file.write_text(r["prompt"], encoding="utf-8")
+        db_rows.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "stage": r.get("stage", args.cmd),
+                "action": r["action"],
+                "model": r["model"],
+                "cwd": r["cwd"],
+                "prompt_path": str(p_file),
+                "verify_cmd": r.get("verify_cmd"),
+                "confined": 1 if r.get("confined") else 0,
+                "max_attempts": max(1, int(r.get("max_attempts", 3))),
+                "priority": int(r.get("priority", 0)),
+            }
+        )
+    store.enqueue_jobs(cid, db_rows)
+
+    run_ns = _build_run_namespace(
+        campaign=cid,
+        preset=getattr(args, "preset", None),
+        read_concurrency=getattr(args, "read_concurrency", None),
+        write_concurrency=getattr(args, "write_concurrency", None),
+        stall_timeout=getattr(args, "stall_timeout", None),
+        wall_timeout=getattr(args, "wall_timeout", None),
+        max_retries=int(getattr(args, "max_retries", 2)),
+        min_free_ram_mb=float(getattr(args, "min_free_ram_mb", 1500.0)),
+        min_free_root_gb=float(getattr(args, "min_free_root_gb", 8.0)),
+        empty_cwd=bool(getattr(args, "empty_cwd", False)),
+        no_tools_guard=bool(getattr(args, "no_tools_guard", False)),
+        max_tool_calls=getattr(args, "max_tool_calls", None),
+        max_usd=float(getattr(args, "max_usd", 0.0) or 0.0),
+        retry_wall_timeouts=bool(getattr(args, "retry_wall_timeouts", False)),
+        checkpoint_path=getattr(args, "checkpoint_path", None),
+        checkpoint_jsonl=getattr(args, "checkpoint_jsonl", None),
+        retry_failed=bool(getattr(args, "retry_failed", False)),
+        cursor_bin=getattr(args, "cursor_bin", None),
+        db_path=str(db_path),
+        artifact_dir=str(art_dir),
+        allow_any_model=bool(getattr(args, "allow_any_model", False)),
+        quiet=bool(getattr(args, "quiet", False)),
+        suppress_stdout=True,
+    )
+    rc = cmd_run(run_ns)
+    export_data = store.export_campaign(cid)
+    parse_json = bool(getattr(args, "parse_json", False))
+    results = _collect_campaign_outputs(export_data, parse_json=parse_json)
+
+    payload = {
+        "ok": rc == 0,
+        "campaign_id": cid,
+        "summary": export_data["summary"],
+        "results": results,
+    }
+    if getattr(args, "out", None):
+        out_p = Path(args.out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if getattr(args, "report_md", None):
+        md_p = Path(args.report_md)
+        md_p.parent.mkdir(parents=True, exist_ok=True)
+        md_p.write_text(render_campaign_markdown(export_data, parse_json=parse_json), encoding="utf-8")
+
+    # Emit compact stdout JSON (if --out was written, keep stdout concise; else include results)
+    if getattr(args, "out", None):
+        stdout_obj = {
+            "ok": rc == 0,
+            "campaign_id": cid,
+            "out": str(args.out),
+            "report_md": str(args.report_md) if getattr(args, "report_md", None) else None,
+            "summary": export_data["summary"],
+        }
+    else:
+        stdout_obj = payload
+    print(json.dumps(stdout_obj, indent=2, ensure_ascii=False))
+    return rc
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    preset_cfg = FLEET_PRESETS.get(str(args.preset).strip().lower(), {}) if args.preset else {}
+    action = str(args.action or preset_cfg.get("action") or "ask").strip().lower()
+    model = resolve_fleet_model(
+        args.model or preset_cfg.get("model") or "medium",
+        allow_any_model=bool(args.allow_any_model),
+    )
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    prompts: list[str] = list(args.prompts or [])
+    if args.prompt_file:
+        prompts.append(Path(args.prompt_file).read_text(encoding="utf-8"))
+    if not prompts:
+        print(json.dumps({"ok": False, "error": "provide at least one prompt argument or --prompt-file"}))
+        return 1
+
+    cid = sanitize_id(
+        args.campaign or f"ask-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+        64,
+    )
+    rows_spec: list[dict[str, Any]] = []
+    for idx, p_text in enumerate(prompts, 1):
+        jid = sanitize_id(f"ask-{idx:03d}-{hashlib.sha256(p_text.encode('utf-8')).hexdigest()[:8]}", 64)
+        rows_spec.append(
+            {
+                "id": jid,
+                "name": f"ask-{idx:03d}",
+                "stage": "ask",
+                "action": action,
+                "model": model,
+                "cwd": cwd,
+                "prompt": p_text,
+                "verify_cmd": args.verify_cmd,
+                "confined": bool(args.confined or preset_cfg.get("confined", False)),
+                "priority": len(prompts) - idx,
+            }
+        )
+    return _enqueue_and_run_inline(cid=cid, rows_spec=rows_spec, args=args, preset_cfg=preset_cfg, model_str=model)
+
+
+def cmd_map(args: argparse.Namespace) -> int:
+    preset_cfg = FLEET_PRESETS.get(str(args.preset).strip().lower(), {}) if args.preset else {}
+    action = str(args.action or preset_cfg.get("action") or "ask").strip().lower()
+    model = resolve_fleet_model(
+        args.model or preset_cfg.get("model") or "medium",
+        allow_any_model=bool(args.allow_any_model),
+    )
+    cwd = Path(args.cwd or os.getcwd()).resolve()
+    inline_files = bool(args.inline_files) or bool(preset_cfg.get("inline_files", False))
+    max_file_bytes = max(1024, int((args.max_file_kb or 64) * 1024))
+
+    instruction = str(args.instruction or "").strip()
+    if args.instruction_file:
+        instruction = Path(args.instruction_file).read_text(encoding="utf-8").strip()
+    if not instruction:
+        print(json.dumps({"ok": False, "error": "--instruction or --instruction-file is required for `map`"}))
+        return 1
+
+    camp_excl = _load_exclusions_file(Path(args.exclusions_file)) if args.exclusions_file else []
+    camp_forb = [str(x).strip() for x in (args.forbidden or []) if str(x).strip()]
+    camp_traj = (
+        _load_trajectories_jsonl(Path(args.trajectories_file), max_items=int(args.max_trajectories or 3))
+        if args.trajectories_file
+        else []
+    )
+
+    items: list[dict[str, Any]] = []
+    seen_files: set[Path] = set()
+    for pattern in (args.files or []):
+        p_obj = Path(pattern)
+        if p_obj.is_absolute():
+            matches = sorted(Path(p_obj.anchor).glob(str(p_obj.relative_to(p_obj.anchor))))
+        else:
+            matches = sorted(cwd.glob(pattern))
+        for m in matches:
+            if not m.is_file():
+                continue
+            rm = m.resolve()
+            if rm in seen_files:
+                continue
+            seen_files.add(rm)
+            try:
+                rel = str(rm.relative_to(cwd))
+            except ValueError:
+                rel = str(rm)
+            if inline_files:
+                raw_bytes = rm.read_bytes()
+                truncated = len(raw_bytes) > max_file_bytes
+                body = raw_bytes[:max_file_bytes].decode("utf-8", errors="replace")
+                if truncated:
+                    body += f"\n... [truncated at {max_file_bytes} bytes of {len(raw_bytes)}]"
+                items.append({"id": rel, "body": f"FILE: {rel}\n```\n{body}\n```"})
+            else:
+                items.append({"id": rel, "body": f"Inspect file `{rel}` in workspace `{cwd}`."})
+
+    if args.items_jsonl:
+        for idx, raw_line in enumerate(Path(args.items_jsonl).read_text(encoding="utf-8").splitlines(), 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                iid = str(obj.get(args.id_field) or obj.get("id") or f"item-{idx:04d}")
+                body = json.dumps(obj, ensure_ascii=False, indent=2)
+            else:
+                iid = f"item-{idx:04d}"
+                body = str(obj)
+            items.append({"id": iid, "body": body})
+
+    if args.items_json:
+        parsed = json.loads(Path(args.items_json).read_text(encoding="utf-8"))
+        if not isinstance(parsed, list):
+            print(json.dumps({"ok": False, "error": "--items-json must contain a JSON array"}))
+            return 1
+        for idx, obj in enumerate(parsed, 1):
+            if isinstance(obj, dict):
+                iid = str(obj.get(args.id_field) or obj.get("id") or f"item-{idx:04d}")
+                body = json.dumps(obj, ensure_ascii=False, indent=2)
+            else:
+                iid = f"item-{idx:04d}"
+                body = str(obj)
+            items.append({"id": iid, "body": body})
+
+    if args.stdin_items:
+        for idx, raw_line in enumerate(sys.stdin.read().splitlines(), 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            items.append({"id": f"stdin-{idx:04d}", "body": line})
+
+    if not items:
+        print(json.dumps({"ok": False, "error": "no map items matched (--files, --items-jsonl, --items-json, or --stdin-items)"}))
+        return 1
+
+    batches = pack_map_items(
+        items,
+        batch_size=int(args.batch_size or 1),
+        batch_max_chars=int(args.batch_max_chars or 48000),
+    )
+    cid = sanitize_id(
+        args.campaign or f"map-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+        64,
+    )
+
+    rows_spec: list[dict[str, Any]] = []
+    for b_idx, batch in enumerate(batches, 1):
+        blocks = [f"=== ITEM {it['id']} ===\n{it['body']}" for it in batch]
+        task_body = f"{instruction}\n\n" + "\n\n".join(blocks)
+        composed = compose_worker_prompt(
+            task_body,
+            intended_design_exclusions=camp_excl,
+            forbidden_actions=camp_forb,
+            winning_trajectories=camp_traj,
+        )
+        # Keep deterministic batch IDs when --campaign is provided so interrupted runs resume idempotently!
+        batch_key = "|".join(it["id"] for it in batch)
+        digest = hashlib.sha256(batch_key.encode("utf-8")).hexdigest()[:8]
+        jid = sanitize_id(f"batch-{b_idx:03d}-{digest}", 64)
+        rows_spec.append(
+            {
+                "id": jid,
+                "name": f"batch-{b_idx:03d} ({len(batch)} items)",
+                "stage": "map",
+                "action": action,
+                "model": model,
+                "cwd": str(cwd),
+                "prompt": composed,
+                "verify_cmd": args.verify_cmd,
+                "confined": bool(args.confined or preset_cfg.get("confined", False)),
+                "priority": len(batches) - b_idx,
+            }
+        )
+
+    return _enqueue_and_run_inline(cid=cid, rows_spec=rows_spec, args=args, preset_cfg=preset_cfg, model_str=model)
+
+
+def _add_common_run_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--preset",
+        choices=sorted(FLEET_PRESETS.keys()),
+        default=None,
+        help="Preset profile: synthesis (0-tool 18.8x cheaper), fast, audit, plan, patch",
+    )
+    p.add_argument("--read-concurrency", type=int, default=None)
+    p.add_argument("--write-concurrency", type=int, default=None)
+    p.add_argument("--stall-timeout", type=int, default=None)
+    p.add_argument("--wall-timeout", type=int, default=None)
+    p.add_argument("--max-retries", type=int, default=2)
+    p.add_argument("--min-free-ram-mb", type=float, default=1500.0)
+    p.add_argument("--min-free-root-gb", type=float, default=8.0)
+    p.add_argument("--empty-cwd", action="store_true", help="Run ask/plan jobs in isolated empty cwd + --workspace")
+    p.add_argument("--no-tools-guard", action="store_true", help="Prepend single-turn NO_TOOLS banner on ask prompts")
+    p.add_argument("--max-tool-calls", type=int, default=None, help="Kill worker immediately if tool_calls exceeds N (-1 disables)")
+    p.add_argument("--max-usd", type=float, default=0.0, help="Halt spawning remaining workers once est_standard_usd reaches cap")
+    p.add_argument("--retry-wall-timeouts", action="store_true", help="Retry jobs that hit wall timeout (disabled by default)")
+    p.add_argument("--checkpoint-path", default=None, help="Atomic JSON export snapshot updated after each completed job")
+    p.add_argument("--checkpoint-jsonl", default=None, help="Append-only fsynced JSONL log of completed jobs")
+    p.add_argument("--retry-failed", action="store_true", help="Reset failed jobs back to pending before running")
+    p.add_argument("--allow-any-model", action="store_true", help="Allow any valid cursor-agent model ID (composer, codex, claude, etc.)")
+    p.add_argument("--quiet", action="store_true", help="Suppress per-job stderr progress lines")
+    p.add_argument("--cursor-bin", default=None)
+    p.add_argument("--db-path", default=None)
+    p.add_argument("--artifact-dir", default=None)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="High-Throughput Grok 4.7+ Fleet Runner")
+    p = argparse.ArgumentParser(
+        description="High-Throughput Cursor CLI / Grok 4.7+ Fleet Runner (zero-dep Python stdlib)"
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    doc = sub.add_parser("doctor", help="Verify cursor-agent auth, models, bwrap, and host headroom")
+    doc.add_argument("--cursor-bin", default=None)
+    doc.add_argument("--db-path", default=None)
+    doc.add_argument("--artifact-dir", default=None)
+    doc.add_argument("--fast", action="store_true", help="Skip live `cursor-agent models` query")
+    doc.add_argument("--json", action="store_true")
+
+    ask_p = sub.add_parser("ask", help="Zero-manifest one-shot parallel fan-out for inline prompts")
+    ask_p.add_argument("prompts", nargs="*", help="One or more inline prompt strings")
+    ask_p.add_argument("--prompt-file", default=None)
+    ask_p.add_argument("--campaign", default=None)
+    ask_p.add_argument("--action", choices=["ask", "plan", "worktree"], default=None)
+    ask_p.add_argument("--model", default=None)
+    ask_p.add_argument("--cwd", default=None)
+    ask_p.add_argument("--verify-cmd", default=None)
+    ask_p.add_argument("--confined", action="store_true")
+    ask_p.add_argument("--parse-json", action="store_true", help="Extract JSON payloads from worker responses")
+    ask_p.add_argument("--out", default=None, help="Write combined JSON results to path")
+    ask_p.add_argument("--report-md", default=None, help="Write combined Markdown report to path")
+    ask_p.add_argument("--dry-run", action="store_true", help="Estimate tokens & cost without running workers")
+    _add_common_run_flags(ask_p)
+
+    map_p = sub.add_parser("map", help="Zero-manifest parallel map-reduce over files, JSONL, JSON, or stdin")
+    map_p.add_argument("--instruction", default=None, help="Static instruction applied to every batch")
+    map_p.add_argument("--instruction-file", default=None, help="Read static instruction from file")
+    map_p.add_argument("--files", action="append", default=None, help="Glob pattern of files to map (repeatable)")
+    map_p.add_argument("--inline-files", action="store_true", help="Inline file contents directly into prompts (default on synthesis/fast presets)")
+    map_p.add_argument("--max-file-kb", type=int, default=64, help="Per-file inline cap in KiB (default 64)")
+    map_p.add_argument("--items-jsonl", default=None, help="JSONL file of items to batch across workers")
+    map_p.add_argument("--items-json", default=None, help="JSON array file of items to batch across workers")
+    map_p.add_argument("--stdin-items", action="store_true", help="Read newline-delimited items from stdin")
+    map_p.add_argument("--id-field", default="id", help="Field name for item IDs in JSON/JSONL (default: id)")
+    map_p.add_argument("--batch-size", type=int, default=1, help="Items packed per worker (empirical sweet spot: 4 for synthesis)")
+    map_p.add_argument("--batch-max-chars", type=int, default=48000, help="Max payload chars per batch before splitting")
+    map_p.add_argument("--campaign", default=None, help="Stable campaign ID for crash-safe resume")
+    map_p.add_argument("--action", choices=["ask", "plan", "worktree"], default=None)
+    map_p.add_argument("--model", default=None)
+    map_p.add_argument("--cwd", default=None)
+    map_p.add_argument("--verify-cmd", default=None)
+    map_p.add_argument("--confined", action="store_true")
+    map_p.add_argument("--exclusions-file", default=None)
+    map_p.add_argument("--forbidden", action="append", default=None)
+    map_p.add_argument("--trajectories-file", default=None)
+    map_p.add_argument("--max-trajectories", type=int, default=3)
+    map_p.add_argument("--parse-json", action="store_true", help="Extract JSON payloads from worker responses")
+    map_p.add_argument("--out", default=None, help="Write combined JSON results to path")
+    map_p.add_argument("--report-md", default=None, help="Write combined Markdown report to path")
+    map_p.add_argument("--dry-run", action="store_true", help="Estimate batch count, tokens & cost without running workers")
+    _add_common_run_flags(map_p)
 
     enq = sub.add_parser("enqueue", help="Enqueue jobs from a JSONL manifest")
     enq.add_argument("--campaign", required=True)
@@ -1585,33 +2652,46 @@ def build_parser() -> argparse.ArgumentParser:
     enq.add_argument("--forbidden", action="append", default=None, help="Forbidden action rule (repeatable)")
     enq.add_argument("--trajectories-file", default=None, help="JSONL winning-trajectory exemplars")
     enq.add_argument("--max-trajectories", type=int, default=3)
+    enq.add_argument("--allow-any-model", action="store_true")
 
     run_p = sub.add_parser("run", help="Drain pending jobs for a campaign")
     run_p.add_argument("--campaign", required=True)
-    run_p.add_argument("--read-concurrency", type=int, default=8)
-    run_p.add_argument("--write-concurrency", type=int, default=3)
-    run_p.add_argument("--stall-timeout", type=int, default=75)
-    run_p.add_argument("--wall-timeout", type=int, default=300)
-    run_p.add_argument("--max-retries", type=int, default=2)
-    run_p.add_argument("--min-free-ram-mb", type=float, default=1500.0)
-    run_p.add_argument("--min-free-root-gb", type=float, default=8.0)
-    run_p.add_argument("--empty-cwd", action="store_true", help="Run ask/plan jobs in isolated empty cwd + --workspace")
-    run_p.add_argument("--no-tools-guard", action="store_true", help="Prepend single-turn NO_TOOLS banner on ask prompts")
-    run_p.add_argument("--max-tool-calls", type=int, default=-1, help="Kill worker immediately if tool_calls exceeds N (-1 disables)")
-    run_p.add_argument("--max-usd", type=float, default=0.0, help="Halt spawning remaining workers once est_standard_usd reaches cap")
-    run_p.add_argument("--retry-wall-timeouts", action="store_true", help="Retry jobs that hit wall timeout (disabled by default)")
-    run_p.add_argument("--checkpoint-path", default=None, help="Atomic JSON export snapshot updated after each completed job")
-    run_p.add_argument("--checkpoint-jsonl", default=None, help="Append-only fsynced JSONL log of completed jobs")
-    run_p.add_argument("--retry-failed", action="store_true", help="Reset failed jobs back to pending before running")
-    run_p.add_argument("--cursor-bin", default=None)
-    run_p.add_argument("--db-path", default=None)
-    run_p.add_argument("--artifact-dir", default=None)
+    _add_common_run_flags(run_p)
 
     st = sub.add_parser("status", help="Show campaign progress and host headroom")
     st.add_argument("--campaign", default=None)
     st.add_argument("--json", action="store_true")
     st.add_argument("--db-path", default=None)
     st.add_argument("--artifact-dir", default=None)
+
+    ls_p = sub.add_parser("campaigns", aliases=["ls"], help="List campaigns in the fleet database")
+    ls_p.add_argument("--limit", type=int, default=30)
+    ls_p.add_argument("--json", action="store_true")
+    ls_p.add_argument("--db-path", default=None)
+
+    ins = sub.add_parser("inspect", help="Inspect jobs, errors, and outputs for a campaign")
+    ins.add_argument("--campaign", required=True)
+    ins.add_argument("--job", default=None)
+    ins.add_argument("--failed-only", action="store_true")
+    ins.add_argument("--show-output", action="store_true")
+    ins.add_argument("--max-chars", type=int, default=2000)
+    ins.add_argument("--json", action="store_true")
+    ins.add_argument("--db-path", default=None)
+
+    rep = sub.add_parser("report", help="Render combined Markdown or JSON report from campaign outputs")
+    rep.add_argument("--campaign", required=True)
+    rep.add_argument("--format", choices=["md", "json"], default="md")
+    rep.add_argument("--parse-json", action="store_true")
+    rep.add_argument("--out", default=None)
+    rep.add_argument("--db-path", default=None)
+
+    pat = sub.add_parser("patches", help="List, check, or apply harvested worktree patches")
+    pat.add_argument("--campaign", required=True)
+    pat.add_argument("--apply", default=None, help="Job ID or name whose patch to apply")
+    pat.add_argument("--repo", default=None, help="Target git repo directory for --apply (default: cwd)")
+    pat.add_argument("--check", action="store_true", help="Dry-run `git apply --check` without modifying files")
+    pat.add_argument("--json", action="store_true")
+    pat.add_argument("--db-path", default=None)
 
     exp = sub.add_parser("export", help="Export full campaign records to JSON")
     exp.add_argument("--campaign", required=True)
@@ -1638,12 +2718,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.cmd == "doctor":
+        return cmd_doctor(args)
+    if args.cmd == "ask":
+        return cmd_ask(args)
+    if args.cmd == "map":
+        return cmd_map(args)
     if args.cmd == "enqueue":
         return cmd_enqueue(args)
     if args.cmd == "run":
         return cmd_run(args)
     if args.cmd == "status":
         return cmd_status(args)
+    if args.cmd in ("campaigns", "ls"):
+        return cmd_campaigns(args)
+    if args.cmd == "inspect":
+        return cmd_inspect(args)
+    if args.cmd == "report":
+        return cmd_report(args)
+    if args.cmd == "patches":
+        return cmd_patches(args)
     if args.cmd == "export":
         return cmd_export(args)
     if args.cmd == "record-win":

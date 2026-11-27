@@ -97,7 +97,15 @@ git pull && ./install.sh --skip-tricameral-engine
 # Optional: pull local Tricameral micro-organ spores (~122 MB for Huginn, ~479 MB for both Ravens)
 wm-models pull huginn            # set HF_TOKEN=... for private HF repo, or add --source gdrive
 wm-models list
+
+# Standalone Cursor CLI / Grok 4.7+ Fleet ONLY (~1s, zero Rust/Node/AGY/WhiteMagic deps; macOS & Linux)
+./install.sh --cursor-fleet-only --wire-cursor-mcp
+cursor-fleet doctor
+cursor-fleet map --preset synthesis --files "src/**/*.py" --batch-size 4 --dry-run \
+  --instruction "List concrete bugs as JSON"
 ```
+
+See [**`docs/CURSOR_FLEET.md`**](./docs/CURSOR_FLEET.md) for the complete standalone Cursor / Grok Fleet guide (`doctor`, `ask`, `map`, `campaigns`, `inspect`, `report`, `patches`, presets, `--dry-run` cost estimator, crash-safe quota resume, and 1-tool `wm-grok-mcp`).
 
 > **Turn-0 Context Tip:** Disable domain-specific marketplace plugins globally (e.g., `chrome-devtools-plugin`, `modern-web-guidance-plugin`, `google-antigravity-sdk` ≈ `~1,003` Turn-0 tokens) and re-enable them only in web/SDK repos via `.agents/plugins.json`.
 

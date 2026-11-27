@@ -79,6 +79,8 @@ TOOL_SCHEMA = {
                         "session_id": {"type": "string"},
                         "worktree_name": {"type": "string"},
                         "allow_write": {"type": "boolean"},
+                        "empty_cwd": {"type": "boolean"},
+                        "no_tools_guard": {"type": "boolean"},
                         "confined": {"type": "boolean"},
                         "verify_cmd": {"type": "string"},
                         "sign_receipt": {"type": "boolean"},
@@ -89,9 +91,26 @@ TOOL_SCHEMA = {
                     "required": ["prompt"],
                 },
             },
+            "preset": {
+                "type": "string",
+                "enum": ["synthesis", "fast", "audit", "plan", "patch"],
+                "description": "Efficiency preset (`synthesis` = 0-tool empty_cwd + medium, ~18.8x cheaper)",
+            },
             "model": {
                 "type": "string",
-                "description": "Grok 4.7 tier: low | medium | high (default) | xhigh, or explicit grok-4.7-*",
+                "description": "Grok 4.7+ tier: low | medium | high (default, standard non-fast) | xhigh | *-fast, or explicit model",
+            },
+            "empty_cwd": {
+                "type": "boolean",
+                "description": "Isolate ask/plan workers in empty workspace (prevents repo scanning token burn)",
+            },
+            "no_tools_guard": {
+                "type": "boolean",
+                "description": "Prepend single-turn pure-synthesis no-tools directive on ask prompts",
+            },
+            "allow_any_model": {
+                "type": "boolean",
+                "description": "Allow any valid cursor-agent model ID beyond grok-X.Y-*",
             },
             "concurrency": {"type": "integer", "minimum": 1, "maximum": 6},
             "timeout_sec": {"type": "integer", "minimum": 15, "maximum": 150},
