@@ -16,10 +16,15 @@ def main():
         sys.stdout.write("{}")
         return
 
-    err = payload.get("error")
+    if payload.get("is_interrupt") is True:
+        sys.stdout.write("{}")
+        sys.stdout.flush()
+        return
+
+    err = payload.get("error") or payload.get("error_message")
     tool_call = payload.get("toolCall") or {}
-    tool_name = str(tool_call.get("name") or "unknown")
-    args = tool_call.get("args") or tool_call.get("arguments") or {}
+    tool_name = str(tool_call.get("name") or payload.get("tool_name") or "unknown")
+    args = tool_call.get("args") or tool_call.get("arguments") or payload.get("tool_input") or {}
     if isinstance(args, str):
         try:
             args = json.loads(args)
@@ -27,10 +32,23 @@ def main():
             args = {}
     if not isinstance(args, dict):
         args = {}
-    raw_out = payload.get("result") or payload.get("output") or payload.get("toolOutput")
+    raw_out = (
+        payload.get("result")
+        or payload.get("output")
+        or payload.get("toolOutput")
+        or payload.get("tool_output")
+    )
     out_str = raw_out if isinstance(raw_out, str) else (json.dumps(raw_out) if raw_out else "")
-    write_content = str(args.get("Content") or args.get("content") or "") if tool_name == "write_file" else ""
-    edit_content = str(args.get("Replacement") or args.get("replacement") or "") if tool_name == "edit_file" else ""
+    write_content = (
+        str(args.get("Content") or args.get("content") or args.get("contents") or "")
+        if tool_name in ("write_file", "Write")
+        else ""
+    )
+    edit_content = (
+        str(args.get("Replacement") or args.get("replacement") or args.get("new_string") or "")
+        if tool_name in ("edit_file", "StrReplace")
+        else ""
+    )
 
     spill_bytes = 0
     spill_kind = ""
@@ -59,21 +77,22 @@ def main():
             ledger_path = Path(
                 os.environ.get("WM_SIM_LEDGER", str(Path.home() / ".local" / "share" / "whitemagic" / "sim_ledger.jsonl"))
             )
-            if tool_name == "run_command":
+            if tool_name in ("run_command", "Shell"):
                 preview = redact(str(args.get("CommandLine") or args.get("command") or ""))[:180]
-            elif tool_name == "read_file":
-                p = str(args.get("Path") or args.get("path") or "")
-                s_l, e_l = args.get("StartLine"), args.get("EndLine")
+            elif tool_name in ("read_file", "Read"):
+                p = str(args.get("Path") or args.get("path") or args.get("file_path") or "")
+                s_l = args.get("StartLine") if args.get("StartLine") is not None else args.get("offset")
+                e_l = args.get("EndLine") if args.get("EndLine") is not None else args.get("limit")
                 rng = (
                     f" [L{s_l if s_l is not None else 1}-{e_l if e_l is not None else 'EOF'}]"
                     if (s_l is not None or e_l is not None)
                     else ""
                 )
-                preview = redact(f"read_file: {p}{rng}" if p else "read_file")[:180]
-            elif tool_name in ("write_file", "edit_file"):
-                p = str(args.get("Path") or args.get("path") or "")
+                preview = redact(f"{tool_name}: {p}{rng}" if p else tool_name)[:180]
+            elif tool_name in ("write_file", "edit_file", "Write", "StrReplace"):
+                p = str(args.get("Path") or args.get("path") or args.get("file_path") or "")
                 preview = redact(f"{tool_name}: {p}" if p else tool_name)[:180]
-            elif tool_name.endswith("_apply_edits"):
+            elif tool_name.endswith("_apply_edits") or tool_name == "MCP:apply_edits":
                 edits = args.get("edits")
                 if isinstance(edits, str):
                     try:
@@ -85,17 +104,17 @@ def main():
                     preview = redact(f"apply_edits: {', '.join(paths)}")[:180]
                 else:
                     preview = "apply_edits"
-            elif tool_name.endswith("_run_checks"):
+            elif tool_name.endswith("_run_checks") or tool_name == "MCP:run_checks":
                 cmds = args.get("commands")
                 first = cmds[0] if isinstance(cmds, list) and cmds else ""
                 if isinstance(first, dict):
                     first = first.get("command", "")
                 preview = redact(f"run_checks: {first}")[:180]
-            elif tool_name.endswith("_batch_search"):
+            elif tool_name.endswith("_batch_search") or tool_name == "MCP:batch_search":
                 qs = args.get("queries")
                 qtypes = [str(q.get("type", "?")) for q in qs[:4] if isinstance(q, dict)] if isinstance(qs, list) else []
                 preview = redact(f"batch_search: {','.join(qtypes)}")[:180]
-            elif tool_name.endswith("_code_graph"):
+            elif tool_name.endswith("_code_graph") or tool_name == "MCP:code_graph":
                 preview = redact(f"code_graph: {args.get('mode', '')}:{args.get('target', '')}")[:180]
             else:
                 srv = str(args.get("ServerName") or "")
@@ -108,9 +127,9 @@ def main():
             entry = {
                 "event": "tool_failure",
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "conversation_id": str(payload.get("conversationId", ""))[:16],
+                "conversation_id": str(payload.get("conversationId") or payload.get("conversation_id") or "")[:16],
                 "cwd": str(payload.get("cwd", "")),
-                "model": str(payload.get("modelName", "")),
+                "model": str(payload.get("modelName") or payload.get("model") or ""),
                 "tool": tool_name,
                 "cmd_preview": preview,
                 "error": redact(str(err))[:240],
@@ -125,12 +144,19 @@ def main():
             telem_path = Path(
                 os.environ.get("WM_AGY_TELEMETRY", str(Path.home() / ".local" / "share" / "whitemagic" / "agy_telemetry.jsonl"))
             )
-            src_txt = str(args.get("Path") or args.get("CommandLine") or out_str[:120])
+            src_txt = str(
+                args.get("Path")
+                or args.get("path")
+                or args.get("file_path")
+                or args.get("CommandLine")
+                or args.get("command")
+                or out_str[:120]
+            )
             entry = {
                 "event": "tool_spill",
                 "kind": spill_kind,
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "conv_id": str(payload.get("conversationId", ""))[:16],
+                "conv_id": str(payload.get("conversationId") or payload.get("conversation_id") or "")[:16],
                 "tool": tool_name,
                 "bytes": spill_bytes,
                 "preview": redact(src_txt)[:180],

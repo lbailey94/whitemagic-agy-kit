@@ -2424,6 +2424,35 @@ def test_v460_multihost_codex_cursor_and_cpr_translate():
             r_inst.stderr[-300:] if r_inst.returncode != 0 else "",
         )
 
+        # 14f) Cursor Shell updated_input preserves sibling fields & delegates compound heredocs via --py
+        rc_sib, cu_sib = run_sq(
+            ["--pre-tool", "--host", "cursor", "--event", "preToolUse", "--py", str(KIT / "plugin" / "hooks" / "pre_tool_guard.py")],
+            {
+                "tool_name": "Shell",
+                "tool_input": {"command": "git status", "working_directory": str(KIT), "block_until_ms": 15000},
+                "conversation_id": "cur-sib-1",
+            },
+        )
+        rc_hd, cu_hd = run_sq(
+            ["--pre-tool", "--host", "cursor", "--event", "preToolUse", "--py", str(KIT / "plugin" / "hooks" / "pre_tool_guard.py")],
+            {
+                "tool_name": "Shell",
+                "tool_input": {"command": "python3 - <<'PY'\nprint('ok')\nPY", "working_directory": str(KIT)},
+                "conversation_id": "cur-hd-1",
+            },
+        )
+        check(
+            "wm-squeeze --host cursor preserves Shell sibling fields & wraps inline Python heredoc via --py",
+            rc_sib == 0
+            and "wm-squeeze --safe -- git status" in cu_sib.get("updated_input", {}).get("command", "")
+            and cu_sib.get("updated_input", {}).get("working_directory") == str(KIT)
+            and cu_sib.get("updated_input", {}).get("block_until_ms") == 15000
+            and rc_hd == 0
+            and "--pipe" in cu_hd.get("updated_input", {}).get("command", "")
+            and cu_hd.get("updated_input", {}).get("working_directory") == str(KIT),
+            f"sib={cu_sib} hd={cu_hd}",
+        )
+
 
 def test_c2_grimoire_profiles_mandala_exec_and_sidecar_telemetry():
     print("\n15. Phase C2 Per-Host Grimoire Profile, --mandala-exec & Sidecar Grimoire/wm_fast:")
