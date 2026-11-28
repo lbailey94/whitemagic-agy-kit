@@ -330,12 +330,15 @@ if global_mcp_path.is_file():
 
 tri_mcp = local_bin / "wm-tricameral-mcp"
 engine = local_bin / "muninn-engine"
+models_dir = Path(os.environ.get("WM_MODELS_DIR") or str(Path.home() / ".local" / "share" / "whitemagic" / "models"))
+has_spores = models_dir.is_dir() and any(models_dir.glob("*.tm7b"))
 if engine.is_file() and tri_mcp.is_file() and "tricameral" not in global_servers:
-    servers["tricameral"] = {
-        "command": str(tri_mcp),
-        "args": [],
-        "tools": {"tricameral_dispatch": {"eager": True}},
-    }
+    tri_cfg = {"command": str(tri_mcp), "args": []}
+    if has_spores:
+        tri_cfg["tools"] = {"tricameral_dispatch": {"eager": True}}
+    else:
+        tri_cfg["tools"] = {"tricameral_dispatch": {"eager": False}}
+    servers["tricameral"] = tri_cfg
 
 if servers:
     out = target_plugin / "mcp_config.json"
@@ -567,11 +570,13 @@ changed = False
 if os.environ.get("SYNC_GLOBAL_FLAG") == "1":
     engine = home / ".local" / "bin" / "muninn-engine"
     tri_mcp = home / ".local" / "bin" / "wm-tricameral-mcp"
+    models_dir = Path(os.environ.get("WM_MODELS_DIR") or str(home / ".local" / "share" / "whitemagic" / "models"))
+    has_spores = models_dir.is_dir() and any(models_dir.glob("*.tm7b"))
     if engine.is_file() and tri_mcp.is_file():
         servers["tricameral"] = {
             "command": str(tri_mcp),
             "args": [],
-            "tools": {"tricameral_dispatch": {"eager": True}},
+            "tools": {"tricameral_dispatch": {"eager": bool(has_spores)}},
         }
         changed = True
 

@@ -1479,14 +1479,26 @@ def handle_read_file(args, payload):
                     overwrite["EndLine"] = e_line
             elif s_int is None and e_int is not None:
                 if e_int < 1:
+                    s_int = 1
+                    s_line = 1
                     e_int = max_span
                     e_line = e_int
+                    overwrite["StartLine"] = 1
                     overwrite["EndLine"] = e_int
                 elif is_large_file and e_int > clamp_trigger:
                     s_line = 1
                     e_line = max_span
                     overwrite["StartLine"] = 1
                     overwrite["EndLine"] = max_span
+        # Post-clamp range invariant: never permit StartLine < 1 or EndLine < StartLine
+        if s_int is not None and s_int < 1:
+            s_int = 1
+            s_line = 1
+            overwrite["StartLine"] = 1
+        if s_int is not None and e_int is not None and e_int < s_int:
+            e_int = s_int + 199
+            e_line = e_int
+            overwrite["EndLine"] = e_int
 
     # C3: Exact unchanged duplicate-slice dedup
     if conv_id and step_idx > 0:

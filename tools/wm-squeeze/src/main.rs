@@ -2931,6 +2931,7 @@ fn handle_read_file_rs(args: &HashMap<String, String>, transcript: &str, conv_id
     let mut ow_end: Option<i64> = None;
     let mut cur_ctx = 0u64;
 
+    let mut eff_max_span = 200i64;
     if !has_byte_offset && env::var("WM_READ_CLAMP_OFF").ok().as_deref() != Some("1") {
         if let Some(s) = s_int {
             if s < 1 {
@@ -2944,7 +2945,15 @@ fn handle_read_file_rs(args: &HashMap<String, String>, transcript: &str, conv_id
             _ => None,
         };
         let wide_lines = (inverted || span.map(|sp| sp > 50).unwrap_or(true)) && is_wide_line_file_rs(p_obj, size);
-        let compact_lim = if wide_lines { 50 } else { 150 };
+        let g_limits = if grimoire_profile_exists() {
+            Some(load_grimoire_read_limits(HostKind::Agy))
+        } else {
+            None
+        };
+        let mut compact_lim = if wide_lines { 50i64 } else { 150i64 };
+        if let Some((_, g_clamp, g_wide)) = g_limits {
+            compact_lim = compact_lim.min(if wide_lines { g_wide as i64 } else { g_clamp as i64 });
+        }
         let already_compact = !inverted && span.map(|sp| sp <= compact_lim).unwrap_or(false);
 
         if !already_compact {
@@ -2957,8 +2966,7 @@ fn handle_read_file_rs(args: &HashMap<String, String>, transcript: &str, conv_id
                 (200i64, 250i64)
             };
             let mut wide_lim = 50i64;
-            if grimoire_profile_exists() {
-                let (g_unb, g_clamp, g_wide) = load_grimoire_read_limits(HostKind::Agy);
+            if let Some((g_unb, g_clamp, g_wide)) = g_limits {
                 clamp_trigger = clamp_trigger.min(g_unb as i64);
                 max_span = max_span.min(g_clamp as i64);
                 wide_lim = wide_lim.min(g_wide as i64);
@@ -2973,6 +2981,7 @@ fn handle_read_file_rs(args: &HashMap<String, String>, transcript: &str, conv_id
                     max_span = max_span.min(if wide_lines { 50 } else { 120 });
                 }
             }
+            eff_max_span = max_span.max(1);
 
             if inverted {
                 let s = s_int.unwrap();
@@ -3015,7 +3024,9 @@ fn handle_read_file_rs(args: &HashMap<String, String>, transcript: &str, conv_id
             } else if s_int.is_none() && e_int.is_some() {
                 let e = e_int.unwrap();
                 if e < 1 {
+                    s_int = Some(1);
                     e_int = Some(max_span);
+                    ow_start = Some(1);
                     ow_end = Some(max_span);
                 } else if is_large && e > clamp_trigger {
                     s_int = Some(1);
@@ -3023,6 +3034,20 @@ fn handle_read_file_rs(args: &HashMap<String, String>, transcript: &str, conv_id
                     ow_start = Some(1);
                     ow_end = Some(max_span);
                 }
+            }
+        }
+        // Post-clamp range invariant: never permit StartLine < 1 or EndLine < StartLine
+        if let Some(s) = s_int {
+            if s < 1 {
+                s_int = Some(1);
+                ow_start = Some(1);
+            }
+        }
+        if let (Some(s), Some(e)) = (s_int, e_int) {
+            if e < s {
+                let ne = s + eff_max_span - 1;
+                e_int = Some(ne);
+                ow_end = Some(ne);
             }
         }
     }

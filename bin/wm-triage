@@ -25,18 +25,26 @@ MAX_BYTES = 4500
 
 
 def _lane_cache(home: Path) -> str:
-    brief = home / "SharedWorkspace" / "PREFLIGHT_BRIEF.md"
+    brief = Path(os.environ.get("WM_PREFLIGHT_PATH", str(home / "SharedWorkspace" / "PREFLIGHT_BRIEF.md")))
     lines = []
+    try:
+        du = shutil.disk_usage(str(home))
+        free_gb = du.free / (1024 ** 3)
+        used_pct = int(round((du.used / du.total) * 100)) if du.total else 0
+        warn = " [LOW DISK]" if (free_gb < 15.0 or used_pct >= 90) else ""
+        lines.append(f"Local Disk: {free_gb:.1f} GiB free ({used_pct}% used){warn}")
+    except Exception:
+        pass
     if brief.is_file():
         age_m = (time.time() - brief.stat().st_mtime) / 60.0
         stale = "STALE " if age_m >= 120.0 else ""
-        lines.append(f"Brief: {stale}{age_m:.0f}m old")
+        lines.append(f"Estate Brief (synced): {stale}{age_m:.0f}m old")
         for ln in brief.read_text(encoding="utf-8", errors="replace").splitlines()[:6]:
             s = ln.strip()
             if s.startswith("> **Hosted") or s.startswith("> **Observed"):
                 lines.append(s.lstrip("> ").strip()[:160])
     else:
-        lines.append("Brief: missing")
+        lines.append("Estate Brief (synced): missing")
 
     inbox_p = home / ".local" / "state" / "whitemagic" / "inbox-cache.json"
     if inbox_p.is_file():
@@ -100,8 +108,19 @@ def _lane_board(home: Path) -> str:
 
 
 def _lane_wm3(home: Path) -> str:
-    wm3 = shutil.which("wm3") or str(home / ".local" / "bin" / "wm3")
-    store = home / ".local" / "share" / "whitemagic" / "gen3"
+    wm3 = (
+        os.environ.get("WM3_BIN")
+        or shutil.which("wm-gen3")
+        or shutil.which("wm3")
+        or next(
+            (str(p) for p in (home / ".local" / "bin" / "wm-gen3", home / ".local" / "bin" / "wm3") if p.is_file()),
+            str(home / ".local" / "bin" / "wm3"),
+        )
+    )
+    xdg_store = home / ".local" / "share" / "whitemagic" / "gen3"
+    shared_store = Path("/Users/Shared/ai/wm-store-gen3")
+    default_store = xdg_store if xdg_store.is_dir() else (shared_store if shared_store.is_dir() else xdg_store)
+    store = Path(os.environ.get("WM3_STORE") or str(default_store))
     if not Path(wm3).is_file() or not store.is_dir():
         return "Continuity: wm3/store unavailable"
     try:
