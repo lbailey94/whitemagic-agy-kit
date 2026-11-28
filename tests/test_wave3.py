@@ -1488,15 +1488,28 @@ def test_v44_ide_longevity_shield():
         check("HUD cold miss 140k (0% hit) -> Cold Cache Miss alert", rc == 0 and "Cold Cache Miss" in um_cold)
 
     # 9f) Multi-surface CLIs (wm-handoff, agy-token-audit, agy-mode, agy-bench, wm-sim)
-    p_ho = subprocess.run([str(LOCAL_BIN / "wm-handoff"), "--surface", "app", "--cwd", str(KIT)], capture_output=True, text=True)
-    check("wm-handoff --surface app emits crystal", p_ho.returncode == 0 and "surface=app" in p_ho.stdout and "crystal_sha256=" in p_ho.stdout)
-    p_au = subprocess.run([str(LOCAL_BIN / "agy-token-audit"), "--surface", "app", "--recent", "3", "--json"], capture_output=True, text=True)
-    ok_au = p_au.returncode == 0 and any(s.get("surface") == "app" for s in json.loads(p_au.stdout).get("sessions", []))
-    check("agy-token-audit --surface app --recent 3 --json succeeds", ok_au)
+    app_brain = Path.home() / ".gemini" / "antigravity" / "brain"
+    has_real_app = bool(list(app_brain.glob("*/.system_generated/logs/transcript.jsonl"))) if app_brain.is_dir() else False
+    with tempfile.TemporaryDirectory(prefix="wm-app-surf-") as app_td:
+        surf_env = dict(os.environ)
+        if not has_real_app:
+            synth_logs = Path(app_td) / ".gemini" / "antigravity" / "brain" / "conv-app-synth-1" / ".system_generated" / "logs"
+            synth_logs.mkdir(parents=True, exist_ok=True)
+            (synth_logs / "transcript.jsonl").write_text(
+                json.dumps({"type": "USER_INPUT", "content": "check app surface", "created_at": "2026-11-25T12:00:00Z"}) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "model": "gemini-4-hydrogen-high", "input_tokens": 4000, "cache_read_tokens": 36000, "output_tokens": 300, "content": "App surface verified.", "created_at": "2026-11-25T12:00:05Z"}) + "\n",
+                encoding="utf-8",
+            )
+            surf_env["HOME"] = app_td
+        p_ho = subprocess.run([str(LOCAL_BIN / "wm-handoff"), "--surface", "app", "--cwd", str(KIT)], capture_output=True, text=True, env=surf_env)
+        check("wm-handoff --surface app emits crystal", p_ho.returncode == 0 and "surface=app" in p_ho.stdout and "crystal_sha256=" in p_ho.stdout)
+        p_au = subprocess.run([str(LOCAL_BIN / "agy-token-audit"), "--surface", "app", "--recent", "3", "--json"], capture_output=True, text=True, env=surf_env)
+        ok_au = p_au.returncode == 0 and any(s.get("surface") == "app" for s in json.loads(p_au.stdout).get("sessions", []))
+        check("agy-token-audit --surface app --recent 3 --json succeeds", ok_au)
+        p_ab = subprocess.run([str(LOCAL_BIN / "agy-bench"), "--surface", "app", "--recent", "3", "--credits"], capture_output=True, text=True, env=surf_env)
+        check("agy-bench --surface app --credits succeeds", p_ab.returncode == 0 and "Overall cache hit rate" in p_ab.stdout)
     p_md = subprocess.run([str(LOCAL_BIN / "agy-mode"), "status", "--surface", "all"], capture_output=True, text=True)
     check("agy-mode status --surface all succeeds", p_md.returncode == 0 and "AGY Model Cache" in p_md.stdout)
-    p_ab = subprocess.run([str(LOCAL_BIN / "agy-bench"), "--surface", "app", "--recent", "3", "--credits"], capture_output=True, text=True)
-    check("agy-bench --surface app --credits succeeds", p_ab.returncode == 0 and "Overall cache hit rate" in p_ab.stdout)
     p_sim = subprocess.run([str(LOCAL_BIN / "wm-sim"), "audit"], capture_output=True, text=True)
     check("wm-sim audit confirms fast MCP VALID", p_sim.returncode == 0 and "whitemagic-agy-kit MCP: VALID" in p_sim.stdout)
 
@@ -2418,6 +2431,9 @@ def test_v460_multihost_codex_cursor_and_cpr_translate():
             and all(ev in cu_hooks.get("hooks", {}) for ev in ("sessionStart", "beforeShellExecution", "beforeMCPExecution", "preToolUse", "postToolUse", "postToolUseFailure", "stop"))
             and (fake_home / ".cursor" / "rules" / "whitemagic-turbo.mdc").is_file()
             and (fake_home / ".cursor" / "agents" / "fresh-verifier.md").is_file()
+            and (fake_home / ".cursor" / "agents" / "fast-builder.md").is_file()
+            and (fake_home / ".cursor" / "agents" / "swarm-coordinator.md").is_file()
+            and (fake_home / ".cursor" / "cli-config.json").is_file()
             and (fake_home / ".cursor" / "hooks" / "session_start_brief.py").is_file()
             and "whitemagic" in cu_mcp.get("mcpServers", {})
             and "wm_fast" in cu_mcp.get("mcpServers", {}),
