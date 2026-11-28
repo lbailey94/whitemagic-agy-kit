@@ -386,7 +386,11 @@ def test_v4_fusion():
     print("\n5. Fused Turbo+Fast v4.0.0 (python3 -m, 2>&1, post_tool_sim, unified SessionStart, 5-tool MCP):")
     sq = LOCAL_BIN / "wm-squeeze"
     p_ok = subprocess.run([str(sq), "--safe", "--", "python3", "-m", "pytest", "--version"], capture_output=True, text=True)
-    check("wm-squeeze --safe allows python3 -m pytest", p_ok.returncode == 0)
+    check(
+        "wm-squeeze --safe allows python3 -m pytest",
+        p_ok.returncode == 0
+        or (p_ok.returncode == 1 and "No module named pytest" in (p_ok.stdout + p_ok.stderr) and "[wm-squeeze]" not in p_ok.stderr),
+    )
     p_bad = subprocess.run([str(sq), "--safe", "--", "python3", "-c", "print(1)"], capture_output=True, text=True)
     check("wm-squeeze --safe refuses python3 -c (rc=2)", p_bad.returncode == 2)
 
@@ -580,7 +584,7 @@ def test_bwrap_confinement():
                     not res_out.get("ok")
                     and res_out.get("confinement_receipt", {}).get("verify_exit_code", 0) != 0
                     and not outside_file.exists()
-                    and ("read-only" in err_tail or "permission denied" in err_tail),
+                    and ("read-only" in err_tail or "permission denied" in err_tail or "operation not permitted" in err_tail),
                     detail=err_tail.strip().splitlines()[-1] if err_tail.strip() else "",
                 )
             finally:
@@ -666,8 +670,12 @@ def test_signed_confinement_receipts():
     import base64
     import importlib.machinery
     import importlib.util
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import ed25519
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+    except ImportError:
+        serialization = None
+        ed25519 = None
 
     # 7a) wm-grok-mcp schema exposes sign_receipt, sign_alg, receipt_log
     gmcp_in = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
@@ -801,31 +809,41 @@ def test_signed_confinement_receipts():
 
             # 7d) Ed25519 signing (PEM PKCS8 + raw 32-byte), CLI verify-receipt & tamper detection
             _clear_receipt_env()
-            priv = ed25519.Ed25519PrivateKey.generate()
-            pub = priv.public_key()
             pem_priv_path = td_path / "ed25519_priv.pem"
             pem_pub_path = td_path / "ed25519_pub.pem"
             raw_priv_path = td_path / "ed25519_priv.bin"
-            pem_priv_path.write_bytes(
-                priv.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption(),
+            if ed25519 is not None and serialization is not None:
+                priv = ed25519.Ed25519PrivateKey.generate()
+                pub = priv.public_key()
+                pem_priv_path.write_bytes(
+                    priv.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.PKCS8,
+                        encryption_algorithm=serialization.NoEncryption(),
+                    )
                 )
-            )
-            pem_pub_path.write_bytes(
-                pub.public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                pem_pub_path.write_bytes(
+                    pub.public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
                 )
-            )
-            raw_priv_path.write_bytes(
-                priv.private_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PrivateFormat.Raw,
-                    encryption_algorithm=serialization.NoEncryption(),
+                raw_priv_path.write_bytes(
+                    priv.private_bytes(
+                        encoding=serialization.Encoding.Raw,
+                        format=serialization.PrivateFormat.Raw,
+                        encryption_algorithm=serialization.NoEncryption(),
+                    )
                 )
-            )
+            else:
+                raw_seed = os.urandom(32)
+                raw_priv_path.write_bytes(raw_seed)
+                pem_priv_bytes = swarm_mod._der_to_pem(swarm_mod._ED25519_PKCS8_PREFIX + raw_seed, "PRIVATE KEY")
+                pem_priv_path.write_bytes(pem_priv_bytes)
+                openssl_bin = swarm_mod._find_openssl_ed25519()
+                priv = swarm_mod._OpensslEd25519PrivateKey(pem_priv_bytes, openssl_bin)
+                pub = priv.public_key()
+                pem_pub_path.write_bytes(pub.to_pem().encode("utf-8"))
 
             os.environ["WM_CONFINEMENT_ED25519_KEY_FILE"] = str(pem_priv_path)
             res_ed = swarm_mod.run_confined_verify(wt, "echo ed25519-pem", 20, sign_alg="ed25519")

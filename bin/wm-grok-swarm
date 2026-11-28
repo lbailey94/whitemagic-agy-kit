@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -78,7 +79,14 @@ def find_bwrap() -> str | None:
         if p.is_file() and os.access(p, os.X_OK):
             return str(p)
         return None
-    return shutil.which("bwrap")
+    bw = shutil.which("bwrap")
+    if bw:
+        return bw
+    if sys.platform == "darwin":
+        sbx = shutil.which("sandbox-exec") or ("/usr/bin/sandbox-exec" if os.access("/usr/bin/sandbox-exec", os.X_OK) else None)
+        if sbx:
+            return sbx
+    return None
 
 
 def _compute_worktree_diff_sha256(wt_path: Path) -> str:
@@ -254,16 +262,93 @@ def _load_hmac_key_from_env() -> bytes | None:
     return file_key
 
 
+_ED25519_PKCS8_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+
+
+def _find_openssl_ed25519() -> str | None:
+    for cand in ("/opt/homebrew/bin/openssl", "/usr/local/bin/openssl", shutil.which("openssl") or "", "/usr/bin/openssl"):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            res = subprocess.run([cand, "version"], capture_output=True, text=True)
+            if res.returncode == 0 and not res.stdout.startswith("LibreSSL"):
+                return cand
+    return None
+
+
+def _der_to_pem(der: bytes, label: str) -> bytes:
+    b64 = base64.b64encode(der).decode("ascii")
+    lines = [b64[i : i + 64] for i in range(0, len(b64), 64)]
+    return (f"-----BEGIN {label}-----\n" + "\n".join(lines) + f"\n-----END {label}-----\n").encode("ascii")
+
+
+class _OpensslEd25519PublicKey:
+    def __init__(self, pem_bytes: bytes, openssl_bin: str):
+        self._pem = pem_bytes
+        self._openssl = openssl_bin
+
+    def verify(self, sig_bytes: bytes, payload: bytes) -> None:
+        with tempfile.TemporaryDirectory(prefix="wm-ed-v-") as td:
+            td_p = Path(td)
+            pub_p = td_p / "pub.pem"
+            msg_p = td_p / "msg.bin"
+            sig_p = td_p / "sig.bin"
+            pub_p.write_bytes(self._pem)
+            msg_p.write_bytes(payload)
+            sig_p.write_bytes(sig_bytes)
+            r = subprocess.run(
+                [self._openssl, "pkeyutl", "-verify", "-pubin", "-inkey", str(pub_p), "-rawin", "-in", str(msg_p), "-sigfile", str(sig_p)],
+                capture_output=True,
+            )
+            if r.returncode != 0:
+                raise ValueError("ed25519 signature mismatch")
+
+    def to_pem(self) -> str:
+        return self._pem.decode("utf-8")
+
+
+class _OpensslEd25519PrivateKey:
+    def __init__(self, pem_bytes: bytes, openssl_bin: str):
+        self._pem = pem_bytes
+        self._openssl = openssl_bin
+
+    def sign(self, payload: bytes) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="wm-ed-s-") as td:
+            td_p = Path(td)
+            priv_p = td_p / "priv.pem"
+            msg_p = td_p / "msg.bin"
+            priv_p.write_bytes(self._pem)
+            msg_p.write_bytes(payload)
+            r = subprocess.run(
+                [self._openssl, "pkeyutl", "-sign", "-inkey", str(priv_p), "-rawin", "-in", str(msg_p)],
+                capture_output=True,
+            )
+            if r.returncode != 0 or len(r.stdout) != 64:
+                raise ValueError(f"openssl Ed25519 sign failed: {r.stderr.decode('utf-8', 'replace')}")
+            return r.stdout
+
+    def public_key(self) -> _OpensslEd25519PublicKey:
+        r = subprocess.run(
+            [self._openssl, "pkey", "-pubout"],
+            input=self._pem,
+            capture_output=True,
+        )
+        if r.returncode != 0 or b"BEGIN PUBLIC KEY" not in r.stdout:
+            raise ValueError("openssl Ed25519 public key derivation failed")
+        return _OpensslEd25519PublicKey(r.stdout, self._openssl)
+
+
+def _has_ed25519_backend() -> bool:
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed  # noqa: F401
+        return True
+    except ImportError:
+        return _find_openssl_ed25519() is not None
+
+
 def _load_ed25519_private_key_from_env():
     key_file = os.environ.get("WM_CONFINEMENT_ED25519_KEY_FILE", "").strip()
     if not key_file:
         return None
-    try:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import ed25519
-    except ImportError as exc:
-        raise ValueError("cryptography package required for Ed25519 confinement signing") from exc
-
     p = Path(key_file)
     if not p.is_file():
         raise ValueError(f"WM_CONFINEMENT_ED25519_KEY_FILE not found: {key_file}")
@@ -271,17 +356,35 @@ def _load_ed25519_private_key_from_env():
         raw = p.read_bytes()
     except OSError as exc:
         raise ValueError(f"cannot read WM_CONFINEMENT_ED25519_KEY_FILE {key_file}: {exc}") from exc
-    if b"-----BEGIN" in raw:
-        try:
-            priv = serialization.load_pem_private_key(raw, password=None)
-        except Exception as exc:
-            raise ValueError(f"invalid PEM private key in {key_file}: {exc}") from exc
-        if not isinstance(priv, ed25519.Ed25519PrivateKey):
-            raise ValueError(f"PEM key in {key_file} is not an Ed25519 private key")
-        return priv
-    if len(raw) == 32:
-        return ed25519.Ed25519PrivateKey.from_private_bytes(raw)
-    raise ValueError(f"WM_CONFINEMENT_ED25519_KEY_FILE must be PEM PKCS8 or raw 32-byte key: {key_file}")
+
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        if b"-----BEGIN" in raw:
+            try:
+                priv = serialization.load_pem_private_key(raw, password=None)
+            except Exception as exc:
+                raise ValueError(f"invalid PEM private key in {key_file}: {exc}") from exc
+            if not isinstance(priv, ed25519.Ed25519PrivateKey):
+                raise ValueError(f"PEM key in {key_file} is not an Ed25519 private key")
+            return priv
+        if len(raw) == 32:
+            return ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+        raise ValueError(f"WM_CONFINEMENT_ED25519_KEY_FILE must be PEM PKCS8 or raw 32-byte key: {key_file}")
+    except ImportError as exc:
+        openssl_bin = _find_openssl_ed25519()
+        if not openssl_bin:
+            raise ValueError("cryptography package or OpenSSL 3+ required for Ed25519 confinement signing") from exc
+        if b"-----BEGIN" in raw:
+            chk = subprocess.run([openssl_bin, "pkey", "-noout", "-text"], input=raw, capture_output=True)
+            if chk.returncode != 0 or "ED25519" not in chk.stdout.decode("utf-8", "replace").upper():
+                raise ValueError(f"invalid Ed25519 PEM private key in {key_file}")
+            return _OpensslEd25519PrivateKey(raw, openssl_bin)
+        if len(raw) == 32:
+            pem = _der_to_pem(_ED25519_PKCS8_PREFIX + raw, "PRIVATE KEY")
+            return _OpensslEd25519PrivateKey(pem, openssl_bin)
+        raise ValueError(f"WM_CONFINEMENT_ED25519_KEY_FILE must be PEM PKCS8 or raw 32-byte key: {key_file}")
 
 
 def _resolve_signing_plan(
@@ -332,10 +435,8 @@ def _resolve_signing_plan(
         )
 
     if raw_alg == "ed25519":
-        try:
-            from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed_check  # noqa: F401
-        except ImportError as exc:
-            raise ValueError("cryptography package required for Ed25519 confinement signing") from exc
+        if not _has_ed25519_backend():
+            raise ValueError("cryptography package or OpenSSL 3+ required for Ed25519 confinement signing")
         if ed_key is None:
             raise ValueError("Ed25519 signing requested but WM_CONFINEMENT_ED25519_KEY_FILE is not set")
         return (True, "ed25519", ed_key)
@@ -380,12 +481,6 @@ def sign_confinement_receipt(
 
 
 def _load_ed25519_public_key(ed25519_public_key=None):
-    try:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import ed25519
-    except ImportError as exc:
-        raise ValueError("cryptography package required for Ed25519 verification") from exc
-
     if ed25519_public_key is None:
         pub_env = os.environ.get("WM_CONFINEMENT_ED25519_PUBKEY_FILE", "").strip()
         if pub_env:
@@ -399,10 +494,22 @@ def _load_ed25519_public_key(ed25519_public_key=None):
                 )
             return priv.public_key()
 
-    if isinstance(ed25519_public_key, ed25519.Ed25519PublicKey):
+    if isinstance(ed25519_public_key, _OpensslEd25519PublicKey):
         return ed25519_public_key
-    if isinstance(ed25519_public_key, ed25519.Ed25519PrivateKey):
+    if isinstance(ed25519_public_key, _OpensslEd25519PrivateKey):
         return ed25519_public_key.public_key()
+
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        if isinstance(ed25519_public_key, ed25519.Ed25519PublicKey):
+            return ed25519_public_key
+        if isinstance(ed25519_public_key, ed25519.Ed25519PrivateKey):
+            return ed25519_public_key.public_key()
+    except ImportError:
+        serialization = None
+        ed25519 = None
 
     if isinstance(ed25519_public_key, Path) or (
         isinstance(ed25519_public_key, str) and "-----BEGIN" not in ed25519_public_key
@@ -418,18 +525,30 @@ def _load_ed25519_public_key(ed25519_public_key=None):
     else:
         raise ValueError("Unsupported Ed25519 public key type")
 
+    if ed25519 is not None and serialization is not None:
+        if b"-----BEGIN PUBLIC KEY-----" in raw:
+            pub = serialization.load_pem_public_key(raw)
+            if not isinstance(pub, ed25519.Ed25519PublicKey):
+                raise ValueError("PEM public key is not an Ed25519 public key")
+            return pub
+        if b"-----BEGIN" in raw:
+            priv = serialization.load_pem_private_key(raw, password=None)
+            if not isinstance(priv, ed25519.Ed25519PrivateKey):
+                raise ValueError("PEM private key is not an Ed25519 private key")
+            return priv.public_key()
+        if len(raw) == 32:
+            return ed25519.Ed25519PublicKey.from_public_bytes(raw)
+        raise ValueError("Ed25519 public key must be PEM or raw 32-byte key")
+
+    openssl_bin = _find_openssl_ed25519()
+    if not openssl_bin:
+        raise ValueError("cryptography package or OpenSSL 3+ required for Ed25519 verification")
     if b"-----BEGIN PUBLIC KEY-----" in raw:
-        pub = serialization.load_pem_public_key(raw)
-        if not isinstance(pub, ed25519.Ed25519PublicKey):
-            raise ValueError("PEM public key is not an Ed25519 public key")
-        return pub
+        return _OpensslEd25519PublicKey(raw, openssl_bin)
     if b"-----BEGIN" in raw:
-        priv = serialization.load_pem_private_key(raw, password=None)
-        if not isinstance(priv, ed25519.Ed25519PrivateKey):
-            raise ValueError("PEM private key is not an Ed25519 private key")
-        return priv.public_key()
+        return _OpensslEd25519PrivateKey(raw, openssl_bin).public_key()
     if len(raw) == 32:
-        return ed25519.Ed25519PublicKey.from_public_bytes(raw)
+        return _OpensslEd25519PublicKey(_der_to_pem(_ED25519_SPKI_PREFIX + raw, "PUBLIC KEY"), openssl_bin)
     raise ValueError("Ed25519 public key must be PEM or raw 32-byte key")
 
 
@@ -469,17 +588,15 @@ def verify_confinement_receipt(
         return (False, "hmac-sha256 signature mismatch")
 
     if alg == "ed25519":
-        try:
-            from cryptography.exceptions import InvalidSignature
-        except ImportError:
-            return (False, "cryptography package required for Ed25519 verification")
+        if not _has_ed25519_backend():
+            return (False, "cryptography package or OpenSSL 3+ required for Ed25519 verification")
         try:
             pub_key = _load_ed25519_public_key(ed25519_public_key)
         except (ValueError, OSError) as exc:
             return (False, str(exc))
         try:
             pub_key.verify(sig_bytes, payload)
-        except InvalidSignature:
+        except Exception:
             return (False, "ed25519 signature mismatch")
         return (True, "verified ed25519")
 
@@ -505,11 +622,13 @@ def append_receipt_ledger(receipt: dict, ledger_path: str | Path | None = None) 
 
 
 def _extract_ed25519_public_pem(ed25519_public_key=None) -> str | None:
-    from cryptography.hazmat.primitives import serialization
-
     if isinstance(ed25519_public_key, str) and "-----BEGIN PUBLIC KEY-----" in ed25519_public_key:
         return ed25519_public_key
     pub = _load_ed25519_public_key(ed25519_public_key)
+    if isinstance(pub, _OpensslEd25519PublicKey):
+        return pub.to_pem()
+    from cryptography.hazmat.primitives import serialization
+
     return pub.public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -823,34 +942,67 @@ def run_confined_verify(
     resolved_wt = wt_path.resolve()
     diff_sha = _compute_worktree_diff_sha256(resolved_wt)
     tmp_git_ro_binds = _discover_tmp_git_ro_binds(resolved_wt)
-    bwrap_cmd = [
-        bwrap,
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev",
-        "/dev",
-        "--proc",
-        "/proc",
-        "--tmpfs",
-        "/tmp",
-    ]
-    for gpath in tmp_git_ro_binds:
-        bwrap_cmd.extend(["--ro-bind", str(gpath), str(gpath)])
-    bwrap_cmd.extend([
-        "--bind",
-        str(resolved_wt),
-        str(resolved_wt),
-        "--chdir",
-        str(resolved_wt),
-        "--unshare-net",
-        "--die-with-parent",
-        "--",
-        "sh",
-        "-c",
-        verify_cmd,
-    ])
-    bwrap_flags = bwrap_cmd[1 : bwrap_cmd.index("--")]
+    is_seatbelt = Path(bwrap).name == "sandbox-exec"
+    scratch_tmp: Path | None = None
+    run_env = None
+    run_cwd = None
+    if is_seatbelt:
+        scratch_tmp = Path(tempfile.mkdtemp(prefix="wm-sbx-tmp-")).resolve()
+        bwrap_flags = ["--sandbox-exec", "--ro-bind", "/", "/"]
+        for gpath in tmp_git_ro_binds:
+            bwrap_flags.extend(["--ro-bind", str(gpath), str(gpath)])
+        bwrap_flags.extend(["--bind", str(resolved_wt), str(resolved_wt), "--unshare-net"])
+
+        def _sbpl_esc(s: str) -> str:
+            return s.replace("\\", "\\\\").replace('"', '\\"')
+
+        ro_rules = "\n".join(f'(deny file-write* (subpath "{_sbpl_esc(str(gpath))}"))' for gpath in tmp_git_ro_binds)
+        sbpl = (
+            "(version 1)\n"
+            "(allow default)\n"
+            "(deny network*)\n"
+            "(deny file-write*)\n"
+            "(allow file-write*\n"
+            '  (literal "/dev/null")\n'
+            '  (literal "/dev/zero")\n'
+            '  (literal "/dev/dtracehelper")\n'
+            '  (literal "/dev/tty")\n'
+            f'  (subpath "{_sbpl_esc(str(resolved_wt))}")\n'
+            f'  (subpath "{_sbpl_esc(str(scratch_tmp))}"))'
+            + (f"\n{ro_rules}" if ro_rules else "")
+        )
+        bwrap_cmd = [bwrap, "-p", sbpl, "sh", "-c", verify_cmd]
+        run_env = {**os.environ, "TMPDIR": str(scratch_tmp)}
+        run_cwd = str(resolved_wt)
+    else:
+        bwrap_cmd = [
+            bwrap,
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+        ]
+        for gpath in tmp_git_ro_binds:
+            bwrap_cmd.extend(["--ro-bind", str(gpath), str(gpath)])
+        bwrap_cmd.extend([
+            "--bind",
+            str(resolved_wt),
+            str(resolved_wt),
+            "--chdir",
+            str(resolved_wt),
+            "--unshare-net",
+            "--die-with-parent",
+            "--",
+            "sh",
+            "-c",
+            verify_cmd,
+        ])
+        bwrap_flags = bwrap_cmd[1 : bwrap_cmd.index("--")]
     eff_timeout = max(1, min(int(timeout_sec), 90))
     try:
         proc = subprocess.run(
@@ -858,8 +1010,12 @@ def run_confined_verify(
             capture_output=True,
             text=True,
             timeout=eff_timeout,
+            env=run_env,
+            cwd=run_cwd,
         )
     except subprocess.TimeoutExpired as exc:
+        if scratch_tmp is not None:
+            shutil.rmtree(scratch_tmp, ignore_errors=True)
         stdout_s = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr_s = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         rcpt = _build_confinement_receipt(
@@ -882,6 +1038,8 @@ def run_confined_verify(
             "confinement_receipt": rcpt,
         }
     except OSError as exc:
+        if scratch_tmp is not None:
+            shutil.rmtree(scratch_tmp, ignore_errors=True)
         rcpt = _build_confinement_receipt(
             bwrap_bin=bwrap,
             network_isolated=False,
@@ -899,6 +1057,8 @@ def run_confined_verify(
             "error": f"bwrap execution failed: {exc}",
             "confinement_receipt": rcpt,
         }
+    if scratch_tmp is not None:
+        shutil.rmtree(scratch_tmp, ignore_errors=True)
 
     rcpt = _build_confinement_receipt(
         bwrap_bin=bwrap,
